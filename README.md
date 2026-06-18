@@ -22,6 +22,7 @@ This repository starts with a minimal core:
 - Structured event model
 - Adapter protocol
 - Debug echo adapter
+- Codex non-interactive adapter using `codex exec --json`
 - Markdown memory store with `user`, `project`, `team`, `agent`, and `task` scopes
 - JSONL event log
 - CLI smoke path
@@ -40,6 +41,8 @@ The first real adapter targets should be:
 python -m agentdeck init
 python -m agentdeck doctor
 python -m agentdeck run "hello from AgentDeck"
+python -m agentdeck run --adapter codex --cwd "$PWD" "Summarize this repository"
+python -m agentdeck run --adapter codex --cwd "$PWD" --resume-last "Continue"
 python -m agentdeck memory add "Project rule" "Keep shared memory concise."
 python -m agentdeck memory list
 ```
@@ -82,4 +85,3 @@ Agents should not share raw chat transcripts as memory. They should share:
 
 Raw transcripts remain available for audit, but runtime prompts should receive
 bounded, relevant memory only.
-

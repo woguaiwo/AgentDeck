@@ -8,7 +8,9 @@ import json
 import sys
 from pathlib import Path
 
+from agentdeck.adapters.codex_exec import CodexExecAdapter
 from agentdeck.adapters.echo import EchoAdapter
+from agentdeck.adapters.base import AgentAdapter
 from agentdeck.core.config import Workspace
 from agentdeck.core.runtime import AgentRuntime
 from agentdeck.storage.event_log import EventLog
@@ -27,8 +29,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="Run a prompt through an adapter")
     run.add_argument("prompt")
-    run.add_argument("--adapter", default="echo", choices=["echo"])
+    run.add_argument("--adapter", default="echo", choices=["echo", "codex", "codex-exec"])
     run.add_argument("--agent", default="default")
+    run.add_argument("--cwd", default=".", help="Project directory used by the wrapped agent")
+    run.add_argument("--codex-bin", default="codex", help="Codex executable path")
+    run.add_argument("--resume", help="Resume a Codex session id or thread name")
+    run.add_argument("--resume-last", action="store_true", help="Resume the most recent Codex session")
+    run.add_argument("--model", help="Model override for adapters that support it")
+    run.add_argument("--sandbox", choices=["read-only", "workspace-write", "danger-full-access"])
+    run.add_argument("--no-skip-git-check", action="store_true", help="Do not pass --skip-git-repo-check to Codex")
+    run.add_argument("--extra-arg", action="append", default=[], help="Extra raw argument forwarded to the adapter")
 
     memory = sub.add_parser("memory", help="Manage markdown memory")
     mem_sub = memory.add_subparsers(dest="memory_command", required=True)
@@ -54,12 +64,29 @@ def resolve_workspace(args: argparse.Namespace, cwd: str | Path | None = None) -
 
 
 async def _run_prompt(args: argparse.Namespace, workspace: Workspace) -> int:
-    adapter = EchoAdapter()
+    adapter = _build_adapter(args)
     runtime = AgentRuntime(workspace, adapter, agent_id=args.agent)
     result = await runtime.run_prompt(args.prompt)
     print(result.final_text)
     print(f"session_id: {result.session_id}")
     return 0
+
+
+def _build_adapter(args: argparse.Namespace) -> AgentAdapter:
+    if args.adapter == "echo":
+        return EchoAdapter()
+    if args.adapter in {"codex", "codex-exec"}:
+        return CodexExecAdapter(
+            codex_bin=args.codex_bin,
+            cwd=Path(args.cwd).expanduser().resolve(),
+            resume=args.resume,
+            resume_last=args.resume_last,
+            model=args.model,
+            sandbox=args.sandbox,
+            skip_git_repo_check=not args.no_skip_git_check,
+            extra_args=tuple(args.extra_arg or ()),
+        )
+    raise ValueError(f"unsupported adapter: {args.adapter}")
 
 
 def main(argv: list[str] | None = None) -> int:

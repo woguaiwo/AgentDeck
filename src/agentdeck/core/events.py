@@ -11,6 +11,7 @@ from typing import Any
 
 class EventKind(str, Enum):
     USER_MESSAGE = "user_message"
+    STATUS = "status"
     SESSION_STARTED = "session_started"
     SESSION_IDLE = "session_idle"
     ASSISTANT_DELTA = "assistant_delta"
@@ -57,4 +58,3 @@ class AgentEvent:
             event_id=str(data.get("event_id") or uuid.uuid4().hex),
             created_at=float(data.get("created_at") or time.time()),
         )
-
