@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentdeck"
+version = "0.1.0"
+description = "Remote control plane for AI agent teams"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "AgentDeck contributors" }]
+keywords = ["agent", "ai", "cli", "orchestration", "telegram", "codex", "kimi", "claude"]
+dependencies = []
+
+[project.scripts]
+agentdeck = "agentdeck.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
