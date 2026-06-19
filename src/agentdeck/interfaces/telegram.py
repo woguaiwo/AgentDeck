@@ -6,16 +6,15 @@ import asyncio
 import json
 import os
 import threading
-import time
 import urllib.parse
 import urllib.request
-import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from agentdeck.core.config import Workspace
 from agentdeck.core.run_service import RunConfigurationError, RunRequest, run_agent_prompt
 from agentdeck.storage.approvals import ApprovalRegistry
+from agentdeck.storage.jobs import JobRecord, JobRegistry
 from agentdeck.storage.projects import ProjectRegistry
 from agentdeck.storage.tasks import TaskBoard
 
@@ -28,20 +27,6 @@ class TelegramConfig:
     token: str
     allowed_chat_ids: set[int] = field(default_factory=set)
     poll_timeout: int = 30
-
-
-@dataclass
-class TelegramJob:
-    job_id: str
-    chat_id: int
-    task_id: str
-    prompt: str
-    status: str = "queued"
-    created_at: float = field(default_factory=time.time)
-    updated_at: float = field(default_factory=time.time)
-    session_id: str = ""
-    final_text: str = ""
-    error: str = ""
 
 
 class TelegramBotApi:
@@ -73,7 +58,7 @@ class TelegramBotApi:
 
 
 class TelegramJobQueue:
-    """In-memory background runner for Telegram-triggered jobs."""
+    """Background runner for Telegram-triggered jobs."""
 
     def __init__(
         self,
@@ -85,30 +70,31 @@ class TelegramJobQueue:
         self.workspace = workspace
         self.sender = sender
         self.runner = runner
+        self.registry = JobRegistry(workspace)
         self._lock = threading.Lock()
-        self._jobs: dict[str, TelegramJob] = {}
         self._threads: dict[str, threading.Thread] = {}
+        self.registry.mark_unfinished_interrupted(
+            interface="telegram",
+            reason="AgentDeck restarted before this job finished.",
+        )
 
-    def start(self, *, chat_id: int, task_id: str, prompt: str) -> TelegramJob:
-        job = TelegramJob(job_id=_new_job_id(), chat_id=chat_id, task_id=task_id, prompt=prompt)
-        thread = threading.Thread(target=self._run_job, args=(job.job_id,), daemon=True)
+    def start(self, *, chat_id: int, task_id: str, prompt: str) -> JobRecord:
         with self._lock:
-            self._jobs[job.job_id] = job
+            job = self.registry.create(interface="telegram", chat_id=chat_id, task_id=task_id, prompt=prompt)
+            thread = threading.Thread(target=self._run_job, args=(job.job_id,), daemon=True)
             self._threads[job.job_id] = thread
         thread.start()
         return job
 
-    def get(self, job_id: str) -> TelegramJob | None:
+    def get(self, job_id: str) -> JobRecord | None:
         with self._lock:
-            job = self._jobs.get(job_id)
-            return _copy_job(job) if job is not None else None
+            return self.registry.get(job_id)
 
-    def list(self, *, limit: int = 10) -> list[TelegramJob]:
+    def list(self, *, limit: int = 10) -> list[JobRecord]:
         with self._lock:
-            jobs = [_copy_job(job) for job in self._jobs.values()]
-        return sorted(jobs, key=lambda item: item.updated_at, reverse=True)[:limit]
+            return self.registry.list(interface="telegram", limit=limit)
 
-    def wait(self, job_id: str, *, timeout: float | None = None) -> TelegramJob | None:
+    def wait(self, job_id: str, *, timeout: float | None = None) -> JobRecord | None:
         with self._lock:
             thread = self._threads.get(job_id)
         if thread is not None:
@@ -136,14 +122,9 @@ class TelegramJobQueue:
             )
             self._send(job.chat_id, _format_job_completion(finished or job, result.approval_requested))
 
-    def _set_job_status(self, job_id: str, status: str) -> TelegramJob | None:
+    def _set_job_status(self, job_id: str, status: str) -> JobRecord | None:
         with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None:
-                return None
-            job.status = status
-            job.updated_at = time.time()
-            return _copy_job(job)
+            return self.registry.set_status(job_id, status)
 
     def _finish_job(
         self,
@@ -153,17 +134,15 @@ class TelegramJobQueue:
         session_id: str = "",
         final_text: str = "",
         error: str = "",
-    ) -> TelegramJob | None:
+    ) -> JobRecord | None:
         with self._lock:
-            job = self._jobs.get(job_id)
-            if job is None:
-                return None
-            job.status = status
-            job.updated_at = time.time()
-            job.session_id = session_id
-            job.final_text = final_text
-            job.error = error
-            return _copy_job(job)
+            return self.registry.finish(
+                job_id,
+                status=status,
+                session_id=session_id,
+                final_text=final_text,
+                error=error,
+            )
 
     def _send(self, chat_id: int, text: str) -> None:
         try:
@@ -502,28 +481,7 @@ def _normalize_bot_token(value: str) -> str:
     return "".join(clean.split())
 
 
-def _new_job_id() -> str:
-    return f"job-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
-
-
-def _copy_job(job: TelegramJob | None) -> TelegramJob | None:
-    if job is None:
-        return None
-    return TelegramJob(
-        job_id=job.job_id,
-        chat_id=job.chat_id,
-        task_id=job.task_id,
-        prompt=job.prompt,
-        status=job.status,
-        created_at=job.created_at,
-        updated_at=job.updated_at,
-        session_id=job.session_id,
-        final_text=job.final_text,
-        error=job.error,
-    )
-
-
-def _format_job_completion(job: TelegramJob, approval_requested: bool) -> str:
+def _format_job_completion(job: JobRecord, approval_requested: bool) -> str:
     lines = [
         f"Job done: {job.job_id}",
         f"task: {job.task_id}",

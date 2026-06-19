@@ -14,6 +14,7 @@ from agentdeck.core.events import AgentEvent, EventKind
 from agentdeck.core.run_service import RunRequest, RunServiceResult
 from agentdeck.interfaces.telegram import TelegramCommandHandler, TelegramJobQueue, config_from_env, split_message
 from agentdeck.storage.approvals import ApprovalRegistry
+from agentdeck.storage.jobs import JobRegistry
 from agentdeck.storage.sessions import SessionRegistry
 from agentdeck.storage.tasks import TaskBoard
 
@@ -131,6 +132,37 @@ class TelegramInterfaceTests(unittest.TestCase):
             detail = asyncio.run(handler.handle_text(f"/job {job_id}", chat_id=42))[0]
             self.assertIn("status: done", detail)
             self.assertIn("done: background work", detail)
+
+    def test_jobs_are_persisted_and_unfinished_jobs_are_marked_interrupted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            workspace.ensure()
+            registry = JobRegistry(workspace)
+            stale = registry.create(interface="telegram", chat_id=42, task_id="task-a", prompt="old work")
+            done = registry.create(interface="telegram", chat_id=42, task_id="task-b", prompt="done work")
+            registry.finish(done.job_id, status="done", session_id="session-done", final_text="done text")
+
+            queue = TelegramJobQueue(workspace, sender=lambda chat_id, text: None)
+            handler = TelegramCommandHandler(workspace, job_queue=queue)
+
+            stale_after_restart = queue.get(stale.job_id)
+            assert stale_after_restart is not None
+            self.assertEqual(stale_after_restart.status, "interrupted")
+            self.assertIn("restarted", stale_after_restart.error)
+
+            done_after_restart = queue.get(done.job_id)
+            assert done_after_restart is not None
+            self.assertEqual(done_after_restart.status, "done")
+            self.assertEqual(done_after_restart.final_text, "done text")
+
+            jobs = asyncio.run(handler.handle_text("/jobs", chat_id=42))[0]
+            self.assertIn(stale.job_id, jobs)
+            self.assertIn(done.job_id, jobs)
+            self.assertIn("status: interrupted", jobs)
+
+            detail = asyncio.run(handler.handle_text(f"/job {done.job_id}", chat_id=42))[0]
+            self.assertIn("status: done", detail)
+            self.assertIn("done text", detail)
 
     def test_message_split_and_env_config(self) -> None:
         chunks = split_message("a" * 5000, limit=1000)
