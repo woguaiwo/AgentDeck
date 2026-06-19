@@ -29,7 +29,7 @@ This repository starts with a minimal core:
 - Task board with project, agent, session, status, priority, and notes
 - Session registry with human-readable titles and provider session ids
 - Approval registry for backend approval requests and explicit decisions
-- Telegram long-polling interface for project/task/approval/run commands
+- Telegram long-polling interface with background run jobs
 - Markdown memory store with `user`, `project`, `team`, `agent`, and `task` scopes
 - JSONL event log
 - CLI smoke path
@@ -112,11 +112,17 @@ Supported commands:
 /tasks [project]
 /task <task_id>
 /run <task_id> <message>
+/jobs
+/job <job_id>
 /approvals [pending|approved|rejected]
 /approval <approval_id>
 /approve <approval_id> [note]
 /reject <approval_id> [note]
 ```
+
+`/run` starts a background job and returns immediately with a job id. The bot
+continues receiving Telegram messages while the backend agent runs, then sends
+the final result back to the chat when the job finishes.
 
 For development without installing:
 

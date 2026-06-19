@@ -4,13 +4,15 @@ import io
 import os
 import re
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
 from agentdeck.cli import main
 from agentdeck.core.config import Workspace
 from agentdeck.core.events import AgentEvent, EventKind
-from agentdeck.interfaces.telegram import TelegramCommandHandler, config_from_env, split_message
+from agentdeck.core.run_service import RunRequest, RunServiceResult
+from agentdeck.interfaces.telegram import TelegramCommandHandler, TelegramJobQueue, config_from_env, split_message
 from agentdeck.storage.approvals import ApprovalRegistry
 from agentdeck.storage.sessions import SessionRegistry
 from agentdeck.storage.tasks import TaskBoard
@@ -86,6 +88,49 @@ class TelegramInterfaceTests(unittest.TestCase):
             assert resolved is not None
             self.assertEqual(resolved.status, "approved")
             self.assertEqual(resolved.resolved_by, "telegram")
+
+    def test_run_command_can_start_background_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            started = threading.Event()
+            release = threading.Event()
+            sent: list[tuple[int, str]] = []
+
+            async def runner(workspace_arg: Workspace, request: RunRequest) -> RunServiceResult:
+                self.assertIs(workspace_arg, workspace)
+                started.set()
+                release.wait(timeout=2)
+                return RunServiceResult(
+                    session_id="session-bg",
+                    final_text=f"done: {request.prompt}",
+                    events=[],
+                    agent_id="owner",
+                    adapter="echo",
+                    task_id=request.task or "",
+                )
+
+            queue = TelegramJobQueue(workspace, sender=lambda chat_id, text: sent.append((chat_id, text)), runner=runner)
+            handler = TelegramCommandHandler(workspace, job_queue=queue)
+
+            reply = asyncio.run(handler.handle_text("/run task-a background work", chat_id=42))[0]
+            self.assertIn("Job started:", reply)
+            job_id = re.search(r"Job started: (job-\S+)", reply).group(1)
+            self.assertTrue(started.wait(timeout=1))
+
+            jobs = asyncio.run(handler.handle_text("/jobs", chat_id=42))[0]
+            self.assertIn(job_id, jobs)
+            self.assertRegex(jobs, r"status: (queued|running)")
+
+            release.set()
+            job = queue.wait(job_id, timeout=2)
+            assert job is not None
+            self.assertEqual(job.status, "done")
+            self.assertEqual(job.session_id, "session-bg")
+            self.assertEqual(sent, [(42, f"Job done: {job_id}\ntask: task-a\nsession: session-bg\n\ndone: background work")])
+
+            detail = asyncio.run(handler.handle_text(f"/job {job_id}", chat_id=42))[0]
+            self.assertIn("status: done", detail)
+            self.assertIn("done: background work", detail)
 
     def test_message_split_and_env_config(self) -> None:
         chunks = split_message("a" * 5000, limit=1000)

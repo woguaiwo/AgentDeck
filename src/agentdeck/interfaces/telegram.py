@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
+import time
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -25,6 +28,20 @@ class TelegramConfig:
     token: str
     allowed_chat_ids: set[int] = field(default_factory=set)
     poll_timeout: int = 30
+
+
+@dataclass
+class TelegramJob:
+    job_id: str
+    chat_id: int
+    task_id: str
+    prompt: str
+    status: str = "queued"
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    session_id: str = ""
+    final_text: str = ""
+    error: str = ""
 
 
 class TelegramBotApi:
@@ -55,6 +72,106 @@ class TelegramBotApi:
         return data
 
 
+class TelegramJobQueue:
+    """In-memory background runner for Telegram-triggered jobs."""
+
+    def __init__(
+        self,
+        workspace: Workspace,
+        *,
+        sender: Callable[[int, str], None],
+        runner: Callable[[Workspace, RunRequest], Any] = run_agent_prompt,
+    ) -> None:
+        self.workspace = workspace
+        self.sender = sender
+        self.runner = runner
+        self._lock = threading.Lock()
+        self._jobs: dict[str, TelegramJob] = {}
+        self._threads: dict[str, threading.Thread] = {}
+
+    def start(self, *, chat_id: int, task_id: str, prompt: str) -> TelegramJob:
+        job = TelegramJob(job_id=_new_job_id(), chat_id=chat_id, task_id=task_id, prompt=prompt)
+        thread = threading.Thread(target=self._run_job, args=(job.job_id,), daemon=True)
+        with self._lock:
+            self._jobs[job.job_id] = job
+            self._threads[job.job_id] = thread
+        thread.start()
+        return job
+
+    def get(self, job_id: str) -> TelegramJob | None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            return _copy_job(job) if job is not None else None
+
+    def list(self, *, limit: int = 10) -> list[TelegramJob]:
+        with self._lock:
+            jobs = [_copy_job(job) for job in self._jobs.values()]
+        return sorted(jobs, key=lambda item: item.updated_at, reverse=True)[:limit]
+
+    def wait(self, job_id: str, *, timeout: float | None = None) -> TelegramJob | None:
+        with self._lock:
+            thread = self._threads.get(job_id)
+        if thread is not None:
+            thread.join(timeout)
+        return self.get(job_id)
+
+    def _run_job(self, job_id: str) -> None:
+        job = self._set_job_status(job_id, "running")
+        if job is None:
+            return
+        try:
+            result = asyncio.run(self.runner(self.workspace, RunRequest(prompt=job.prompt, task=job.task_id)))
+        except RunConfigurationError as exc:
+            self._finish_job(job_id, status="error", error=str(exc))
+            self._send(job.chat_id, f"Job failed: {job_id}\n{exc}")
+        except Exception as exc:  # keep the polling loop alive even if a background job crashes
+            self._finish_job(job_id, status="error", error=str(exc))
+            self._send(job.chat_id, f"Job failed: {job_id}\n{exc}")
+        else:
+            finished = self._finish_job(
+                job_id,
+                status="done",
+                session_id=result.session_id,
+                final_text=result.final_text,
+            )
+            self._send(job.chat_id, _format_job_completion(finished or job, result.approval_requested))
+
+    def _set_job_status(self, job_id: str, status: str) -> TelegramJob | None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            job.status = status
+            job.updated_at = time.time()
+            return _copy_job(job)
+
+    def _finish_job(
+        self,
+        job_id: str,
+        *,
+        status: str,
+        session_id: str = "",
+        final_text: str = "",
+        error: str = "",
+    ) -> TelegramJob | None:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            job.status = status
+            job.updated_at = time.time()
+            job.session_id = session_id
+            job.final_text = final_text
+            job.error = error
+            return _copy_job(job)
+
+    def _send(self, chat_id: int, text: str) -> None:
+        try:
+            self.sender(chat_id, text)
+        except Exception:
+            pass
+
+
 class TelegramCommandHandler:
     """Parse Telegram messages into AgentDeck operations."""
 
@@ -63,11 +180,13 @@ class TelegramCommandHandler:
         workspace: Workspace,
         *,
         runner: Callable[[Workspace, RunRequest], Any] = run_agent_prompt,
+        job_queue: TelegramJobQueue | None = None,
     ) -> None:
         self.workspace = workspace
         self.runner = runner
+        self.job_queue = job_queue
 
-    async def handle_text(self, text: str) -> list[str]:
+    async def handle_text(self, text: str, *, chat_id: int | None = None) -> list[str]:
         clean = text.strip()
         if not clean:
             return []
@@ -91,8 +210,12 @@ class TelegramCommandHandler:
             return [self._resolve_approval(rest, "approved")]
         if command in {"/reject", "reject"}:
             return [self._resolve_approval(rest, "rejected")]
+        if command in {"/jobs", "jobs"}:
+            return [self._jobs()]
+        if command in {"/job", "job"}:
+            return [self._job(rest)]
         if command in {"/run", "run"}:
-            return [await self._run(rest)]
+            return [await self._run(rest, chat_id=chat_id)]
         return [f"Unknown command: {command}\n\n{_help_text()}"]
 
     def _projects(self) -> str:
@@ -211,10 +334,20 @@ class TelegramCommandHandler:
             )
         return f"Approval {record.status}: {record.title}\nid: {record.approval_id}"
 
-    async def _run(self, rest: str) -> str:
+    async def _run(self, rest: str, *, chat_id: int | None = None) -> str:
         task_id, prompt = _split_once(rest.strip())
         if not task_id or not prompt:
             return "Usage: /run <task_id> <message>"
+        if self.job_queue is not None and chat_id is not None:
+            job = self.job_queue.start(chat_id=chat_id, task_id=task_id, prompt=prompt)
+            return "\n".join(
+                [
+                    f"Job started: {job.job_id}",
+                    f"task: {job.task_id}",
+                    "status: queued",
+                    f"Use /job {job.job_id}",
+                ]
+            )
         try:
             result = await self.runner(self.workspace, RunRequest(prompt=prompt, task=task_id))
         except RunConfigurationError as exc:
@@ -233,13 +366,53 @@ class TelegramCommandHandler:
                 lines.append(f"Use /approval {result.pending_approvals[0].approval_id}")
         return "\n".join(lines)
 
+    def _jobs(self) -> str:
+        if self.job_queue is None:
+            return "Jobs are not enabled for this interface."
+        records = self.job_queue.list()
+        if not records:
+            return "No jobs."
+        lines = ["Jobs:"]
+        for index, job in enumerate(records, 1):
+            lines.append(f"{index}. {job.job_id}")
+            lines.append(f"   status: {job.status}  task: {job.task_id}")
+            if job.session_id:
+                lines.append(f"   session: {job.session_id}")
+            if job.error:
+                lines.append(f"   error: {_one_line(job.error, 120)}")
+        return "\n".join(lines)
+
+    def _job(self, rest: str) -> str:
+        if self.job_queue is None:
+            return "Jobs are not enabled for this interface."
+        job_id = rest.strip()
+        if not job_id:
+            return "Usage: /job <job_id>"
+        job = self.job_queue.get(job_id)
+        if job is None:
+            return f"Job not found: {job_id}"
+        lines = [
+            f"Job: {job.job_id}",
+            f"status: {job.status}",
+            f"task: {job.task_id}",
+        ]
+        if job.session_id:
+            lines.append(f"session: {job.session_id}")
+        if job.error:
+            lines.append(f"error: {job.error}")
+        if job.final_text:
+            lines.append("")
+            lines.append(job.final_text)
+        return "\n".join(lines)
+
 
 class TelegramServer:
     def __init__(self, workspace: Workspace, api: TelegramBotApi, config: TelegramConfig) -> None:
         self.workspace = workspace
         self.api = api
         self.config = config
-        self.handler = TelegramCommandHandler(workspace)
+        self.job_queue = TelegramJobQueue(workspace, sender=api.send_message)
+        self.handler = TelegramCommandHandler(workspace, job_queue=self.job_queue)
 
     def serve_forever(self, *, once: bool = False) -> None:
         offset: int | None = None
@@ -263,7 +436,7 @@ class TelegramServer:
         if self.config.allowed_chat_ids and chat_id not in self.config.allowed_chat_ids:
             return
         try:
-            replies = asyncio.run(self.handler.handle_text(text))
+            replies = asyncio.run(self.handler.handle_text(text, chat_id=chat_id))
         except Exception as exc:  # keep polling even if one command fails
             replies = [f"AgentDeck error: {exc}"]
         for reply in replies:
@@ -329,6 +502,49 @@ def _normalize_bot_token(value: str) -> str:
     return "".join(clean.split())
 
 
+def _new_job_id() -> str:
+    return f"job-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+
+
+def _copy_job(job: TelegramJob | None) -> TelegramJob | None:
+    if job is None:
+        return None
+    return TelegramJob(
+        job_id=job.job_id,
+        chat_id=job.chat_id,
+        task_id=job.task_id,
+        prompt=job.prompt,
+        status=job.status,
+        created_at=job.created_at,
+        updated_at=job.updated_at,
+        session_id=job.session_id,
+        final_text=job.final_text,
+        error=job.error,
+    )
+
+
+def _format_job_completion(job: TelegramJob, approval_requested: bool) -> str:
+    lines = [
+        f"Job done: {job.job_id}",
+        f"task: {job.task_id}",
+    ]
+    if job.session_id:
+        lines.append(f"session: {job.session_id}")
+    if approval_requested:
+        lines.append("approval: required")
+        lines.append("Use /approvals")
+    lines.append("")
+    lines.append(job.final_text or "Run finished without a final text response.")
+    return "\n".join(lines)
+
+
+def _one_line(value: str, max_chars: int) -> str:
+    clean = " ".join(value.strip().split())
+    if len(clean) <= max_chars:
+        return clean
+    return clean[: max_chars - 1].rstrip() + "..."
+
+
 def _help_text() -> str:
     return "\n".join(
         [
@@ -342,5 +558,7 @@ def _help_text() -> str:
             "/approval <approval_id>",
             "/approve <approval_id> [note]",
             "/reject <approval_id> [note]",
+            "/jobs",
+            "/job <job_id>",
         ]
     )
