@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
 
+from agentdeck.core.approvals import ApprovalMode
 from agentdeck.core.config import Workspace
 from agentdeck.core.events import AgentEvent, EventKind
 
@@ -31,6 +32,7 @@ class CodexExecAdapter:
     model: str | None = None
     sandbox: str | None = None
     skip_git_repo_check: bool = True
+    approval_mode: ApprovalMode = ApprovalMode.FAIL
     extra_args: tuple[str, ...] = field(default_factory=tuple)
 
     async def send(
@@ -52,6 +54,7 @@ class CodexExecAdapter:
         command = self._build_command(prompt, last_message_path)
         assistant_chunks: list[str] = []
         emitted_final = ""
+        approval_requested = False
 
         try:
             process = await asyncio.create_subprocess_exec(
@@ -79,34 +82,54 @@ class CodexExecAdapter:
                 if event.kind == EventKind.ASSISTANT_FINAL:
                     emitted_final = event.text
                 yield event
+                if event.kind == EventKind.APPROVAL_REQUESTED:
+                    approval_requested = True
+                    if self.approval_mode == ApprovalMode.FAIL:
+                        process.terminate()
+                        yield AgentEvent(
+                            EventKind.ERROR,
+                            agent_id,
+                            session_id,
+                            text=(
+                                "Backend requested approval, but this adapter cannot answer "
+                                "mid-run approval prompts yet."
+                            ),
+                            payload={
+                                "approval_mode": self.approval_mode.value,
+                                "hint": "Use --approval-mode record to only log requests, or --approval-mode bypass in an isolated environment.",
+                            },
+                        )
+                        break
 
             assert process.stderr is not None
             stderr = _filter_stderr((await process.stderr.read()).decode("utf-8", errors="replace"))
             return_code = await process.wait()
 
-            final_text = _read_last_message(last_message_path).strip()
-            if final_text and final_text != emitted_final:
-                emitted_final = final_text
-                yield AgentEvent(
-                    EventKind.ASSISTANT_FINAL,
-                    agent_id,
-                    session_id,
-                    text=final_text,
-                    payload={"source": "codex_output_last_message"},
-                )
-            elif not emitted_final and assistant_chunks:
-                final_text = "".join(assistant_chunks).strip()
-                if final_text:
+            if not approval_requested or self.approval_mode != ApprovalMode.FAIL:
+                final_text = _read_last_message(last_message_path).strip()
+                if final_text and final_text != emitted_final:
                     emitted_final = final_text
                     yield AgentEvent(
                         EventKind.ASSISTANT_FINAL,
                         agent_id,
                         session_id,
                         text=final_text,
-                        payload={"source": "assistant_delta_join"},
+                        payload={"source": "codex_output_last_message"},
                     )
+                elif not emitted_final and assistant_chunks:
+                    final_text = "".join(assistant_chunks).strip()
+                    if final_text:
+                        emitted_final = final_text
+                        yield AgentEvent(
+                            EventKind.ASSISTANT_FINAL,
+                            agent_id,
+                            session_id,
+                            text=final_text,
+                            payload={"source": "assistant_delta_join"},
+                        )
 
-            if return_code != 0:
+            approval_fail = approval_requested and self.approval_mode == ApprovalMode.FAIL
+            if return_code != 0 and not approval_fail:
                 yield AgentEvent(
                     EventKind.ERROR,
                     agent_id,
@@ -178,7 +201,9 @@ class CodexExecAdapter:
             command.append("--skip-git-repo-check")
         if self.model:
             command.extend(["--model", self.model])
-        if self.sandbox:
+        if self.approval_mode == ApprovalMode.BYPASS:
+            command.append("--dangerously-bypass-approvals-and-sandbox")
+        elif self.sandbox:
             command.extend(["--sandbox", self.sandbox])
         command.extend(self.extra_args)
 

@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from agentdeck.adapters.codex_exec import CodexExecAdapter, _event_from_stdout_line
+from agentdeck.core.approvals import ApprovalMode
 from agentdeck.core.config import Workspace
 from agentdeck.core.events import EventKind
 from agentdeck.core.runtime import AgentRuntime
@@ -72,3 +73,46 @@ class CodexExecAdapterTests(unittest.TestCase):
 
         assert event is not None
         self.assertEqual(event.kind, EventKind.STATUS)
+
+    def test_bypass_mode_adds_codex_dangerous_bypass_flag(self) -> None:
+        adapter = CodexExecAdapter(
+            cwd=Path("/tmp/project"),
+            sandbox="read-only",
+            approval_mode=ApprovalMode.BYPASS,
+        )
+
+        command = adapter._build_command("hello", Path("/tmp/last.md"))
+
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
+        self.assertNotIn("--sandbox", command)
+
+    def test_default_fail_mode_stops_on_approval_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            fake = tmp / "fake_codex"
+            fake.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    import json
+                    import time
+
+                    print(json.dumps({{"type": "approval_requested", "text": "Allow shell?"}}), flush=True)
+                    time.sleep(5)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+
+            workspace = Workspace(tmp / ".agentdeck")
+            adapter = CodexExecAdapter(codex_bin=str(fake))
+            runtime = AgentRuntime(workspace, adapter, agent_id="codex-test")
+
+            result = asyncio.run(runtime.run_prompt("hello"))
+
+            kinds = [event.kind for event in result.events]
+            self.assertIn(EventKind.APPROVAL_REQUESTED, kinds)
+            errors = [event for event in result.events if event.kind == EventKind.ERROR]
+            self.assertTrue(errors)
+            self.assertIn("cannot answer mid-run approval", errors[0].text)

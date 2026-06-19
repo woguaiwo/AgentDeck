@@ -43,9 +43,24 @@ python -m agentdeck doctor
 python -m agentdeck run "hello from AgentDeck"
 python -m agentdeck run --adapter codex --cwd "$PWD" "Summarize this repository"
 python -m agentdeck run --adapter codex --cwd "$PWD" --resume-last "Continue"
+python -m agentdeck run --adapter codex --cwd "$PWD" --approval-mode record "Show me what approval is needed"
 python -m agentdeck memory add "Project rule" "Keep shared memory concise."
 python -m agentdeck memory list
 ```
+
+## Codex Approval Modes
+
+`CodexExecAdapter` is non-interactive, so AgentDeck cannot yet answer mid-run
+approval prompts. The adapter exposes explicit modes instead of pretending the
+approval loop is solved:
+
+- `--approval-mode fail` is the default. If Codex asks for approval, AgentDeck
+  records the request and stops the run with a clear error.
+- `--approval-mode record` records approval events and lets Codex continue if
+  Codex can proceed without an answer.
+- `--approval-mode bypass` passes Codex
+  `--dangerously-bypass-approvals-and-sandbox`. Use this only in an isolated,
+  trusted environment.
 
 For development without installing:
 

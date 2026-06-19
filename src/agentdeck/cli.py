@@ -11,6 +11,7 @@ from pathlib import Path
 from agentdeck.adapters.codex_exec import CodexExecAdapter
 from agentdeck.adapters.echo import EchoAdapter
 from agentdeck.adapters.base import AgentAdapter
+from agentdeck.core.approvals import ApprovalMode
 from agentdeck.core.config import Workspace
 from agentdeck.core.runtime import AgentRuntime
 from agentdeck.storage.event_log import EventLog
@@ -37,6 +38,15 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--resume-last", action="store_true", help="Resume the most recent Codex session")
     run.add_argument("--model", help="Model override for adapters that support it")
     run.add_argument("--sandbox", choices=["read-only", "workspace-write", "danger-full-access"])
+    run.add_argument(
+        "--approval-mode",
+        default="fail",
+        choices=["fail", "record", "bypass"],
+        help=(
+            "How to handle backend approval requests. 'fail' stops on approval, "
+            "'record' only logs requests, and 'bypass' asks the backend to skip approvals."
+        ),
+    )
     run.add_argument("--no-skip-git-check", action="store_true", help="Do not pass --skip-git-repo-check to Codex")
     run.add_argument("--extra-arg", action="append", default=[], help="Extra raw argument forwarded to the adapter")
 
@@ -83,6 +93,7 @@ def _build_adapter(args: argparse.Namespace) -> AgentAdapter:
             resume_last=args.resume_last,
             model=args.model,
             sandbox=args.sandbox,
+            approval_mode=ApprovalMode.parse(args.approval_mode),
             skip_git_repo_check=not args.no_skip_git_check,
             extra_args=tuple(args.extra_arg or ()),
         )
