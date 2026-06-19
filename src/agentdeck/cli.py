@@ -11,6 +11,7 @@ from pathlib import Path
 
 from agentdeck.adapters.codex_exec import CodexExecAdapter
 from agentdeck.adapters.echo import EchoAdapter
+from agentdeck.adapters.kimi_print import KimiPrintAdapter
 from agentdeck.adapters.base import AgentAdapter
 from agentdeck.core.approvals import ApprovalMode
 from agentdeck.core.config import Workspace
@@ -35,7 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="Run a prompt through an adapter")
     run.add_argument("prompt")
-    run.add_argument("--adapter", choices=["echo", "codex", "codex-exec"])
+    run.add_argument("--adapter", choices=["echo", "codex", "codex-exec", "kimi", "kimi-print"])
     run.add_argument("--project", help="Project id or title")
     run.add_argument("--task", help="Task id or title")
     run.add_argument("--agent")
@@ -43,8 +44,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--title", help="Human-readable title for a new or resumed AgentDeck session")
     run.add_argument("--cwd", help="Project directory used by the wrapped agent")
     run.add_argument("--codex-bin", help="Codex executable path")
-    run.add_argument("--resume", help="Resume a Codex session id or thread name")
-    run.add_argument("--resume-last", action="store_true", help="Resume the most recent Codex session")
+    run.add_argument("--kimi-bin", help="Kimi executable path")
+    run.add_argument("--resume", help="Resume a provider session id or thread name")
+    run.add_argument("--resume-last", action="store_true", help="Resume the provider's most recent session when supported")
     run.add_argument("--model", help="Model override for adapters that support it")
     run.add_argument("--sandbox", choices=["read-only", "workspace-write", "danger-full-access"])
     run.add_argument(
@@ -90,12 +92,13 @@ def build_parser() -> argparse.ArgumentParser:
     agent_create.add_argument("--project", help="Project id this agent belongs to")
     agent_create.add_argument("--role", default="owner", help="Team role, e.g. owner, planner, developer, tester")
     agent_create.add_argument("--team", help="Team id")
-    agent_create.add_argument("--adapter", default="echo", choices=["echo", "codex", "codex-exec"])
+    agent_create.add_argument("--adapter", default="echo", choices=["echo", "codex", "codex-exec", "kimi", "kimi-print"])
     agent_create.add_argument("--cwd", default=".", help="Project directory used by this agent")
     agent_create.add_argument("--model")
     agent_create.add_argument("--sandbox", choices=["read-only", "workspace-write", "danger-full-access"])
     agent_create.add_argument("--approval-mode", default="fail", choices=["fail", "record", "bypass"])
     agent_create.add_argument("--codex-bin", default="codex")
+    agent_create.add_argument("--kimi-bin", default="kimi")
     agent_create.add_argument("--resume-policy", default="latest", choices=["latest", "new", "manual"])
     agent_create.add_argument("--replace", action="store_true")
     agent_list = agent_sub.add_parser("list", help="List project agents")
@@ -201,7 +204,7 @@ async def _run_prompt(args: argparse.Namespace, workspace: Workspace) -> int:
         args.agent = session.agent_id
         args.adapter = args.adapter or session.adapter
         args.cwd = args.cwd or session.project_dir
-        if args.adapter in {"codex", "codex-exec"} and not args.resume and not args.resume_last:
+        if args.adapter in {"codex", "codex-exec", "kimi", "kimi-print"} and not args.resume and not args.resume_last:
             if not session.provider_session_id:
                 print(
                     f"session has no provider session id; pass --resume explicitly: {session.session_id}",
@@ -213,6 +216,7 @@ async def _run_prompt(args: argparse.Namespace, workspace: Workspace) -> int:
 
     args.adapter = args.adapter or "echo"
     args.codex_bin = args.codex_bin or "codex"
+    args.kimi_bin = args.kimi_bin or "kimi"
     args.approval_mode = args.approval_mode or "fail"
     project_dir = Path(args.cwd or ".").expanduser().resolve()
     adapter = _build_adapter(args)
@@ -254,6 +258,16 @@ def _build_adapter(args: argparse.Namespace) -> AgentAdapter:
             sandbox=args.sandbox,
             approval_mode=ApprovalMode.parse(args.approval_mode),
             skip_git_repo_check=not args.no_skip_git_check,
+            extra_args=tuple(args.extra_arg or ()),
+        )
+    if adapter_name in {"kimi", "kimi-print"}:
+        return KimiPrintAdapter(
+            kimi_bin=args.kimi_bin,
+            cwd=Path(args.cwd or ".").expanduser().resolve(),
+            resume=args.resume,
+            resume_last=args.resume_last,
+            model=args.model,
+            approval_mode=ApprovalMode.parse(args.approval_mode),
             extra_args=tuple(args.extra_arg or ()),
         )
     raise ValueError(f"unsupported adapter: {adapter_name}")
@@ -345,6 +359,7 @@ def main(argv: list[str] | None = None) -> int:
                     sandbox=args.sandbox or "",
                     approval_mode=args.approval_mode,
                     codex_bin=args.codex_bin,
+                    kimi_bin=args.kimi_bin,
                     resume_policy=args.resume_policy,
                     replace=args.replace,
                 )
@@ -516,6 +531,7 @@ def _apply_agent_defaults(args: argparse.Namespace, agent: AgentRecord, sessions
     args.sandbox = args.sandbox or agent.sandbox or None
     args.approval_mode = args.approval_mode or agent.approval_mode
     args.codex_bin = args.codex_bin or agent.codex_bin
+    args.kimi_bin = args.kimi_bin or agent.kimi_bin
     args.title = args.title or agent.title
 
     if args.session or args.resume or args.resume_last:
@@ -527,7 +543,7 @@ def _apply_agent_defaults(args: argparse.Namespace, agent: AgentRecord, sessions
     latest = sessions.latest_for_agent(
         agent.agent_id,
         adapter=adapter_name,
-        require_provider_session=adapter_name in {"codex", "codex-exec"},
+        require_provider_session=adapter_name in {"codex", "codex-exec", "kimi", "kimi-print"},
     )
     if latest is not None:
         args.session = latest.session_id

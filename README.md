@@ -23,6 +23,7 @@ This repository starts with a minimal core:
 - Adapter protocol
 - Debug echo adapter
 - Codex non-interactive adapter using `codex exec --json`
+- Kimi non-interactive adapter using `kimi --print --output-format stream-json`
 - Project registry for managing multiple source projects from one workspace
 - Agent registry with project defaults, role, team, and resume policy
 - Task board with project, agent, session, status, priority, and notes
@@ -55,6 +56,7 @@ python -m agentdeck agents list
 python -m agentdeck tasks list
 python -m agentdeck sessions list
 python -m agentdeck run --adapter codex --cwd "$PWD" "Summarize this repository"
+python -m agentdeck run --adapter kimi --cwd "$PWD" "Summarize this repository"
 python -m agentdeck run --adapter codex --cwd "$PWD" --resume-last "Continue"
 python -m agentdeck run --adapter codex --cwd "$PWD" --approval-mode record "Show me what approval is needed"
 python -m agentdeck memory add "Project rule" "Keep shared memory concise."

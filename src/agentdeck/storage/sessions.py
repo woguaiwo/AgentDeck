@@ -192,11 +192,17 @@ class SessionRegistry:
     def _update_status_event(self, record: SessionRecord, event: AgentEvent) -> None:
         payload = event.payload
         event_type = str(payload.get("type") or event.text or "").lower().replace(".", "_").replace("-", "_")
-        if event_type == "thread_started":
-            thread_id = str(payload.get("thread_id") or payload.get("id") or "")
-            if thread_id:
-                record.provider_session_id = thread_id
-                record.provider_session_kind = "codex_thread"
+        if event_type in {"thread_started", "session_started"}:
+            provider_id = str(payload.get("thread_id") or payload.get("session_id") or payload.get("id") or "")
+            if provider_id:
+                record.provider_session_id = provider_id
+                provider = str(payload.get("provider") or "").lower()
+                if event_type == "thread_started":
+                    record.provider_session_kind = "codex_thread"
+                elif provider:
+                    record.provider_session_kind = f"{provider}_session"
+                else:
+                    record.provider_session_kind = "provider_session"
             provider_title = _clean_title(str(payload.get("title") or payload.get("name") or ""))
             if provider_title and record.metadata.get("title_source") != "manual":
                 record.title = provider_title

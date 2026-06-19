@@ -27,6 +27,7 @@ class AgentRecord:
     sandbox: str = ""
     approval_mode: str = "fail"
     codex_bin: str = "codex"
+    kimi_bin: str = "kimi"
     resume_policy: str = "latest"
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -46,6 +47,7 @@ class AgentRecord:
             sandbox=str(data.get("sandbox") or ""),
             approval_mode=str(data.get("approval_mode") or "fail"),
             codex_bin=str(data.get("codex_bin") or "codex"),
+            kimi_bin=str(data.get("kimi_bin") or "kimi"),
             resume_policy=str(data.get("resume_policy") or "latest"),
             created_at=float(data.get("created_at") or time.time()),
             updated_at=float(data.get("updated_at") or time.time()),
@@ -80,6 +82,7 @@ class AgentRegistry:
         sandbox: str = "",
         approval_mode: str = "fail",
         codex_bin: str = "codex",
+        kimi_bin: str = "kimi",
         resume_policy: str = "latest",
         replace: bool = False,
     ) -> AgentRecord:
@@ -103,6 +106,7 @@ class AgentRegistry:
             sandbox=sandbox or "",
             approval_mode=approval_mode or "fail",
             codex_bin=codex_bin or "codex",
+            kimi_bin=kimi_bin or "kimi",
             resume_policy=resume_policy or "latest",
             created_at=created_at,
             updated_at=now,
