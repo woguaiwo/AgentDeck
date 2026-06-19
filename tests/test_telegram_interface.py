@@ -99,6 +99,9 @@ class TelegramInterfaceTests(unittest.TestCase):
             self.assertEqual(config.token, "token")
             self.assertEqual(config.allowed_chat_ids, {1, 2})
             self.assertEqual(config.poll_timeout, 7)
+
+            config = config_from_env(token="    Token: 123456:ABC_def-GHI   ")
+            self.assertEqual(config.token, "123456:ABC_def-GHI")
         finally:
             if old_allowed is not None:
                 os.environ["AGENTDECK_TELEGRAM_ALLOWED_CHATS"] = old_allowed

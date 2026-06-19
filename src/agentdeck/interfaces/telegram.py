@@ -272,7 +272,7 @@ class TelegramServer:
 
 
 def config_from_env(token: str | None = None, allowed_chat_ids: list[str] | None = None, poll_timeout: int = 30) -> TelegramConfig:
-    resolved_token = token or os.environ.get("AGENTDECK_TELEGRAM_TOKEN") or ""
+    resolved_token = _normalize_bot_token(token or os.environ.get("AGENTDECK_TELEGRAM_TOKEN") or "")
     allowed = set(_parse_allowed_chat_ids(allowed_chat_ids or []))
     allowed.update(_parse_allowed_chat_ids((os.environ.get("AGENTDECK_TELEGRAM_ALLOWED_CHATS") or "").split(",")))
     return TelegramConfig(token=resolved_token, allowed_chat_ids=allowed, poll_timeout=poll_timeout)
@@ -320,6 +320,13 @@ def _parse_allowed_chat_ids(values: list[str]) -> list[int]:
         except ValueError:
             continue
     return chat_ids
+
+
+def _normalize_bot_token(value: str) -> str:
+    clean = value.strip()
+    if "Token:" in clean:
+        clean = clean.split("Token:", 1)[1].strip()
+    return "".join(clean.split())
 
 
 def _help_text() -> str:
