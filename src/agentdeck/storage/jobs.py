@@ -97,12 +97,15 @@ class JobRegistry:
         self,
         *,
         interface: str | None = None,
+        chat_id: int | None = None,
         status: str | None = None,
         limit: int | None = None,
     ) -> list[JobRecord]:
         records = list(self._read().values())
         if interface:
             records = [record for record in records if record.interface == interface]
+        if chat_id is not None:
+            records = [record for record in records if record.chat_id == chat_id]
         if status:
             clean_status = _validate_status(status)
             records = [record for record in records if record.status == clean_status]

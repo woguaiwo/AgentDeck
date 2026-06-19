@@ -93,6 +93,8 @@ class TelegramInterfaceTests(unittest.TestCase):
     def test_run_command_can_start_background_job(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            workspace.ensure()
+            task = TaskBoard(workspace).create(title="Background task")
             started = threading.Event()
             release = threading.Event()
             sent: list[tuple[int, str]] = []
@@ -113,7 +115,7 @@ class TelegramInterfaceTests(unittest.TestCase):
             queue = TelegramJobQueue(workspace, sender=lambda chat_id, text: sent.append((chat_id, text)), runner=runner)
             handler = TelegramCommandHandler(workspace, job_queue=queue)
 
-            reply = asyncio.run(handler.handle_text("/run task-a background work", chat_id=42))[0]
+            reply = asyncio.run(handler.handle_text(f"/run {task.task_id} background work", chat_id=42))[0]
             self.assertIn("Job started:", reply)
             job_id = re.search(r"Job started: (job-\S+)", reply).group(1)
             self.assertTrue(started.wait(timeout=1))
@@ -127,11 +129,80 @@ class TelegramInterfaceTests(unittest.TestCase):
             assert job is not None
             self.assertEqual(job.status, "done")
             self.assertEqual(job.session_id, "session-bg")
-            self.assertEqual(sent, [(42, f"Job done: {job_id}\ntask: task-a\nsession: session-bg\n\ndone: background work")])
+            self.assertEqual(sent, [(42, f"Job done: {job_id}\ntask: {task.task_id}\nsession: session-bg\n\ndone: background work")])
 
             detail = asyncio.run(handler.handle_text(f"/job {job_id}", chat_id=42))[0]
             self.assertIn("status: done", detail)
             self.assertIn("done: background work", detail)
+
+    def test_current_task_removes_need_to_copy_task_or_job_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            project = tmp / "project"
+            project.mkdir()
+            seen: list[tuple[str, str]] = []
+            sent: list[tuple[int, str]] = []
+
+            self._main(["--workspace", str(workspace.root), "projects", "create", "proj", "--title", "Project One", "--cwd", str(project)])
+            self._main(["--workspace", str(workspace.root), "agents", "create", "owner", "--project", "proj", "--adapter", "echo"])
+            task_out = self._main(["--workspace", str(workspace.root), "tasks", "create", "Named phone task", "--project", "proj"])
+            task_id = re.search(r"\((task-[^)]+)\)", task_out).group(1)
+
+            async def runner(workspace_arg: Workspace, request: RunRequest) -> RunServiceResult:
+                seen.append((request.task or "", request.prompt))
+                return RunServiceResult(
+                    session_id="session-current",
+                    final_text=f"done: {request.prompt}",
+                    events=[],
+                    agent_id="owner",
+                    adapter="echo",
+                    task_id=request.task or "",
+                )
+
+            queue = TelegramJobQueue(workspace, sender=lambda chat_id, text: sent.append((chat_id, text)), runner=runner)
+            handler = TelegramCommandHandler(workspace, job_queue=queue)
+
+            selected = asyncio.run(handler.handle_text("/use named phone task", chat_id=42))[0]
+            self.assertIn("Current task set", selected)
+            self.assertIn(task_id, selected)
+
+            current = asyncio.run(handler.handle_text("/current", chat_id=42))[0]
+            self.assertIn("Named phone task", current)
+
+            reply = asyncio.run(handler.handle_text("/run continue without ids", chat_id=42))[0]
+            self.assertIn("Job started:", reply)
+            job_id = re.search(r"Job started: (job-\S+)", reply).group(1)
+            job = queue.wait(job_id, timeout=2)
+            assert job is not None
+            self.assertEqual(seen, [(task_id, "continue without ids")])
+
+            latest = asyncio.run(handler.handle_text("/job", chat_id=42))[0]
+            self.assertIn(f"Job: {job_id}", latest)
+            self.assertIn("done: continue without ids", latest)
+
+    def test_newtask_names_and_selects_task_from_telegram(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            project = tmp / "project"
+            project.mkdir()
+
+            self._main(["--workspace", str(workspace.root), "projects", "create", "proj", "--title", "Project One", "--cwd", str(project)])
+            handler = TelegramCommandHandler(workspace)
+
+            created = asyncio.run(handler.handle_text("/newtask Mobile named task", chat_id=42))[0]
+            self.assertIn("Task created and selected", created)
+            self.assertIn("Mobile named task", created)
+            task_id = re.search(r"id: (task-\S+)", created).group(1)
+
+            task = TaskBoard(workspace).get(task_id)
+            assert task is not None
+            self.assertEqual(task.title, "Mobile named task")
+            self.assertEqual(task.project_id, "proj")
+
+            current = asyncio.run(handler.handle_text("/current", chat_id=42))[0]
+            self.assertIn("Mobile named task", current)
 
     def test_jobs_are_persisted_and_unfinished_jobs_are_marked_interrupted(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -185,6 +256,8 @@ class TelegramInterfaceTests(unittest.TestCase):
     def test_cancel_running_job_records_cancel_request(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            workspace.ensure()
+            task = TaskBoard(workspace).create(title="Cancellable task")
             started = threading.Event()
             release = threading.Event()
             sent: list[tuple[int, str]] = []
@@ -204,7 +277,7 @@ class TelegramInterfaceTests(unittest.TestCase):
             queue = TelegramJobQueue(workspace, sender=lambda chat_id, text: sent.append((chat_id, text)), runner=runner)
             handler = TelegramCommandHandler(workspace, job_queue=queue)
 
-            reply = asyncio.run(handler.handle_text("/run task-a cancellable work", chat_id=42))[0]
+            reply = asyncio.run(handler.handle_text(f"/run {task.task_id} cancellable work", chat_id=42))[0]
             job_id = re.search(r"Job started: (job-\S+)", reply).group(1)
             self.assertTrue(started.wait(timeout=1))
 
@@ -224,9 +297,47 @@ class TelegramInterfaceTests(unittest.TestCase):
             self.assertEqual(len(sent), 1)
             self.assertIn("note: Cancellation was requested", sent[0][1])
 
+    def test_cancel_without_id_uses_latest_cancellable_job_for_chat(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            workspace.ensure()
+            task = TaskBoard(workspace).create(title="Task A")
+            started = threading.Event()
+            release = threading.Event()
+
+            async def runner(workspace_arg: Workspace, request: RunRequest) -> RunServiceResult:
+                started.set()
+                release.wait(timeout=2)
+                return RunServiceResult(
+                    session_id="session-latest",
+                    final_text="finished",
+                    events=[],
+                    agent_id="owner",
+                    adapter="echo",
+                    task_id=request.task or "",
+                )
+
+            queue = TelegramJobQueue(workspace, sender=lambda chat_id, text: None, runner=runner)
+            handler = TelegramCommandHandler(workspace, job_queue=queue)
+
+            reply = asyncio.run(handler.handle_text(f"/run {task.task_id} latest job", chat_id=42))[0]
+            job_id = re.search(r"Job started: (job-\S+)", reply).group(1)
+            self.assertTrue(started.wait(timeout=1))
+
+            cancel_reply = asyncio.run(handler.handle_text("/cancel", chat_id=42))[0]
+            self.assertIn(f"Cancel requested: {job_id}", cancel_reply)
+
+            requested = queue.get(job_id)
+            assert requested is not None
+            self.assertEqual(requested.status, "cancel_requested")
+            release.set()
+            queue.wait(job_id, timeout=2)
+
     def test_cancelled_event_marks_job_cancelled(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            workspace.ensure()
+            task = TaskBoard(workspace).create(title="Cancelled task")
             started = threading.Event()
             sent: list[tuple[int, str]] = []
 
@@ -253,7 +364,7 @@ class TelegramInterfaceTests(unittest.TestCase):
             queue = TelegramJobQueue(workspace, sender=lambda chat_id, text: sent.append((chat_id, text)), runner=runner)
             handler = TelegramCommandHandler(workspace, job_queue=queue)
 
-            reply = asyncio.run(handler.handle_text("/run task-a cancellable work", chat_id=42))[0]
+            reply = asyncio.run(handler.handle_text(f"/run {task.task_id} cancellable work", chat_id=42))[0]
             job_id = re.search(r"Job started: (job-\S+)", reply).group(1)
             self.assertTrue(started.wait(timeout=1))
 

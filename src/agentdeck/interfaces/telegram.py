@@ -9,6 +9,7 @@ import threading
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 from agentdeck.core.cancel import CancellationToken
@@ -17,8 +18,8 @@ from agentdeck.core.events import EventKind
 from agentdeck.core.run_service import RunConfigurationError, RunRequest, run_agent_prompt
 from agentdeck.storage.approvals import ApprovalRegistry
 from agentdeck.storage.jobs import JobRecord, JobRegistry
-from agentdeck.storage.projects import ProjectRegistry
-from agentdeck.storage.tasks import TaskBoard
+from agentdeck.storage.projects import ProjectRecord, ProjectRegistry
+from agentdeck.storage.tasks import TaskBoard, TaskRecord
 
 
 MAX_TELEGRAM_MESSAGE = 3900
@@ -59,6 +60,52 @@ class TelegramBotApi:
         return data
 
 
+class TelegramChatStateStore:
+    """Persist small per-chat interface state."""
+
+    def __init__(self, workspace: Workspace) -> None:
+        self.workspace = workspace
+        self._lock = threading.Lock()
+
+    @property
+    def path(self) -> Path:
+        return self.workspace.root / "telegram" / "state.json"
+
+    def current_task(self, chat_id: int) -> str:
+        with self._lock:
+            data = self._read()
+            return str(data.get(str(chat_id), {}).get("current_task_id") or "")
+
+    def set_current_task(self, chat_id: int, task_id: str) -> None:
+        with self._lock:
+            data = self._read()
+            chat = dict(data.get(str(chat_id)) or {})
+            chat["current_task_id"] = task_id
+            data[str(chat_id)] = chat
+            self._write(data)
+
+    def _read(self) -> dict[str, dict[str, Any]]:
+        if not self.path.exists():
+            return {}
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        chats = data.get("chats", data)
+        if not isinstance(chats, dict):
+            return {}
+        return {str(key): dict(value) for key, value in chats.items() if isinstance(value, dict)}
+
+    def _write(self, data: dict[str, dict[str, Any]]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"version": 1, "chats": data}
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(self.path)
+
+
 class TelegramJobQueue:
     """Background runner for Telegram-triggered jobs."""
 
@@ -94,9 +141,16 @@ class TelegramJobQueue:
         with self._lock:
             return self.registry.get(job_id)
 
-    def list(self, *, limit: int = 10) -> list[JobRecord]:
+    def list(self, *, chat_id: int | None = None, limit: int = 10) -> list[JobRecord]:
         with self._lock:
-            return self.registry.list(interface="telegram", limit=limit)
+            return self.registry.list(interface="telegram", chat_id=chat_id, limit=limit)
+
+    def latest_for_chat(self, chat_id: int, *, statuses: set[str] | None = None) -> JobRecord | None:
+        with self._lock:
+            records = self.registry.list(interface="telegram", chat_id=chat_id)
+        if statuses:
+            records = [record for record in records if record.status in statuses]
+        return records[0] if records else None
 
     def wait(self, job_id: str, *, timeout: float | None = None) -> JobRecord | None:
         with self._lock:
@@ -225,6 +279,7 @@ class TelegramCommandHandler:
         self.workspace = workspace
         self.runner = runner
         self.job_queue = job_queue
+        self.chat_state = TelegramChatStateStore(workspace)
 
     async def handle_text(self, text: str, *, chat_id: int | None = None) -> list[str]:
         clean = text.strip()
@@ -240,6 +295,12 @@ class TelegramCommandHandler:
             return [self._tasks(rest)]
         if command in {"/task", "task"}:
             return [self._task(rest)]
+        if command in {"/newtask", "newtask"}:
+            return [self._newtask(rest, chat_id=chat_id)]
+        if command in {"/use", "use"}:
+            return [self._use(rest, chat_id=chat_id)]
+        if command in {"/current", "current"}:
+            return [self._current(chat_id=chat_id)]
         if command in {"/agents", "agents"}:
             return [self._agents(rest)]
         if command in {"/approvals", "approvals"}:
@@ -251,11 +312,11 @@ class TelegramCommandHandler:
         if command in {"/reject", "reject"}:
             return [self._resolve_approval(rest, "rejected")]
         if command in {"/jobs", "jobs"}:
-            return [self._jobs()]
+            return [self._jobs(chat_id=chat_id)]
         if command in {"/job", "job"}:
-            return [self._job(rest)]
+            return [self._job(rest, chat_id=chat_id)]
         if command in {"/cancel", "cancel"}:
-            return [self._cancel(rest)]
+            return [self._cancel(rest, chat_id=chat_id)]
         if command in {"/run", "run"}:
             return [await self._run(rest, chat_id=chat_id)]
         return [f"Unknown command: {command}\n\n{_help_text()}"]
@@ -288,7 +349,7 @@ class TelegramCommandHandler:
         task_id = rest.strip()
         if not task_id:
             return "Usage: /task <task_id>"
-        record = TaskBoard(self.workspace).resolve(task_id)
+        record = self._resolve_task(task_id)
         if record is None:
             return f"Task not found: {task_id}"
         lines = [
@@ -307,6 +368,97 @@ class TelegramCommandHandler:
             for note in record.notes[-3:]:
                 lines.append(f"- {note.get('text', '')}")
         return "\n".join(lines)
+
+    def _newtask(self, rest: str, *, chat_id: int | None) -> str:
+        title = rest.strip()
+        if not title:
+            return "Usage: /newtask <task title>"
+        project = self._default_project(chat_id=chat_id)
+        record = TaskBoard(self.workspace).create(
+            title=title,
+            project_id=project.project_id if project is not None else "",
+            agent_id=project.default_agent_id if project is not None else "owner",
+            team_id=project.team_id if project is not None else "default",
+        )
+        if chat_id is not None:
+            self.chat_state.set_current_task(chat_id, record.task_id)
+        lines = [
+            "Task created and selected:",
+            record.title,
+            f"id: {record.task_id}",
+        ]
+        if record.project_id:
+            lines.append(f"project: {record.project_id}")
+        lines.append("Now you can send /run <message>")
+        return "\n".join(lines)
+
+    def _use(self, rest: str, *, chat_id: int | None) -> str:
+        if chat_id is None:
+            return "This command requires a Telegram chat."
+        task_ref = rest.strip()
+        if not task_ref:
+            return "Usage: /use <task_id or exact task title>"
+        task = self._resolve_task(task_ref)
+        if task is None:
+            return f"Task not found: {task_ref}"
+        self.chat_state.set_current_task(chat_id, task.task_id)
+        return "\n".join(
+            [
+                "Current task set:",
+                task.title,
+                f"id: {task.task_id}",
+                "Now you can send /run <message>",
+            ]
+        )
+
+    def _current(self, *, chat_id: int | None) -> str:
+        if chat_id is None:
+            return "This command requires a Telegram chat."
+        lines: list[str] = []
+        current_task_id = self.chat_state.current_task(chat_id)
+        task = self._resolve_task(current_task_id) if current_task_id else None
+        if task is None:
+            lines.append("Current task: none")
+            lines.append("Use /use <task_id or task title>")
+        else:
+            lines.append("Current task:")
+            lines.append(task.title)
+            lines.append(f"id: {task.task_id}")
+            lines.append(f"status: {task.status}")
+        if self.job_queue is not None:
+            latest = self.job_queue.latest_for_chat(chat_id)
+            if latest is not None:
+                lines.append("")
+                lines.append("Latest job:")
+                lines.append(f"id: {latest.job_id}")
+                lines.append(f"status: {latest.status}")
+        return "\n".join(lines)
+
+    def _default_project(self, *, chat_id: int | None) -> ProjectRecord | None:
+        if chat_id is not None:
+            current_task_id = self.chat_state.current_task(chat_id)
+            task = self._resolve_task(current_task_id) if current_task_id else None
+            if task is not None and task.project_id:
+                project = ProjectRegistry(self.workspace).resolve(task.project_id)
+                if project is not None:
+                    return project
+        projects = ProjectRegistry(self.workspace).list(status="active")
+        if len(projects) == 1:
+            return projects[0]
+        return None
+
+    def _resolve_task(self, value: str) -> TaskRecord | None:
+        board = TaskBoard(self.workspace)
+        task = board.resolve(value)
+        if task is not None:
+            return task
+        clean = " ".join(value.strip().split()).lower()
+        if not clean:
+            return None
+        matches = [record for record in board.list() if record.title.lower() == clean]
+        if len(matches) == 1:
+            return matches[0]
+        return None
 
     def _agents(self, rest: str) -> str:
         project = rest.strip() or None
@@ -377,21 +529,24 @@ class TelegramCommandHandler:
         return f"Approval {record.status}: {record.title}\nid: {record.approval_id}"
 
     async def _run(self, rest: str, *, chat_id: int | None = None) -> str:
-        task_id, prompt = _split_once(rest.strip())
-        if not task_id or not prompt:
-            return "Usage: /run <task_id> <message>"
+        task, prompt, error = self._resolve_run_target(rest, chat_id=chat_id)
+        if error:
+            return error
+        assert task is not None
+        if chat_id is not None:
+            self.chat_state.set_current_task(chat_id, task.task_id)
         if self.job_queue is not None and chat_id is not None:
-            job = self.job_queue.start(chat_id=chat_id, task_id=task_id, prompt=prompt)
+            job = self.job_queue.start(chat_id=chat_id, task_id=task.task_id, prompt=prompt)
             return "\n".join(
                 [
                     f"Job started: {job.job_id}",
-                    f"task: {job.task_id}",
+                    f"task: {task.title}",
                     "status: queued",
-                    f"Use /job {job.job_id}",
+                    "Use /job to view the latest job",
                 ]
             )
         try:
-            result = await self.runner(self.workspace, RunRequest(prompt=prompt, task=task_id))
+            result = await self.runner(self.workspace, RunRequest(prompt=prompt, task=task.task_id))
         except RunConfigurationError as exc:
             return str(exc)
         lines = []
@@ -408,10 +563,29 @@ class TelegramCommandHandler:
                 lines.append(f"Use /approval {result.pending_approvals[0].approval_id}")
         return "\n".join(lines)
 
-    def _jobs(self) -> str:
+    def _resolve_run_target(self, rest: str, *, chat_id: int | None) -> tuple[TaskRecord | None, str, str]:
+        clean = rest.strip()
+        if not clean:
+            return None, "", "Usage: /run <message> after /use <task>, or /run <task_id> <message>"
+        task_ref, maybe_prompt = _split_once(clean)
+        if task_ref and maybe_prompt:
+            task = self._resolve_task(task_ref)
+            if task is not None:
+                return task, maybe_prompt, ""
+        if chat_id is not None:
+            current_task_id = self.chat_state.current_task(chat_id)
+            if current_task_id:
+                task = self._resolve_task(current_task_id)
+                if task is not None:
+                    return task, clean, ""
+        if task_ref and not maybe_prompt and self._resolve_task(task_ref) is not None:
+            return None, "", "Usage: /run <task_id> <message>"
+        return None, "", "No current task. Use /use <task_id or exact task title>, then /run <message>."
+
+    def _jobs(self, *, chat_id: int | None) -> str:
         if self.job_queue is None:
             return "Jobs are not enabled for this interface."
-        records = self.job_queue.list()
+        records = self.job_queue.list(chat_id=chat_id)
         if not records:
             return "No jobs."
         lines = ["Jobs:"]
@@ -424,12 +598,17 @@ class TelegramCommandHandler:
                 lines.append(f"   error: {_one_line(job.error, 120)}")
         return "\n".join(lines)
 
-    def _job(self, rest: str) -> str:
+    def _job(self, rest: str, *, chat_id: int | None) -> str:
         if self.job_queue is None:
             return "Jobs are not enabled for this interface."
         job_id = rest.strip()
         if not job_id:
-            return "Usage: /job <job_id>"
+            if chat_id is None:
+                return "Usage: /job <job_id>"
+            latest = self.job_queue.latest_for_chat(chat_id)
+            if latest is None:
+                return "No jobs."
+            job_id = latest.job_id
         job = self.job_queue.get(job_id)
         if job is None:
             return f"Job not found: {job_id}"
@@ -447,12 +626,17 @@ class TelegramCommandHandler:
             lines.append(job.final_text)
         return "\n".join(lines)
 
-    def _cancel(self, rest: str) -> str:
+    def _cancel(self, rest: str, *, chat_id: int | None) -> str:
         if self.job_queue is None:
             return "Jobs are not enabled for this interface."
         job_id = rest.strip()
         if not job_id:
-            return "Usage: /cancel <job_id>"
+            if chat_id is None:
+                return "Usage: /cancel <job_id>"
+            latest = self.job_queue.latest_for_chat(chat_id, statuses={"queued", "running", "cancel_requested"})
+            if latest is None:
+                return "No queued or running job to cancel."
+            job_id = latest.job_id
         before = self.job_queue.get(job_id)
         if before is None:
             return f"Job not found: {job_id}"
@@ -606,7 +790,11 @@ def _help_text() -> str:
             "/agents [project]",
             "/tasks [project]",
             "/task <task_id>",
+            "/newtask <task title>",
+            "/use <task_id or exact task title>",
+            "/current",
             "/run <task_id> <message>",
+            "/run <message>  (after /use)",
             "/approvals [pending|approved|rejected]",
             "/approval <approval_id>",
             "/approve <approval_id> [note]",
