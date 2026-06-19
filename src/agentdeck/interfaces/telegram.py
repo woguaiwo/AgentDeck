@@ -84,6 +84,47 @@ class TelegramChatStateStore:
             data[str(chat_id)] = chat
             self._write(data)
 
+    def set_recent(self, chat_id: int, *, task_ids: list[str], job_ids: list[str]) -> None:
+        with self._lock:
+            data = self._read()
+            chat = dict(data.get(str(chat_id)) or {})
+            chat["recent_task_ids"] = task_ids
+            chat["recent_job_ids"] = job_ids
+            data[str(chat_id)] = chat
+            self._write(data)
+
+    def set_recent_tasks(self, chat_id: int, task_ids: list[str]) -> None:
+        with self._lock:
+            data = self._read()
+            chat = dict(data.get(str(chat_id)) or {})
+            chat["recent_task_ids"] = task_ids
+            data[str(chat_id)] = chat
+            self._write(data)
+
+    def set_recent_jobs(self, chat_id: int, job_ids: list[str]) -> None:
+        with self._lock:
+            data = self._read()
+            chat = dict(data.get(str(chat_id)) or {})
+            chat["recent_job_ids"] = job_ids
+            data[str(chat_id)] = chat
+            self._write(data)
+
+    def recent_task_id(self, chat_id: int, index: int) -> str:
+        with self._lock:
+            data = self._read()
+            task_ids = data.get(str(chat_id), {}).get("recent_task_ids") or []
+            if not isinstance(task_ids, list) or index < 1 or index > len(task_ids):
+                return ""
+            return str(task_ids[index - 1])
+
+    def recent_job_id(self, chat_id: int, index: int) -> str:
+        with self._lock:
+            data = self._read()
+            job_ids = data.get(str(chat_id), {}).get("recent_job_ids") or []
+            if not isinstance(job_ids, list) or index < 1 or index > len(job_ids):
+                return ""
+            return str(job_ids[index - 1])
+
     def _read(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():
             return {}
@@ -292,15 +333,17 @@ class TelegramCommandHandler:
         if command in {"/projects", "projects"}:
             return [self._projects()]
         if command in {"/tasks", "tasks"}:
-            return [self._tasks(rest)]
+            return [self._tasks(rest, chat_id=chat_id)]
         if command in {"/task", "task"}:
-            return [self._task(rest)]
+            return [self._task(rest, chat_id=chat_id)]
         if command in {"/newtask", "newtask"}:
             return [self._newtask(rest, chat_id=chat_id)]
         if command in {"/use", "use"}:
             return [self._use(rest, chat_id=chat_id)]
         if command in {"/current", "current"}:
             return [self._current(chat_id=chat_id)]
+        if command in {"/list", "list", "/recent", "recent"}:
+            return [self._recent(chat_id=chat_id)]
         if command in {"/agents", "agents"}:
             return [self._agents(rest)]
         if command in {"/approvals", "approvals"}:
@@ -332,11 +375,13 @@ class TelegramCommandHandler:
             lines.append(f"   agent: {record.default_agent_id}  status: {record.status}")
         return "\n".join(lines)
 
-    def _tasks(self, rest: str) -> str:
+    def _tasks(self, rest: str, *, chat_id: int | None) -> str:
         project = rest.strip() or None
         records = TaskBoard(self.workspace).list(project_id=project)
         if not records:
             return "No tasks."
+        if chat_id is not None:
+            self.chat_state.set_recent_tasks(chat_id, [record.task_id for record in records])
         lines = ["Tasks:"]
         for index, record in enumerate(records, 1):
             lines.append(f"{index}. {record.title}")
@@ -345,11 +390,11 @@ class TelegramCommandHandler:
             lines.append(f"   project: {record.project_id or '-'}  agent: {record.agent_id}")
         return "\n".join(lines)
 
-    def _task(self, rest: str) -> str:
+    def _task(self, rest: str, *, chat_id: int | None = None) -> str:
         task_id = rest.strip()
         if not task_id:
             return "Usage: /task <task_id>"
-        record = self._resolve_task(task_id)
+        record = self._resolve_task(task_id, chat_id=chat_id)
         if record is None:
             return f"Task not found: {task_id}"
         lines = [
@@ -398,7 +443,7 @@ class TelegramCommandHandler:
         task_ref = rest.strip()
         if not task_ref:
             return "Usage: /use <task_id or exact task title>"
-        task = self._resolve_task(task_ref)
+        task = self._resolve_task(task_ref, chat_id=chat_id)
         if task is None:
             return f"Task not found: {task_ref}"
         self.chat_state.set_current_task(chat_id, task.task_id)
@@ -434,6 +479,45 @@ class TelegramCommandHandler:
                 lines.append(f"status: {latest.status}")
         return "\n".join(lines)
 
+    def _recent(self, *, chat_id: int | None) -> str:
+        tasks = TaskBoard(self.workspace).list()[:8]
+        jobs = self.job_queue.list(chat_id=chat_id, limit=8) if self.job_queue is not None else []
+        if chat_id is not None:
+            self.chat_state.set_recent(
+                chat_id,
+                task_ids=[task.task_id for task in tasks],
+                job_ids=[job.job_id for job in jobs],
+            )
+
+        current_task_id = self.chat_state.current_task(chat_id) if chat_id is not None else ""
+        lines: list[str] = ["Recent:"]
+        if not tasks:
+            lines.append("Tasks: none")
+        else:
+            lines.append("Tasks:")
+            for index, task in enumerate(tasks, 1):
+                marker = " [current]" if task.task_id == current_task_id else ""
+                lines.append(f"{index}. {task.title}{marker}")
+                lines.append(f"   status: {task.status}  project: {task.project_id or '-'}")
+
+        if self.job_queue is not None:
+            if not jobs:
+                lines.append("")
+                lines.append("Jobs: none")
+            else:
+                lines.append("")
+                lines.append("Jobs:")
+                for index, job in enumerate(jobs, 1):
+                    task = self._resolve_task(job.task_id)
+                    task_title = task.title if task is not None else job.task_id
+                    lines.append(f"{index}. {job.status}  {task_title}")
+                    if job.session_id:
+                        lines.append(f"   session: {job.session_id}")
+
+        lines.append("")
+        lines.append("Use /use 1, /run 1 <message>, /job 1, or /cancel 1.")
+        return "\n".join(lines)
+
     def _default_project(self, *, chat_id: int | None) -> ProjectRecord | None:
         if chat_id is not None:
             current_task_id = self.chat_state.current_task(chat_id)
@@ -447,7 +531,11 @@ class TelegramCommandHandler:
             return projects[0]
         return None
 
-    def _resolve_task(self, value: str) -> TaskRecord | None:
+    def _resolve_task(self, value: str, *, chat_id: int | None = None) -> TaskRecord | None:
+        if chat_id is not None and value.strip().isdigit():
+            mapped = self.chat_state.recent_task_id(chat_id, int(value.strip()))
+            if mapped:
+                value = mapped
         board = TaskBoard(self.workspace)
         task = board.resolve(value)
         if task is not None:
@@ -569,7 +657,7 @@ class TelegramCommandHandler:
             return None, "", "Usage: /run <message> after /use <task>, or /run <task_id> <message>"
         task_ref, maybe_prompt = _split_once(clean)
         if task_ref and maybe_prompt:
-            task = self._resolve_task(task_ref)
+            task = self._resolve_task(task_ref, chat_id=chat_id)
             if task is not None:
                 return task, maybe_prompt, ""
         if chat_id is not None:
@@ -578,7 +666,7 @@ class TelegramCommandHandler:
                 task = self._resolve_task(current_task_id)
                 if task is not None:
                     return task, clean, ""
-        if task_ref and not maybe_prompt and self._resolve_task(task_ref) is not None:
+        if task_ref and not maybe_prompt and self._resolve_task(task_ref, chat_id=chat_id) is not None:
             return None, "", "Usage: /run <task_id> <message>"
         return None, "", "No current task. Use /use <task_id or exact task title>, then /run <message>."
 
@@ -588,6 +676,8 @@ class TelegramCommandHandler:
         records = self.job_queue.list(chat_id=chat_id)
         if not records:
             return "No jobs."
+        if chat_id is not None:
+            self.chat_state.set_recent_jobs(chat_id, [record.job_id for record in records])
         lines = ["Jobs:"]
         for index, job in enumerate(records, 1):
             lines.append(f"{index}. {job.job_id}")
@@ -609,6 +699,8 @@ class TelegramCommandHandler:
             if latest is None:
                 return "No jobs."
             job_id = latest.job_id
+        else:
+            job_id = self._resolve_job_id(job_id, chat_id=chat_id)
         job = self.job_queue.get(job_id)
         if job is None:
             return f"Job not found: {job_id}"
@@ -637,6 +729,8 @@ class TelegramCommandHandler:
             if latest is None:
                 return "No queued or running job to cancel."
             job_id = latest.job_id
+        else:
+            job_id = self._resolve_job_id(job_id, chat_id=chat_id)
         before = self.job_queue.get(job_id)
         if before is None:
             return f"Job not found: {job_id}"
@@ -656,6 +750,13 @@ class TelegramCommandHandler:
         if after.status == "cancelled":
             return f"Job already cancelled: {job_id}"
         return f"Job is already {after.status}: {job_id}"
+
+    def _resolve_job_id(self, value: str, *, chat_id: int | None) -> str:
+        if chat_id is not None and value.strip().isdigit():
+            mapped = self.chat_state.recent_job_id(chat_id, int(value.strip()))
+            if mapped:
+                return mapped
+        return value.strip()
 
 
 class TelegramServer:
@@ -793,6 +894,7 @@ def _help_text() -> str:
             "/newtask <task title>",
             "/use <task_id or exact task title>",
             "/current",
+            "/list",
             "/run <task_id> <message>",
             "/run <message>  (after /use)",
             "/approvals [pending|approved|rejected]",
@@ -801,6 +903,8 @@ def _help_text() -> str:
             "/reject <approval_id> [note]",
             "/jobs",
             "/job <job_id>",
+            "/job 1",
             "/cancel <job_id>",
+            "/cancel 1",
         ]
     )

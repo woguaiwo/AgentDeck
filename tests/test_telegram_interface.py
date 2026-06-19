@@ -181,6 +181,51 @@ class TelegramInterfaceTests(unittest.TestCase):
             self.assertIn(f"Job: {job_id}", latest)
             self.assertIn("done: continue without ids", latest)
 
+    def test_recent_lists_allow_numeric_task_and_job_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            workspace.ensure()
+            board = TaskBoard(workspace)
+            board.create(title="Older task")
+            newer = board.create(title="Newer task")
+            seen: list[tuple[str, str]] = []
+
+            async def runner(workspace_arg: Workspace, request: RunRequest) -> RunServiceResult:
+                seen.append((request.task or "", request.prompt))
+                return RunServiceResult(
+                    session_id="session-numbered",
+                    final_text=f"done: {request.prompt}",
+                    events=[],
+                    agent_id="owner",
+                    adapter="echo",
+                    task_id=request.task or "",
+                )
+
+            queue = TelegramJobQueue(workspace, sender=lambda chat_id, text: None, runner=runner)
+            handler = TelegramCommandHandler(workspace, job_queue=queue)
+
+            tasks = asyncio.run(handler.handle_text("/tasks", chat_id=42))[0]
+            self.assertIn("1.", tasks)
+            selected = asyncio.run(handler.handle_text("/use 1", chat_id=42))[0]
+            self.assertIn("Current task set", selected)
+            self.assertIn(newer.title, selected)
+
+            run_reply = asyncio.run(handler.handle_text("/run 1 numeric work", chat_id=42))[0]
+            job_id = re.search(r"Job started: (job-\S+)", run_reply).group(1)
+            queue.wait(job_id, timeout=2)
+            self.assertEqual(seen, [(newer.task_id, "numeric work")])
+
+            jobs = asyncio.run(handler.handle_text("/jobs", chat_id=42))[0]
+            self.assertIn("1.", jobs)
+            latest = asyncio.run(handler.handle_text("/job 1", chat_id=42))[0]
+            self.assertIn(f"Job: {job_id}", latest)
+
+            queued = queue.registry.create(interface="telegram", chat_id=42, task_id=newer.task_id, prompt="queued work")
+            jobs = asyncio.run(handler.handle_text("/jobs", chat_id=42))[0]
+            self.assertIn(queued.job_id, jobs)
+            cancel_reply = asyncio.run(handler.handle_text("/cancel 1", chat_id=42))[0]
+            self.assertIn(f"Job cancelled: {queued.job_id}", cancel_reply)
+
     def test_newtask_names_and_selects_task_from_telegram(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)

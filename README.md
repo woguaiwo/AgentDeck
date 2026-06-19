@@ -114,12 +114,16 @@ Supported commands:
 /newtask <task title>
 /use <task_id or exact task title>
 /current
+/list
 /run <task_id> <message>
+/run 1 <message>
 /run <message>
 /jobs
 /job <job_id>
+/job 1
 /job
 /cancel <job_id>
+/cancel 1
 /cancel
 /approvals [pending|approved|rejected]
 /approval <approval_id>
@@ -136,7 +140,9 @@ running, that job is marked `interrupted`.
 For phone use, select a task once with `/use <task title>` or create one with
 `/newtask <task title>`. After that, `/run <message>` uses the current task,
 `/job` shows the latest job in the chat, and `/cancel` cancels the latest queued
-or running job.
+or running job. Use `/list` to show numbered recent tasks and jobs; after that,
+commands like `/use 1`, `/run 1 <message>`, `/job 1`, and `/cancel 1` use the
+numbered list instead of long ids.
 
 `/cancel <job_id>` cancels queued jobs immediately. For running Codex/Kimi
 print jobs, AgentDeck requests adapter-level process termination and records the
