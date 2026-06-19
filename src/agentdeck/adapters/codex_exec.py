@@ -173,7 +173,7 @@ class CodexExecAdapter:
                 "--output-last-message",
                 str(last_message_path),
             ]
-            self._append_common_options(command, include_cd=False)
+            self._append_common_options(command, include_cd=False, include_sandbox=False)
             if self.resume_last:
                 command.append("--last")
             elif self.resume:
@@ -190,11 +190,11 @@ class CodexExecAdapter:
             "--output-last-message",
             str(last_message_path),
         ]
-        self._append_common_options(command, include_cd=True)
+        self._append_common_options(command, include_cd=True, include_sandbox=True)
         command.append(prompt)
         return command
 
-    def _append_common_options(self, command: list[str], *, include_cd: bool) -> None:
+    def _append_common_options(self, command: list[str], *, include_cd: bool, include_sandbox: bool) -> None:
         if include_cd and self.cwd is not None:
             command.extend(["--cd", str(self.cwd.expanduser().resolve())])
         if self.skip_git_repo_check:
@@ -203,7 +203,7 @@ class CodexExecAdapter:
             command.extend(["--model", self.model])
         if self.approval_mode == ApprovalMode.BYPASS:
             command.append("--dangerously-bypass-approvals-and-sandbox")
-        elif self.sandbox:
+        elif include_sandbox and self.sandbox:
             command.extend(["--sandbox", self.sandbox])
         command.extend(self.extra_args)
 

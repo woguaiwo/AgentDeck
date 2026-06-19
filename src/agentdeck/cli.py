@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from datetime import datetime
 import json
 import sys
 from pathlib import Path
@@ -16,6 +17,7 @@ from agentdeck.core.config import Workspace
 from agentdeck.core.runtime import AgentRuntime
 from agentdeck.storage.event_log import EventLog
 from agentdeck.storage.memory import MarkdownMemoryStore
+from agentdeck.storage.sessions import SessionRecord, SessionRegistry
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -30,9 +32,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = sub.add_parser("run", help="Run a prompt through an adapter")
     run.add_argument("prompt")
-    run.add_argument("--adapter", default="echo", choices=["echo", "codex", "codex-exec"])
+    run.add_argument("--adapter", choices=["echo", "codex", "codex-exec"])
     run.add_argument("--agent", default="default")
-    run.add_argument("--cwd", default=".", help="Project directory used by the wrapped agent")
+    run.add_argument("--session", help="Resume an AgentDeck session id, agent id, or provider session id")
+    run.add_argument("--cwd", help="Project directory used by the wrapped agent")
     run.add_argument("--codex-bin", default="codex", help="Codex executable path")
     run.add_argument("--resume", help="Resume a Codex session id or thread name")
     run.add_argument("--resume-last", action="store_true", help="Resume the most recent Codex session")
@@ -64,6 +67,13 @@ def build_parser() -> argparse.ArgumentParser:
     events = sub.add_parser("events", help="Inspect event log")
     events.add_argument("--tail", type=int, default=20)
 
+    sessions = sub.add_parser("sessions", help="Inspect session registry")
+    sess_sub = sessions.add_subparsers(dest="sessions_command", required=True)
+    sess_list = sess_sub.add_parser("list", help="List known sessions")
+    sess_list.add_argument("--agent")
+    sess_show = sess_sub.add_parser("show", help="Show one session as JSON")
+    sess_show.add_argument("session")
+
     return parser
 
 
@@ -74,21 +84,46 @@ def resolve_workspace(args: argparse.Namespace, cwd: str | Path | None = None) -
 
 
 async def _run_prompt(args: argparse.Namespace, workspace: Workspace) -> int:
+    registry = SessionRegistry(workspace)
+    session = registry.resolve(args.session) if args.session else None
+    if args.session and session is None:
+        print(f"session not found: {args.session}", file=sys.stderr)
+        return 2
+
+    args = argparse.Namespace(**vars(args))
+    session_id = None
+    if session is not None:
+        args.agent = session.agent_id
+        args.adapter = args.adapter or session.adapter
+        args.cwd = args.cwd or session.project_dir
+        if args.adapter in {"codex", "codex-exec"} and not args.resume and not args.resume_last:
+            if not session.provider_session_id:
+                print(
+                    f"session has no provider session id; pass --resume explicitly: {session.session_id}",
+                    file=sys.stderr,
+                )
+                return 2
+            args.resume = session.provider_session_id
+        session_id = session.session_id
+
+    args.adapter = args.adapter or "echo"
+    project_dir = Path(args.cwd or ".").expanduser().resolve()
     adapter = _build_adapter(args)
-    runtime = AgentRuntime(workspace, adapter, agent_id=args.agent)
-    result = await runtime.run_prompt(args.prompt)
+    runtime = AgentRuntime(workspace, adapter, agent_id=args.agent, project_dir=project_dir, session_registry=registry)
+    result = await runtime.run_prompt(args.prompt, session_id=session_id)
     print(result.final_text)
     print(f"session_id: {result.session_id}")
     return 0
 
 
 def _build_adapter(args: argparse.Namespace) -> AgentAdapter:
-    if args.adapter == "echo":
+    adapter_name = args.adapter or "echo"
+    if adapter_name == "echo":
         return EchoAdapter()
-    if args.adapter in {"codex", "codex-exec"}:
+    if adapter_name in {"codex", "codex-exec"}:
         return CodexExecAdapter(
             codex_bin=args.codex_bin,
-            cwd=Path(args.cwd).expanduser().resolve(),
+            cwd=Path(args.cwd or ".").expanduser().resolve(),
             resume=args.resume,
             resume_last=args.resume_last,
             model=args.model,
@@ -97,7 +132,7 @@ def _build_adapter(args: argparse.Namespace) -> AgentAdapter:
             skip_git_repo_check=not args.no_skip_git_check,
             extra_args=tuple(args.extra_arg or ()),
         )
-    raise ValueError(f"unsupported adapter: {args.adapter}")
+    raise ValueError(f"unsupported adapter: {adapter_name}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -141,6 +176,20 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(event.to_dict(), ensure_ascii=False, sort_keys=True))
         return 0
 
+    if args.command == "sessions":
+        workspace.ensure()
+        registry = SessionRegistry(workspace)
+        if args.sessions_command == "list":
+            _print_sessions(registry.list(agent_id=args.agent))
+            return 0
+        if args.sessions_command == "show":
+            record = registry.resolve(args.session)
+            if record is None:
+                print(f"session not found: {args.session}", file=sys.stderr)
+                return 2
+            print(json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+
     parser.error(f"unknown command: {args.command}")
     return 2
 
@@ -171,6 +220,31 @@ def _normalize_argv(argv: list[str] | None) -> list[str]:
     if workspace:
         return ["--workspace", workspace, *normalized]
     return normalized
+
+
+def _print_sessions(records: list[SessionRecord]) -> None:
+    if not records:
+        print("no sessions")
+        return
+    print("session_id\tagent\tadapter\tstatus\tprovider_session_id\tupdated_at\tproject_dir")
+    for record in records:
+        print(
+            "\t".join(
+                [
+                    record.session_id,
+                    record.agent_id,
+                    record.adapter,
+                    record.status,
+                    record.provider_session_id or "-",
+                    _format_timestamp(record.updated_at),
+                    record.project_dir,
+                ]
+            )
+        )
+
+
+def _format_timestamp(value: float) -> str:
+    return datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
 
 
 if __name__ == "__main__":

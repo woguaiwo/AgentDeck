@@ -1,0 +1,159 @@
+import contextlib
+import io
+import sys
+import tempfile
+import textwrap
+import unittest
+from pathlib import Path
+
+from agentdeck.cli import main
+from agentdeck.core.config import Workspace
+from agentdeck.core.events import AgentEvent, EventKind
+from agentdeck.storage.sessions import SessionRegistry
+
+
+class SessionRegistryTests(unittest.TestCase):
+    def test_registry_captures_codex_thread_id_from_status_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            workspace.ensure()
+            registry = SessionRegistry(workspace)
+
+            registry.upsert_start(
+                session_id="session-a",
+                agent_id="agent-a",
+                adapter="codex",
+                project_dir=tmpdir,
+                prompt="hello",
+            )
+            registry.update_from_event(
+                AgentEvent(
+                    EventKind.STATUS,
+                    "agent-a",
+                    "session-a",
+                    text="thread_started",
+                    payload={"type": "thread.started", "thread_id": "thread-123"},
+                )
+            )
+            registry.update_from_event(
+                AgentEvent(EventKind.ASSISTANT_FINAL, "agent-a", "session-a", text="done")
+            )
+
+            record = registry.get("session-a")
+
+            assert record is not None
+            self.assertEqual(record.provider_session_id, "thread-123")
+            self.assertEqual(record.provider_session_kind, "codex_thread")
+            self.assertEqual(record.last_assistant_final, "done")
+            self.assertEqual(record.status, "idle")
+
+    def test_cli_run_session_resumes_registered_codex_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            workspace.ensure()
+            project = tmp / "project"
+            project.mkdir()
+            args_path = tmp / "codex_args.txt"
+            fake = tmp / "fake_codex"
+            fake.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    import sys
+                    from pathlib import Path
+
+                    args = sys.argv[1:]
+                    Path({str(args_path)!r}).write_text("\\n".join(args), encoding="utf-8")
+                    last = None
+                    for i, arg in enumerate(args):
+                        if arg in {{"--output-last-message", "-o"}} and i + 1 < len(args):
+                            last = Path(args[i + 1])
+                    if last is not None:
+                        last.write_text("resumed final", encoding="utf-8")
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+
+            registry = SessionRegistry(workspace)
+            registry.upsert_start(
+                session_id="session-a",
+                agent_id="agent-a",
+                adapter="codex",
+                project_dir=project,
+                prompt="old",
+            )
+            registry.update_from_event(
+                AgentEvent(
+                    EventKind.STATUS,
+                    "agent-a",
+                    "session-a",
+                    payload={"type": "thread.started", "thread_id": "thread-123"},
+                )
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(
+                    [
+                        "--workspace",
+                        str(workspace.root),
+                        "run",
+                        "next",
+                        "--session",
+                        "session-a",
+                        "--codex-bin",
+                        str(fake),
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertIn("resumed final", stdout.getvalue())
+            args = args_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(args[:2], ["exec", "resume"])
+            self.assertIn("thread-123", args)
+            self.assertEqual(args[-1], "next")
+
+    def test_cli_run_session_refuses_codex_session_without_provider_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            workspace.ensure()
+            project = tmp / "project"
+            project.mkdir()
+            fake = tmp / "fake_codex"
+            fake.write_text(f"#!{sys.executable}\nraise SystemExit('should not run')\n", encoding="utf-8")
+            fake.chmod(0o755)
+
+            registry = SessionRegistry(workspace)
+            registry.upsert_start(
+                session_id="session-a",
+                agent_id="agent-a",
+                adapter="codex",
+                project_dir=project,
+                prompt="old",
+            )
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                code = main(
+                    [
+                        "--workspace",
+                        str(workspace.root),
+                        "run",
+                        "next",
+                        "--session",
+                        "session-a",
+                        "--codex-bin",
+                        str(fake),
+                    ]
+                )
+
+            self.assertEqual(code, 2)
+            self.assertIn("no provider session id", stderr.getvalue())
+
+
+if __name__ == "__main__":
+    unittest.main()

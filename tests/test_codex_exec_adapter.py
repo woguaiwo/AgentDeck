@@ -86,6 +86,19 @@ class CodexExecAdapterTests(unittest.TestCase):
         self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
         self.assertNotIn("--sandbox", command)
 
+    def test_resume_command_does_not_include_unsupported_sandbox_arg(self) -> None:
+        adapter = CodexExecAdapter(
+            cwd=Path("/tmp/project"),
+            resume="thread-123",
+            sandbox="read-only",
+        )
+
+        command = adapter._build_command("hello", Path("/tmp/last.md"))
+
+        self.assertEqual(command[:3], ["codex", "exec", "resume"])
+        self.assertNotIn("--sandbox", command)
+        self.assertIn("thread-123", command)
+
     def test_default_fail_mode_stops_on_approval_request(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
