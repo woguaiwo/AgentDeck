@@ -2,7 +2,9 @@ import contextlib
 import io
 import json
 import re
+import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -168,6 +170,123 @@ class ProjectTaskBoardTests(unittest.TestCase):
             self.assertEqual(shown_task["status"], "done")
             self.assertEqual(shown_task["session_id"], session_id)
 
+    def test_task_auto_session_is_replaced_when_agent_adapter_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            workspace.ensure()
+            project_dir = tmp / "teleagent"
+            project_dir.mkdir()
+            fake_codex = tmp / "fake_codex"
+            fake_codex.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    import json
+                    import sys
+                    from pathlib import Path
+
+                    last = None
+                    args = sys.argv[1:]
+                    for index, arg in enumerate(args):
+                        if arg == "--output-last-message" and index + 1 < len(args):
+                            last = Path(args[index + 1])
+
+                    print(json.dumps({{"type": "thread.started", "thread_id": "thread-from-fake"}}), flush=True)
+                    if last is not None:
+                        last.write_text("codex final", encoding="utf-8")
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake_codex.chmod(0o755)
+
+            self._main(
+                [
+                    "--workspace",
+                    str(workspace.root),
+                    "projects",
+                    "create",
+                    "teleagent",
+                    "--cwd",
+                    str(project_dir),
+                    "--default-agent",
+                    "owner",
+                ]
+            )
+            self._main(
+                [
+                    "--workspace",
+                    str(workspace.root),
+                    "agents",
+                    "create",
+                    "owner",
+                    "--project",
+                    "teleagent",
+                    "--adapter",
+                    "echo",
+                ]
+            )
+            task_out = self._main(
+                [
+                    "--workspace",
+                    str(workspace.root),
+                    "tasks",
+                    "create",
+                    "Switch adapter smoke",
+                    "--project",
+                    "teleagent",
+                ]
+            )
+            match = re.search(r"\((task-[^)]+)\)", task_out)
+            assert match is not None
+            task_id = match.group(1)
+
+            first_run = self._main(["--workspace", str(workspace.root), "run", "echo step", "--task", task_id])
+            first_match = re.search(r"session_id: (\S+)", first_run)
+            assert first_match is not None
+            echo_session_id = first_match.group(1)
+            echo_session = SessionRegistry(workspace).get(echo_session_id)
+            assert echo_session is not None
+            self.assertEqual(echo_session.adapter, "echo")
+
+            self._main(
+                [
+                    "--workspace",
+                    str(workspace.root),
+                    "agents",
+                    "create",
+                    "owner",
+                    "--project",
+                    "teleagent",
+                    "--adapter",
+                    "codex",
+                    "--codex-bin",
+                    str(fake_codex),
+                    "--replace",
+                ]
+            )
+            second_run = self._main(["--workspace", str(workspace.root), "run", "codex step", "--task", task_id])
+            self.assertIn("codex final", second_run)
+            second_match = re.search(r"session_id: (\S+)", second_run)
+            assert second_match is not None
+            codex_session_id = second_match.group(1)
+
+            self.assertNotEqual(codex_session_id, echo_session_id)
+            task = TaskBoard(workspace).get(task_id)
+            assert task is not None
+            self.assertEqual(task.session_id, codex_session_id)
+            codex_session = SessionRegistry(workspace).get(codex_session_id)
+            assert codex_session is not None
+            self.assertEqual(codex_session.adapter, "codex")
+            self.assertEqual(codex_session.provider_session_id, "thread-from-fake")
+
+    def _main(self, args: list[str]) -> str:
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            code = main(args)
+        self.assertEqual(code, 0, stdout.getvalue())
+        return stdout.getvalue()
 
 if __name__ == "__main__":
     unittest.main()

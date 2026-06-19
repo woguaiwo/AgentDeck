@@ -16,7 +16,7 @@ from agentdeck.core.runtime import AgentRuntime
 from agentdeck.storage.approvals import ApprovalRecord, ApprovalRegistry
 from agentdeck.storage.agents import AgentRecord, AgentRegistry
 from agentdeck.storage.projects import ProjectRecord, ProjectRegistry
-from agentdeck.storage.sessions import SessionRegistry
+from agentdeck.storage.sessions import SessionRecord, SessionRegistry
 from agentdeck.storage.tasks import TaskBoard, TaskRecord
 
 
@@ -62,6 +62,7 @@ async def run_agent_prompt(workspace: Workspace, request: RunRequest) -> RunServ
     """Run a prompt using project/task/agent/session defaults."""
 
     workspace.ensure()
+    explicit_session = bool(request.session)
     session_registry = SessionRegistry(workspace)
     agent_registry = AgentRegistry(workspace)
     project_registry = ProjectRegistry(workspace)
@@ -87,20 +88,25 @@ async def run_agent_prompt(workspace: Workspace, request: RunRequest) -> RunServ
 
     session = session_registry.resolve(request.session) if request.session else None
     if request.session and session is None:
-        raise RunConfigurationError(f"session not found: {request.session}")
+        if explicit_session:
+            raise RunConfigurationError(f"session not found: {request.session}")
+        request.session = None
 
     session_id = None
     if session is not None:
-        request.agent = session.agent_id
-        request.adapter = request.adapter or session.adapter
-        request.cwd = request.cwd or session.project_dir
-        if request.adapter in {"codex", "codex-exec", "kimi", "kimi-print"} and not request.resume and not request.resume_last:
-            if not session.provider_session_id:
-                raise RunConfigurationError(
-                    f"session has no provider session id; pass --resume explicitly: {session.session_id}"
-                )
-            request.resume = session.provider_session_id
-        session_id = session.session_id
+        resume_problem = _session_resume_problem(session, request)
+        if resume_problem:
+            if explicit_session:
+                raise RunConfigurationError(resume_problem)
+            request.session = None
+            session = None
+        else:
+            request.agent = session.agent_id
+            request.adapter = request.adapter or session.adapter
+            request.cwd = request.cwd or session.project_dir
+            if _requires_provider_session(request.adapter) and not request.resume and not request.resume_last:
+                request.resume = session.provider_session_id
+            session_id = session.session_id
 
     request.adapter = request.adapter or "echo"
     request.codex_bin = request.codex_bin or "codex"
@@ -128,7 +134,7 @@ async def run_agent_prompt(workspace: Workspace, request: RunRequest) -> RunServ
     pending_approvals: list[ApprovalRecord] = []
     if task is not None:
         refreshed = task_board.resolve(task.task_id)
-        if refreshed is not None and not refreshed.session_id:
+        if refreshed is not None and refreshed.session_id != result.session_id:
             task_board.attach_session(refreshed.task_id, result.session_id)
         task_board.add_note(
             task.task_id,
@@ -182,6 +188,29 @@ def _build_adapter(request: RunRequest) -> AgentAdapter:
             extra_args=tuple(request.extra_args or ()),
         )
     raise RunConfigurationError(f"unsupported adapter: {adapter_name}")
+
+
+def _session_resume_problem(session: SessionRecord, request: RunRequest) -> str:
+    requested_adapter = request.adapter
+    if requested_adapter and requested_adapter != session.adapter:
+        return (
+            f"session adapter mismatch: {session.session_id} uses {session.adapter}, "
+            f"but this run uses {requested_adapter}"
+        )
+
+    adapter_name = requested_adapter or session.adapter
+    if (
+        _requires_provider_session(adapter_name)
+        and not request.resume
+        and not request.resume_last
+        and not session.provider_session_id
+    ):
+        return f"session has no provider session id; pass --resume explicitly: {session.session_id}"
+    return ""
+
+
+def _requires_provider_session(adapter_name: str | None) -> bool:
+    return adapter_name in {"codex", "codex-exec", "kimi", "kimi-print"}
 
 
 def _apply_task_defaults(request: RunRequest, task: TaskRecord) -> None:
