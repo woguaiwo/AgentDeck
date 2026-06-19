@@ -54,6 +54,10 @@ class Workspace:
         return self.root / "sessions"
 
     @property
+    def agents_dir(self) -> Path:
+        return self.root / "agents"
+
+    @property
     def inbox_dir(self) -> Path:
         return self.root / "inbox"
 
@@ -70,6 +74,7 @@ class Workspace:
         for path in [
             self.events_dir,
             self.sessions_dir,
+            self.agents_dir,
             self.inbox_dir,
             self.board_dir,
             self.memory_dir / "user",
@@ -90,6 +95,6 @@ class Workspace:
             "config_exists": self.config_path.exists(),
             "events": str(self.events_dir),
             "sessions": str(self.sessions_dir),
+            "agents": str(self.agents_dir),
             "memory": str(self.memory_dir),
         }
-

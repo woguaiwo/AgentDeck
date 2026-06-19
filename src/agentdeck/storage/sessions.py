@@ -175,6 +175,20 @@ class SessionRegistry:
             records = [record for record in records if record.agent_id == agent_id]
         return sorted(records, key=lambda item: item.updated_at, reverse=True)
 
+    def latest_for_agent(
+        self,
+        agent_id: str,
+        *,
+        adapter: str | None = None,
+        require_provider_session: bool = False,
+    ) -> SessionRecord | None:
+        records = self.list(agent_id=agent_id)
+        if adapter:
+            records = [record for record in records if record.adapter == adapter]
+        if require_provider_session:
+            records = [record for record in records if bool(record.provider_session_id)]
+        return records[0] if records else None
+
     def _update_status_event(self, record: SessionRecord, event: AgentEvent) -> None:
         payload = event.payload
         event_type = str(payload.get("type") or event.text or "").lower().replace(".", "_").replace("-", "_")

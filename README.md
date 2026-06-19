@@ -23,6 +23,8 @@ This repository starts with a minimal core:
 - Adapter protocol
 - Debug echo adapter
 - Codex non-interactive adapter using `codex exec --json`
+- Agent registry with project defaults, role, team, and resume policy
+- Session registry with human-readable titles and provider session ids
 - Markdown memory store with `user`, `project`, `team`, `agent`, and `task` scopes
 - JSONL event log
 - CLI smoke path
@@ -41,6 +43,10 @@ The first real adapter targets should be:
 python -m agentdeck init
 python -m agentdeck doctor
 python -m agentdeck run "hello from AgentDeck"
+python -m agentdeck agents create owner --title "Project Owner" --adapter codex --cwd "$PWD"
+python -m agentdeck run --agent owner "Summarize this repository"
+python -m agentdeck agents list
+python -m agentdeck sessions list
 python -m agentdeck run --adapter codex --cwd "$PWD" "Summarize this repository"
 python -m agentdeck run --adapter codex --cwd "$PWD" --resume-last "Continue"
 python -m agentdeck run --adapter codex --cwd "$PWD" --approval-mode record "Show me what approval is needed"
@@ -74,9 +80,12 @@ PYTHONPATH=src python -m pytest
 ```text
 .agentdeck/
 ├── config.toml
+├── agents/
+│   └── registry.json
 ├── events/
 │   └── events.jsonl
 ├── sessions/
+│   └── registry.json
 ├── inbox/
 ├── board/
 └── memory/
@@ -100,3 +109,10 @@ Agents should not share raw chat transcripts as memory. They should share:
 
 Raw transcripts remain available for audit, but runtime prompts should receive
 bounded, relevant memory only.
+
+## Agent Model
+
+The current practical default is one `owner` agent per project. Agent records
+already include `role` and `team_id`, so later teams can add planners,
+developers, testers, reviewers, and managers without changing the storage
+model.

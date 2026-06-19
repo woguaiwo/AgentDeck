@@ -16,6 +16,7 @@ from agentdeck.core.approvals import ApprovalMode
 from agentdeck.core.config import Workspace
 from agentdeck.core.runtime import AgentRuntime
 from agentdeck.storage.event_log import EventLog
+from agentdeck.storage.agents import AgentRecord, AgentRegistry
 from agentdeck.storage.memory import MarkdownMemoryStore
 from agentdeck.storage.sessions import SessionRecord, SessionRegistry
 
@@ -37,14 +38,13 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--session", help="Resume an AgentDeck session id, agent id, or provider session id")
     run.add_argument("--title", help="Human-readable title for a new or resumed AgentDeck session")
     run.add_argument("--cwd", help="Project directory used by the wrapped agent")
-    run.add_argument("--codex-bin", default="codex", help="Codex executable path")
+    run.add_argument("--codex-bin", help="Codex executable path")
     run.add_argument("--resume", help="Resume a Codex session id or thread name")
     run.add_argument("--resume-last", action="store_true", help="Resume the most recent Codex session")
     run.add_argument("--model", help="Model override for adapters that support it")
     run.add_argument("--sandbox", choices=["read-only", "workspace-write", "danger-full-access"])
     run.add_argument(
         "--approval-mode",
-        default="fail",
         choices=["fail", "record", "bypass"],
         help=(
             "How to handle backend approval requests. 'fail' stops on approval, "
@@ -78,6 +78,27 @@ def build_parser() -> argparse.ArgumentParser:
     sess_rename.add_argument("session")
     sess_rename.add_argument("title")
 
+    agents = sub.add_parser("agents", help="Manage project agents")
+    agent_sub = agents.add_subparsers(dest="agents_command", required=True)
+    agent_create = agent_sub.add_parser("create", help="Create or replace one agent")
+    agent_create.add_argument("agent_id")
+    agent_create.add_argument("--title", help="Human-readable agent name")
+    agent_create.add_argument("--role", default="owner", help="Team role, e.g. owner, planner, developer, tester")
+    agent_create.add_argument("--team", default="default", help="Team id")
+    agent_create.add_argument("--adapter", default="echo", choices=["echo", "codex", "codex-exec"])
+    agent_create.add_argument("--cwd", default=".", help="Project directory used by this agent")
+    agent_create.add_argument("--model")
+    agent_create.add_argument("--sandbox", choices=["read-only", "workspace-write", "danger-full-access"])
+    agent_create.add_argument("--approval-mode", default="fail", choices=["fail", "record", "bypass"])
+    agent_create.add_argument("--codex-bin", default="codex")
+    agent_create.add_argument("--resume-policy", default="latest", choices=["latest", "new", "manual"])
+    agent_create.add_argument("--replace", action="store_true")
+    agent_list = agent_sub.add_parser("list", help="List project agents")
+    agent_list.add_argument("--team")
+    agent_list.add_argument("--role")
+    agent_show = agent_sub.add_parser("show", help="Show one agent as JSON")
+    agent_show.add_argument("agent")
+
     return parser
 
 
@@ -89,12 +110,17 @@ def resolve_workspace(args: argparse.Namespace, cwd: str | Path | None = None) -
 
 async def _run_prompt(args: argparse.Namespace, workspace: Workspace) -> int:
     registry = SessionRegistry(workspace)
+    agent_registry = AgentRegistry(workspace)
+    args = argparse.Namespace(**vars(args))
+    saved_agent = agent_registry.resolve(args.agent) if args.agent else None
+    if saved_agent is not None:
+        _apply_agent_defaults(args, saved_agent, registry)
+
     session = registry.resolve(args.session) if args.session else None
     if args.session and session is None:
         print(f"session not found: {args.session}", file=sys.stderr)
         return 2
 
-    args = argparse.Namespace(**vars(args))
     session_id = None
     if session is not None:
         args.agent = session.agent_id
@@ -111,6 +137,8 @@ async def _run_prompt(args: argparse.Namespace, workspace: Workspace) -> int:
         session_id = session.session_id
 
     args.adapter = args.adapter or "echo"
+    args.codex_bin = args.codex_bin or "codex"
+    args.approval_mode = args.approval_mode or "fail"
     project_dir = Path(args.cwd or ".").expanduser().resolve()
     adapter = _build_adapter(args)
     runtime = AgentRuntime(workspace, adapter, agent_id=args.agent, project_dir=project_dir, session_registry=registry)
@@ -201,6 +229,41 @@ def main(argv: list[str] | None = None) -> int:
             print(f"renamed: {record.title} ({record.session_id})")
             return 0
 
+    if args.command == "agents":
+        workspace.ensure()
+        registry = AgentRegistry(workspace)
+        if args.agents_command == "create":
+            try:
+                record = registry.upsert(
+                    agent_id=args.agent_id,
+                    title=args.title,
+                    role=args.role,
+                    team_id=args.team,
+                    adapter=args.adapter,
+                    project_dir=args.cwd,
+                    model=args.model or "",
+                    sandbox=args.sandbox or "",
+                    approval_mode=args.approval_mode,
+                    codex_bin=args.codex_bin,
+                    resume_policy=args.resume_policy,
+                    replace=args.replace,
+                )
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            print(f"agent: {record.title} ({record.agent_id})")
+            return 0
+        if args.agents_command == "list":
+            _print_agents(registry.list(team_id=args.team, role=args.role))
+            return 0
+        if args.agents_command == "show":
+            record = registry.resolve(args.agent)
+            if record is None:
+                print(f"agent not found: {args.agent}", file=sys.stderr)
+                return 2
+            print(json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+
     parser.error(f"unknown command: {args.command}")
     return 2
 
@@ -248,6 +311,52 @@ def _print_sessions(records: list[SessionRecord]) -> None:
                     record.adapter,
                     record.status,
                     _format_timestamp(record.updated_at),
+                    record.project_dir,
+                ]
+            )
+        )
+
+
+def _apply_agent_defaults(args: argparse.Namespace, agent: AgentRecord, sessions: SessionRegistry) -> None:
+    args.agent = agent.agent_id
+    args.adapter = args.adapter or agent.adapter
+    args.cwd = args.cwd or agent.project_dir
+    args.model = args.model or agent.model or None
+    args.sandbox = args.sandbox or agent.sandbox or None
+    args.approval_mode = args.approval_mode or agent.approval_mode
+    args.codex_bin = args.codex_bin or agent.codex_bin
+    args.title = args.title or agent.title
+
+    if args.session or args.resume or args.resume_last:
+        return
+    if agent.resume_policy != "latest":
+        return
+
+    adapter_name = args.adapter or agent.adapter
+    latest = sessions.latest_for_agent(
+        agent.agent_id,
+        adapter=adapter_name,
+        require_provider_session=adapter_name in {"codex", "codex-exec"},
+    )
+    if latest is not None:
+        args.session = latest.session_id
+
+
+def _print_agents(records: list[AgentRecord]) -> None:
+    if not records:
+        print("no agents")
+        return
+    print("title\tagent_id\trole\tteam\tadapter\tresume_policy\tproject_dir")
+    for record in records:
+        print(
+            "\t".join(
+                [
+                    record.title,
+                    record.agent_id,
+                    record.role,
+                    record.team_id,
+                    record.adapter,
+                    record.resume_policy,
                     record.project_dir,
                 ]
             )
