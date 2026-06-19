@@ -20,6 +20,7 @@ class SessionRecord:
     agent_id: str
     adapter: str
     project_dir: str
+    title: str = ""
     status: str = "running"
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
@@ -36,6 +37,7 @@ class SessionRecord:
             agent_id=str(data.get("agent_id") or "default"),
             adapter=str(data.get("adapter") or "unknown"),
             project_dir=str(data.get("project_dir") or ""),
+            title=str(data.get("title") or _title_from_prompt(str(data.get("last_user_message") or ""))),
             status=str(data.get("status") or "unknown"),
             created_at=float(data.get("created_at") or time.time()),
             updated_at=float(data.get("updated_at") or time.time()),
@@ -72,20 +74,24 @@ class SessionRegistry:
         adapter: str,
         project_dir: str | Path,
         prompt: str,
+        title: str | None = None,
     ) -> SessionRecord:
         records = self._read()
         existing = records.get(session_id)
         now = time.time()
+        clean_title = _clean_title(title or "")
         if existing is None:
             record = SessionRecord(
                 session_id=session_id,
                 agent_id=agent_id,
                 adapter=adapter,
                 project_dir=str(Path(project_dir).expanduser().resolve()),
+                title=clean_title or _title_from_prompt(prompt),
                 last_user_message=prompt,
                 created_at=now,
                 updated_at=now,
             )
+            record.metadata["title_source"] = "manual" if clean_title else "prompt"
         else:
             record = existing
             record.agent_id = agent_id
@@ -94,6 +100,12 @@ class SessionRegistry:
             record.status = "running"
             record.updated_at = now
             record.last_user_message = prompt
+            if clean_title:
+                record.title = clean_title
+                record.metadata["title_source"] = "manual"
+            elif not record.title:
+                record.title = _title_from_prompt(prompt)
+                record.metadata["title_source"] = "prompt"
         records[session_id] = record
         self._write(records)
         return record
@@ -107,6 +119,9 @@ class SessionRegistry:
         record.updated_at = event.created_at
         if event.kind == EventKind.USER_MESSAGE:
             record.last_user_message = event.text
+            if not record.title:
+                record.title = _title_from_prompt(event.text)
+                record.metadata["title_source"] = "prompt"
         elif event.kind == EventKind.STATUS:
             self._update_status_event(record, event)
         elif event.kind == EventKind.ASSISTANT_FINAL:
@@ -128,6 +143,18 @@ class SessionRegistry:
     def get(self, session_id: str) -> SessionRecord | None:
         return self._read().get(session_id)
 
+    def rename(self, session_id: str, title: str) -> SessionRecord | None:
+        records = self._read()
+        record = self.resolve(session_id)
+        if record is None:
+            return None
+        record.title = _clean_title(title) or _title_from_prompt(record.last_user_message)
+        record.updated_at = time.time()
+        record.metadata["title_source"] = "manual"
+        records[record.session_id] = record
+        self._write(records)
+        return record
+
     def resolve(self, value: str) -> SessionRecord | None:
         records = self._read()
         if value in records:
@@ -136,7 +163,7 @@ class SessionRegistry:
         matches = [
             record
             for record in records.values()
-            if record.agent_id == value or record.provider_session_id == value
+            if record.agent_id == value or record.provider_session_id == value or record.title == value
         ]
         if not matches:
             return None
@@ -156,6 +183,10 @@ class SessionRegistry:
             if thread_id:
                 record.provider_session_id = thread_id
                 record.provider_session_kind = "codex_thread"
+            provider_title = _clean_title(str(payload.get("title") or payload.get("name") or ""))
+            if provider_title and record.metadata.get("title_source") != "manual":
+                record.title = provider_title
+                record.metadata["title_source"] = "provider"
             record.metadata["provider_start_event"] = payload
         elif event_type in {"turn_started", "turn_completed"}:
             record.metadata["last_provider_status"] = payload
@@ -192,3 +223,16 @@ class SessionRegistry:
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
         tmp.replace(self.path)
+
+
+def _title_from_prompt(prompt: str, *, max_chars: int = 72) -> str:
+    title = _clean_title(prompt)
+    if not title:
+        return "Untitled session"
+    if len(title) <= max_chars:
+        return title
+    return title[: max_chars - 1].rstrip() + "..."
+
+
+def _clean_title(value: str) -> str:
+    return " ".join(value.strip().split())

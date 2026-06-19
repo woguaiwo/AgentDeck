@@ -39,7 +39,13 @@ class AgentRuntime:
         self.project_dir = Path(project_dir or Path.cwd()).expanduser().resolve()
         self.session_registry = session_registry or SessionRegistry(workspace)
 
-    async def run_prompt(self, prompt: str, *, session_id: str | None = None) -> RunResult:
+    async def run_prompt(
+        self,
+        prompt: str,
+        *,
+        session_id: str | None = None,
+        title: str | None = None,
+    ) -> RunResult:
         self.workspace.ensure()
         sid = session_id or uuid.uuid4().hex[:12]
         events: list[AgentEvent] = []
@@ -50,6 +56,7 @@ class AgentRuntime:
             adapter=self.adapter.name,
             project_dir=self.project_dir,
             prompt=prompt,
+            title=title,
         )
         start = AgentEvent(EventKind.SESSION_STARTED, self.agent_id, sid, payload={"adapter": self.adapter.name})
         user = AgentEvent(EventKind.USER_MESSAGE, self.agent_id, sid, text=prompt)

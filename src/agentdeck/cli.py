@@ -35,6 +35,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--adapter", choices=["echo", "codex", "codex-exec"])
     run.add_argument("--agent", default="default")
     run.add_argument("--session", help="Resume an AgentDeck session id, agent id, or provider session id")
+    run.add_argument("--title", help="Human-readable title for a new or resumed AgentDeck session")
     run.add_argument("--cwd", help="Project directory used by the wrapped agent")
     run.add_argument("--codex-bin", default="codex", help="Codex executable path")
     run.add_argument("--resume", help="Resume a Codex session id or thread name")
@@ -73,6 +74,9 @@ def build_parser() -> argparse.ArgumentParser:
     sess_list.add_argument("--agent")
     sess_show = sess_sub.add_parser("show", help="Show one session as JSON")
     sess_show.add_argument("session")
+    sess_rename = sess_sub.add_parser("rename", help="Rename one session")
+    sess_rename.add_argument("session")
+    sess_rename.add_argument("title")
 
     return parser
 
@@ -110,7 +114,7 @@ async def _run_prompt(args: argparse.Namespace, workspace: Workspace) -> int:
     project_dir = Path(args.cwd or ".").expanduser().resolve()
     adapter = _build_adapter(args)
     runtime = AgentRuntime(workspace, adapter, agent_id=args.agent, project_dir=project_dir, session_registry=registry)
-    result = await runtime.run_prompt(args.prompt, session_id=session_id)
+    result = await runtime.run_prompt(args.prompt, session_id=session_id, title=args.title)
     print(result.final_text)
     print(f"session_id: {result.session_id}")
     return 0
@@ -189,6 +193,13 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             print(json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
             return 0
+        if args.sessions_command == "rename":
+            record = registry.rename(args.session, args.title)
+            if record is None:
+                print(f"session not found: {args.session}", file=sys.stderr)
+                return 2
+            print(f"renamed: {record.title} ({record.session_id})")
+            return 0
 
     parser.error(f"unknown command: {args.command}")
     return 2
@@ -226,16 +237,16 @@ def _print_sessions(records: list[SessionRecord]) -> None:
     if not records:
         print("no sessions")
         return
-    print("session_id\tagent\tadapter\tstatus\tprovider_session_id\tupdated_at\tproject_dir")
+    print("title\tsession_id\tagent\tadapter\tstatus\tupdated_at\tproject_dir")
     for record in records:
         print(
             "\t".join(
                 [
+                    record.title,
                     record.session_id,
                     record.agent_id,
                     record.adapter,
                     record.status,
-                    record.provider_session_id or "-",
                     _format_timestamp(record.updated_at),
                     record.project_dir,
                 ]

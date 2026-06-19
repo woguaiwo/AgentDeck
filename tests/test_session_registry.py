@@ -1,5 +1,7 @@
 import contextlib
 import io
+import json
+import re
 import sys
 import tempfile
 import textwrap
@@ -44,8 +46,84 @@ class SessionRegistryTests(unittest.TestCase):
             assert record is not None
             self.assertEqual(record.provider_session_id, "thread-123")
             self.assertEqual(record.provider_session_kind, "codex_thread")
+            self.assertEqual(record.title, "hello")
             self.assertEqual(record.last_assistant_final, "done")
             self.assertEqual(record.status, "idle")
+
+    def test_cli_sessions_list_rename_and_resolve_title(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            workspace.ensure()
+            project = tmp / "project"
+            project.mkdir()
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(
+                    [
+                        "--workspace",
+                        str(workspace.root),
+                        "run",
+                        "hello",
+                        "--adapter",
+                        "echo",
+                        "--cwd",
+                        str(project),
+                        "--title",
+                        "Build planner",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            match = re.search(r"session_id: (\S+)", stdout.getvalue())
+            assert match is not None
+            session_id = match.group(1)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--workspace", str(workspace.root), "sessions", "list"])
+            self.assertEqual(code, 0)
+            listed = stdout.getvalue()
+            self.assertIn("title\tsession_id", listed)
+            self.assertIn("Build planner", listed)
+            self.assertNotIn("provider_session_id", listed)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(
+                    [
+                        "--workspace",
+                        str(workspace.root),
+                        "sessions",
+                        "rename",
+                        session_id,
+                        "Planner review",
+                    ]
+                )
+            self.assertEqual(code, 0)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--workspace", str(workspace.root), "sessions", "show", "Planner review"])
+            self.assertEqual(code, 0)
+            shown = json.loads(stdout.getvalue())
+            self.assertEqual(shown["session_id"], session_id)
+            self.assertEqual(shown["title"], "Planner review")
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(
+                    [
+                        "--workspace",
+                        str(workspace.root),
+                        "run",
+                        "next",
+                        "--session",
+                        "Planner review",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertIn(f"session_id: {session_id}", stdout.getvalue())
 
     def test_cli_run_session_resumes_registered_codex_thread(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
