@@ -101,8 +101,15 @@ class TelegramJobQueue:
             thread.join(timeout)
         return self.get(job_id)
 
+    def cancel(self, job_id: str) -> JobRecord | None:
+        with self._lock:
+            return self.registry.cancel(
+                job_id,
+                reason="Cancellation requested from Telegram. Running jobs are not terminated yet.",
+            )
+
     def _run_job(self, job_id: str) -> None:
-        job = self._set_job_status(job_id, "running")
+        job = self._start_job(job_id)
         if job is None:
             return
         try:
@@ -114,17 +121,35 @@ class TelegramJobQueue:
             self._finish_job(job_id, status="error", error=str(exc))
             self._send(job.chat_id, f"Job failed: {job_id}\n{exc}")
         else:
+            cancel_was_requested = self._cancel_was_requested(job_id)
             finished = self._finish_job(
                 job_id,
                 status="done",
                 session_id=result.session_id,
                 final_text=result.final_text,
+                error=(
+                    "Cancellation was requested, but adapter-level process termination is not implemented yet."
+                    if cancel_was_requested
+                    else ""
+                ),
             )
             self._send(job.chat_id, _format_job_completion(finished or job, result.approval_requested))
 
-    def _set_job_status(self, job_id: str, status: str) -> JobRecord | None:
+    def _start_job(self, job_id: str) -> JobRecord | None:
         with self._lock:
-            return self.registry.set_status(job_id, status)
+            current = self.registry.get(job_id)
+            if current is None:
+                return None
+            if current.status == "cancelled":
+                return None
+            if current.status == "cancel_requested":
+                self.registry.finish(
+                    job_id,
+                    status="cancelled",
+                    error=current.error or "Cancelled before this job started running.",
+                )
+                return None
+            return self.registry.set_status(job_id, "running")
 
     def _finish_job(
         self,
@@ -143,6 +168,11 @@ class TelegramJobQueue:
                 final_text=final_text,
                 error=error,
             )
+
+    def _cancel_was_requested(self, job_id: str) -> bool:
+        with self._lock:
+            current = self.registry.get(job_id)
+            return current is not None and current.status == "cancel_requested"
 
     def _send(self, chat_id: int, text: str) -> None:
         try:
@@ -193,6 +223,8 @@ class TelegramCommandHandler:
             return [self._jobs()]
         if command in {"/job", "job"}:
             return [self._job(rest)]
+        if command in {"/cancel", "cancel"}:
+            return [self._cancel(rest)]
         if command in {"/run", "run"}:
             return [await self._run(rest, chat_id=chat_id)]
         return [f"Unknown command: {command}\n\n{_help_text()}"]
@@ -384,6 +416,32 @@ class TelegramCommandHandler:
             lines.append(job.final_text)
         return "\n".join(lines)
 
+    def _cancel(self, rest: str) -> str:
+        if self.job_queue is None:
+            return "Jobs are not enabled for this interface."
+        job_id = rest.strip()
+        if not job_id:
+            return "Usage: /cancel <job_id>"
+        before = self.job_queue.get(job_id)
+        if before is None:
+            return f"Job not found: {job_id}"
+        after = self.job_queue.cancel(job_id)
+        if after is None:
+            return f"Job not found: {job_id}"
+        if before.status == "queued" and after.status == "cancelled":
+            return f"Job cancelled: {job_id}"
+        if after.status == "cancel_requested":
+            return "\n".join(
+                [
+                    f"Cancel requested: {job_id}",
+                    "status: cancel_requested",
+                    "Note: the running backend process is not terminated yet.",
+                ]
+            )
+        if after.status == "cancelled":
+            return f"Job already cancelled: {job_id}"
+        return f"Job is already {after.status}: {job_id}"
+
 
 class TelegramServer:
     def __init__(self, workspace: Workspace, api: TelegramBotApi, config: TelegramConfig) -> None:
@@ -491,6 +549,8 @@ def _format_job_completion(job: JobRecord, approval_requested: bool) -> str:
     if approval_requested:
         lines.append("approval: required")
         lines.append("Use /approvals")
+    if job.error:
+        lines.append(f"note: {_one_line(job.error, 180)}")
     lines.append("")
     lines.append(job.final_text or "Run finished without a final text response.")
     return "\n".join(lines)
@@ -518,5 +578,6 @@ def _help_text() -> str:
             "/reject <approval_id> [note]",
             "/jobs",
             "/job <job_id>",
+            "/cancel <job_id>",
         ]
     )

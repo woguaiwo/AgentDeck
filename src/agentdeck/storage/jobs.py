@@ -12,7 +12,7 @@ from typing import Any
 from agentdeck.core.config import Workspace
 
 
-JOB_STATUSES = {"queued", "running", "done", "error", "interrupted"}
+JOB_STATUSES = {"queued", "running", "cancel_requested", "cancelled", "done", "error", "interrupted"}
 
 
 @dataclass
@@ -146,12 +146,32 @@ class JobRegistry:
         self._write(records)
         return record
 
+    def cancel(self, job_id: str, *, reason: str) -> JobRecord | None:
+        records = self._read()
+        record = records.get(job_id)
+        if record is None:
+            return None
+        if record.status == "queued":
+            record.status = "cancelled"
+            record.error = reason
+        elif record.status == "running":
+            record.status = "cancel_requested"
+            record.error = reason
+        elif record.status == "cancel_requested":
+            record.error = record.error or reason
+        else:
+            return record
+        record.updated_at = time.time()
+        records[job_id] = record
+        self._write(records)
+        return record
+
     def mark_unfinished_interrupted(self, *, interface: str, reason: str) -> int:
         records = self._read()
         changed = 0
         now = time.time()
         for record in records.values():
-            if record.interface != interface or record.status not in {"queued", "running"}:
+            if record.interface != interface or record.status not in {"queued", "running", "cancel_requested"}:
                 continue
             record.status = "interrupted"
             record.updated_at = now

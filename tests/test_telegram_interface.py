@@ -164,6 +164,66 @@ class TelegramInterfaceTests(unittest.TestCase):
             self.assertIn("status: done", detail)
             self.assertIn("done text", detail)
 
+    def test_cancel_queued_job_marks_it_cancelled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            workspace.ensure()
+            queue = TelegramJobQueue(workspace, sender=lambda chat_id, text: None)
+            queued = queue.registry.create(interface="telegram", chat_id=42, task_id="task-a", prompt="queued work")
+            handler = TelegramCommandHandler(workspace, job_queue=queue)
+
+            reply = asyncio.run(handler.handle_text(f"/cancel {queued.job_id}", chat_id=42))[0]
+            self.assertIn("Job cancelled", reply)
+
+            record = queue.get(queued.job_id)
+            assert record is not None
+            self.assertEqual(record.status, "cancelled")
+
+            detail = asyncio.run(handler.handle_text(f"/job {queued.job_id}", chat_id=42))[0]
+            self.assertIn("status: cancelled", detail)
+
+    def test_cancel_running_job_records_cancel_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            started = threading.Event()
+            release = threading.Event()
+            sent: list[tuple[int, str]] = []
+
+            async def runner(workspace_arg: Workspace, request: RunRequest) -> RunServiceResult:
+                started.set()
+                release.wait(timeout=2)
+                return RunServiceResult(
+                    session_id="session-cancel",
+                    final_text="finished after cancel request",
+                    events=[],
+                    agent_id="owner",
+                    adapter="echo",
+                    task_id=request.task or "",
+                )
+
+            queue = TelegramJobQueue(workspace, sender=lambda chat_id, text: sent.append((chat_id, text)), runner=runner)
+            handler = TelegramCommandHandler(workspace, job_queue=queue)
+
+            reply = asyncio.run(handler.handle_text("/run task-a cancellable work", chat_id=42))[0]
+            job_id = re.search(r"Job started: (job-\S+)", reply).group(1)
+            self.assertTrue(started.wait(timeout=1))
+
+            cancel_reply = asyncio.run(handler.handle_text(f"/cancel {job_id}", chat_id=42))[0]
+            self.assertIn("Cancel requested", cancel_reply)
+            self.assertIn("status: cancel_requested", cancel_reply)
+
+            requested = queue.get(job_id)
+            assert requested is not None
+            self.assertEqual(requested.status, "cancel_requested")
+
+            release.set()
+            finished = queue.wait(job_id, timeout=2)
+            assert finished is not None
+            self.assertEqual(finished.status, "done")
+            self.assertIn("not implemented yet", finished.error)
+            self.assertEqual(len(sent), 1)
+            self.assertIn("note: Cancellation was requested", sent[0][1])
+
     def test_message_split_and_env_config(self) -> None:
         chunks = split_message("a" * 5000, limit=1000)
         self.assertEqual(len(chunks), 5)
