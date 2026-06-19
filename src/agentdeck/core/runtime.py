@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from agentdeck.adapters.base import AgentAdapter
+from agentdeck.core.cancel import CancellationToken
 from agentdeck.core.config import Workspace
 from agentdeck.core.events import AgentEvent, EventKind
 from agentdeck.storage.approvals import ApprovalRegistry
@@ -52,6 +53,7 @@ class AgentRuntime:
         *,
         session_id: str | None = None,
         title: str | None = None,
+        cancellation: CancellationToken | None = None,
     ) -> RunResult:
         self.workspace.ensure()
         sid = session_id or uuid.uuid4().hex[:12]
@@ -73,7 +75,14 @@ class AgentRuntime:
             events.append(event)
 
         final_text = ""
-        async for event in self.adapter.send(prompt, agent_id=self.agent_id, session_id=sid, workspace=self.workspace):
+        cancelled = False
+        async for event in self.adapter.send(
+            prompt,
+            agent_id=self.agent_id,
+            session_id=sid,
+            workspace=self.workspace,
+            cancellation=cancellation,
+        ):
             self.event_log.append(event)
             self.session_registry.update_from_event(event)
             if event.kind == EventKind.APPROVAL_REQUESTED:
@@ -87,8 +96,10 @@ class AgentRuntime:
             events.append(event)
             if event.kind == EventKind.ASSISTANT_FINAL:
                 final_text = event.text
+            if event.kind == EventKind.CANCELLED:
+                cancelled = True
 
-        idle = AgentEvent(EventKind.SESSION_IDLE, self.agent_id, sid)
+        idle = AgentEvent(EventKind.SESSION_IDLE, self.agent_id, sid, payload={"cancelled": cancelled})
         self.event_log.append(idle)
         self.session_registry.update_from_event(idle)
         events.append(idle)

@@ -129,6 +129,9 @@ class SessionRegistry:
             record.last_assistant_final = event.text
         elif event.kind == EventKind.APPROVAL_REQUESTED:
             record.status = "waiting_approval"
+        elif event.kind == EventKind.CANCELLED:
+            record.status = "cancelled"
+            record.metadata["last_cancel_reason"] = event.text
         elif event.kind == EventKind.ERROR:
             if bool(event.payload.get("approval_required")):
                 record.status = "waiting_approval"
@@ -136,7 +139,7 @@ class SessionRegistry:
                 record.status = "error"
             record.metadata["last_error"] = event.text
         elif event.kind == EventKind.SESSION_IDLE:
-            if record.status not in {"error", "waiting_approval"}:
+            if record.status not in {"cancelled", "error", "waiting_approval"}:
                 record.status = "idle"
 
         records[event.session_id] = record

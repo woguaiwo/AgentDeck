@@ -11,7 +11,9 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from agentdeck.core.cancel import CancellationToken
 from agentdeck.core.config import Workspace
+from agentdeck.core.events import EventKind
 from agentdeck.core.run_service import RunConfigurationError, RunRequest, run_agent_prompt
 from agentdeck.storage.approvals import ApprovalRegistry
 from agentdeck.storage.jobs import JobRecord, JobRegistry
@@ -73,6 +75,7 @@ class TelegramJobQueue:
         self.registry = JobRegistry(workspace)
         self._lock = threading.Lock()
         self._threads: dict[str, threading.Thread] = {}
+        self._cancellations: dict[str, CancellationToken] = {}
         self.registry.mark_unfinished_interrupted(
             interface="telegram",
             reason="AgentDeck restarted before this job finished.",
@@ -81,6 +84,7 @@ class TelegramJobQueue:
     def start(self, *, chat_id: int, task_id: str, prompt: str) -> JobRecord:
         with self._lock:
             job = self.registry.create(interface="telegram", chat_id=chat_id, task_id=task_id, prompt=prompt)
+            self._cancellations[job.job_id] = CancellationToken()
             thread = threading.Thread(target=self._run_job, args=(job.job_id,), daemon=True)
             self._threads[job.job_id] = thread
         thread.start()
@@ -103,17 +107,27 @@ class TelegramJobQueue:
 
     def cancel(self, job_id: str) -> JobRecord | None:
         with self._lock:
-            return self.registry.cancel(
+            record = self.registry.cancel(
                 job_id,
-                reason="Cancellation requested from Telegram. Running jobs are not terminated yet.",
+                reason="Cancellation requested from Telegram.",
             )
+            token = self._cancellations.get(job_id)
+            if token is not None:
+                token.cancel("Cancellation requested from Telegram.")
+            return record
 
     def _run_job(self, job_id: str) -> None:
         job = self._start_job(job_id)
         if job is None:
             return
+        cancellation = self._get_cancellation(job_id)
         try:
-            result = asyncio.run(self.runner(self.workspace, RunRequest(prompt=job.prompt, task=job.task_id)))
+            result = asyncio.run(
+                self.runner(
+                    self.workspace,
+                    RunRequest(prompt=job.prompt, task=job.task_id, cancellation=cancellation),
+                )
+            )
         except RunConfigurationError as exc:
             self._finish_job(job_id, status="error", error=str(exc))
             self._send(job.chat_id, f"Job failed: {job_id}\n{exc}")
@@ -121,19 +135,32 @@ class TelegramJobQueue:
             self._finish_job(job_id, status="error", error=str(exc))
             self._send(job.chat_id, f"Job failed: {job_id}\n{exc}")
         else:
+            cancel_event = next((event for event in result.events if event.kind == EventKind.CANCELLED), None)
             cancel_was_requested = self._cancel_was_requested(job_id)
-            finished = self._finish_job(
-                job_id,
-                status="done",
-                session_id=result.session_id,
-                final_text=result.final_text,
-                error=(
-                    "Cancellation was requested, but adapter-level process termination is not implemented yet."
-                    if cancel_was_requested
-                    else ""
-                ),
-            )
+            if cancel_event is not None:
+                finished = self._finish_job(
+                    job_id,
+                    status="cancelled",
+                    session_id=result.session_id,
+                    final_text=result.final_text,
+                    error=cancel_event.text or "Run cancelled.",
+                )
+            else:
+                finished = self._finish_job(
+                    job_id,
+                    status="done",
+                    session_id=result.session_id,
+                    final_text=result.final_text,
+                    error=(
+                        "Cancellation was requested, but adapter-level process termination is not implemented yet."
+                        if cancel_was_requested
+                        else ""
+                    ),
+                )
             self._send(job.chat_id, _format_job_completion(finished or job, result.approval_requested))
+        finally:
+            with self._lock:
+                self._cancellations.pop(job_id, None)
 
     def _start_job(self, job_id: str) -> JobRecord | None:
         with self._lock:
@@ -173,6 +200,10 @@ class TelegramJobQueue:
         with self._lock:
             current = self.registry.get(job_id)
             return current is not None and current.status == "cancel_requested"
+
+    def _get_cancellation(self, job_id: str) -> CancellationToken | None:
+        with self._lock:
+            return self._cancellations.get(job_id)
 
     def _send(self, chat_id: int, text: str) -> None:
         try:
@@ -435,7 +466,7 @@ class TelegramCommandHandler:
                 [
                     f"Cancel requested: {job_id}",
                     "status: cancel_requested",
-                    "Note: the running backend process is not terminated yet.",
+                    "Note: AgentDeck will ask the running adapter to terminate.",
                 ]
             )
         if after.status == "cancelled":
@@ -540,8 +571,9 @@ def _normalize_bot_token(value: str) -> str:
 
 
 def _format_job_completion(job: JobRecord, approval_requested: bool) -> str:
+    heading = "Job cancelled" if job.status == "cancelled" else "Job done"
     lines = [
-        f"Job done: {job.job_id}",
+        f"{heading}: {job.job_id}",
         f"task: {job.task_id}",
     ]
     if job.session_id:
@@ -552,7 +584,10 @@ def _format_job_completion(job: JobRecord, approval_requested: bool) -> str:
     if job.error:
         lines.append(f"note: {_one_line(job.error, 180)}")
     lines.append("")
-    lines.append(job.final_text or "Run finished without a final text response.")
+    if job.status == "cancelled":
+        lines.append(job.final_text or "Run cancelled.")
+    else:
+        lines.append(job.final_text or "Run finished without a final text response.")
     return "\n".join(lines)
 
 

@@ -10,6 +10,7 @@ from agentdeck.adapters.codex_exec import CodexExecAdapter
 from agentdeck.adapters.echo import EchoAdapter
 from agentdeck.adapters.kimi_print import KimiPrintAdapter
 from agentdeck.core.approvals import ApprovalMode
+from agentdeck.core.cancel import CancellationToken
 from agentdeck.core.config import Workspace
 from agentdeck.core.events import AgentEvent, EventKind
 from agentdeck.core.runtime import AgentRuntime
@@ -43,6 +44,7 @@ class RunRequest:
     approval_mode: str | None = None
     no_skip_git_check: bool = False
     extra_args: tuple[str, ...] = field(default_factory=tuple)
+    cancellation: CancellationToken | None = None
 
 
 @dataclass
@@ -128,7 +130,12 @@ async def run_agent_prompt(workspace: Workspace, request: RunRequest) -> RunServ
         session_registry=session_registry,
         approval_registry=approval_registry,
     )
-    result = await runtime.run_prompt(request.prompt, session_id=session_id, title=request.title)
+    result = await runtime.run_prompt(
+        request.prompt,
+        session_id=session_id,
+        title=request.title,
+        cancellation=request.cancellation,
+    )
 
     approval_requested = any(event.kind == EventKind.APPROVAL_REQUESTED for event in result.events)
     pending_approvals: list[ApprovalRecord] = []

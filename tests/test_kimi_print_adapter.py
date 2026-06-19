@@ -5,12 +5,14 @@ import json
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
 from agentdeck.adapters.kimi_print import KimiPrintAdapter, _events_from_stdout_line
 from agentdeck.cli import main
 from agentdeck.core.approvals import ApprovalMode
+from agentdeck.core.cancel import CancellationToken
 from agentdeck.core.config import Workspace
 from agentdeck.core.events import EventKind
 from agentdeck.core.runtime import AgentRuntime
@@ -167,6 +169,42 @@ class KimiPrintAdapterTests(unittest.TestCase):
             self.assertNotIn("--session", calls[0])
             self.assertIn("--session", calls[1])
             self.assertIn("11111111-2222-3333-4444-555555555555", calls[1])
+
+    def test_cancellation_terminates_kimi_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            fake = tmp / "fake_kimi"
+            fake.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    import json
+                    import time
+
+                    print(json.dumps({{"role": "assistant", "content": [{{"type": "text", "text": "started"}}]}}), flush=True)
+                    time.sleep(30)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+
+            async def run_cancelled() -> object:
+                workspace = Workspace(tmp / ".agentdeck")
+                adapter = KimiPrintAdapter(kimi_bin=str(fake), cwd=tmp)
+                runtime = AgentRuntime(workspace, adapter, agent_id="kimi-test")
+                cancellation = CancellationToken()
+                task = asyncio.create_task(runtime.run_prompt("hello", cancellation=cancellation))
+                await asyncio.sleep(0.2)
+                cancellation.cancel("stop requested")
+                return await asyncio.wait_for(task, timeout=5)
+
+            started_at = time.time()
+            result = asyncio.run(run_cancelled())
+
+            self.assertLess(time.time() - started_at, 5)
+            kinds = [event.kind for event in result.events]
+            self.assertIn(EventKind.CANCELLED, kinds)
 
 
 if __name__ == "__main__":

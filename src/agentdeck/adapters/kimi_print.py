@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, AsyncIterator
 
 from agentdeck.core.approvals import ApprovalMode
+from agentdeck.core.cancel import CancellationToken
 from agentdeck.core.config import Workspace
 from agentdeck.core.events import AgentEvent, EventKind
 
@@ -43,6 +44,7 @@ class KimiPrintAdapter:
         agent_id: str,
         session_id: str,
         workspace: Workspace,
+        cancellation: CancellationToken | None = None,
     ) -> AsyncIterator[AgentEvent]:
         run_cwd = (self.cwd or Path.cwd()).expanduser().resolve()
         command = self._build_command(prompt)
@@ -57,6 +59,7 @@ class KimiPrintAdapter:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+            cancel_task = asyncio.create_task(_terminate_on_cancel(process, cancellation))
 
             assert process.stdout is not None
             async for raw in process.stdout:
@@ -73,6 +76,21 @@ class KimiPrintAdapter:
             assert process.stderr is not None
             stderr_text = (await process.stderr.read()).decode("utf-8", errors="replace").strip()
             return_code = await process.wait()
+            cancelled = await cancel_task
+
+            if cancelled:
+                yield AgentEvent(
+                    EventKind.CANCELLED,
+                    agent_id,
+                    session_id,
+                    text=(cancellation.reason if cancellation is not None else "Cancellation requested."),
+                    payload={
+                        "source": "kimi_print",
+                        "return_code": return_code,
+                        "command": _redacted_command(command),
+                    },
+                )
+                return
 
             stderr = ""
             if stderr_text:
@@ -249,6 +267,28 @@ def _extract_text(value: Any) -> str:
         if text:
             return text
     return ""
+
+
+async def _terminate_on_cancel(process: asyncio.subprocess.Process, cancellation: CancellationToken | None) -> bool:
+    if cancellation is None:
+        return False
+    while process.returncode is None:
+        if cancellation.is_cancelled():
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                return True
+            try:
+                await asyncio.wait_for(process.wait(), timeout=2)
+            except asyncio.TimeoutError:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                await process.wait()
+            return True
+        await asyncio.sleep(0.1)
+    return False
 
 
 def _redacted_command(command: list[str]) -> list[str]:

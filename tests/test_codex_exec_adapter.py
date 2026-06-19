@@ -2,14 +2,17 @@ import asyncio
 import sys
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
 from agentdeck.adapters.codex_exec import CodexExecAdapter, _event_from_stdout_line
 from agentdeck.core.approvals import ApprovalMode
+from agentdeck.core.cancel import CancellationToken
 from agentdeck.core.config import Workspace
 from agentdeck.core.events import EventKind
 from agentdeck.core.runtime import AgentRuntime
+from agentdeck.storage.sessions import SessionRegistry
 
 
 class CodexExecAdapterTests(unittest.TestCase):
@@ -129,3 +132,42 @@ class CodexExecAdapterTests(unittest.TestCase):
             errors = [event for event in result.events if event.kind == EventKind.ERROR]
             self.assertTrue(errors)
             self.assertIn("cannot answer mid-run approval", errors[0].text)
+
+    def test_cancellation_terminates_codex_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            fake = tmp / "fake_codex"
+            fake.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    import json
+                    import time
+
+                    print(json.dumps({{"type": "assistant_delta", "delta": "started"}}), flush=True)
+                    time.sleep(30)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+
+            async def run_cancelled() -> object:
+                workspace = Workspace(tmp / ".agentdeck")
+                adapter = CodexExecAdapter(codex_bin=str(fake))
+                runtime = AgentRuntime(workspace, adapter, agent_id="codex-test")
+                cancellation = CancellationToken()
+                task = asyncio.create_task(runtime.run_prompt("hello", cancellation=cancellation))
+                await asyncio.sleep(0.2)
+                cancellation.cancel("stop requested")
+                return await asyncio.wait_for(task, timeout=5)
+
+            started_at = time.time()
+            result = asyncio.run(run_cancelled())
+
+            self.assertLess(time.time() - started_at, 5)
+            kinds = [event.kind for event in result.events]
+            self.assertIn(EventKind.CANCELLED, kinds)
+            session = SessionRegistry(Workspace(tmp / ".agentdeck")).get(result.session_id)
+            assert session is not None
+            self.assertEqual(session.status, "cancelled")

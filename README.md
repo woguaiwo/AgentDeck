@@ -127,9 +127,10 @@ the final result back to the chat when the job finishes. Job records are stored
 under `.agentdeck/jobs/`; if AgentDeck restarts while a job is still queued or
 running, that job is marked `interrupted`.
 
-`/cancel <job_id>` cancels queued jobs immediately. For running jobs it records
-`cancel_requested`; adapter-level process termination is a later step, so the
-backend may still finish normally.
+`/cancel <job_id>` cancels queued jobs immediately. For running Codex/Kimi
+print jobs, AgentDeck requests adapter-level process termination and records the
+job as `cancelled` once the adapter stops. Adapters that do not support
+cancellation yet may still finish normally after `cancel_requested`.
 
 For development without installing:
 

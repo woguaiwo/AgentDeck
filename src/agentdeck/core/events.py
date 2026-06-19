@@ -21,6 +21,7 @@ class EventKind(str, Enum):
     APPROVAL_REQUESTED = "approval_requested"
     APPROVAL_RESOLVED = "approval_resolved"
     MEMORY_UPDATED = "memory_updated"
+    CANCELLED = "cancelled"
     ERROR = "error"
 
 
