@@ -29,6 +29,7 @@ class AgentRegistryTests(unittest.TestCase):
             )
 
             self.assertEqual(record.agent_id, "motion-x-owner")
+            self.assertEqual(record.project_id, "")
             self.assertEqual(record.role, "owner")
             self.assertEqual(record.team_id, "motion-x")
             self.assertEqual(registry.resolve("Motion-X Owner").agent_id, "motion-x-owner")
@@ -71,8 +72,8 @@ class AgentRegistryTests(unittest.TestCase):
                 code = main(["--workspace", str(workspace.root), "agents", "list"])
             self.assertEqual(code, 0)
             listed = stdout.getvalue()
-            self.assertIn("title\tagent_id\trole\tteam", listed)
-            self.assertIn("Motion-X Owner\tmotionx\towner\tmotionx", listed)
+            self.assertIn("title\tagent_id\tproject\trole\tteam", listed)
+            self.assertIn("Motion-X Owner\tmotionx\t-\towner\tmotionx", listed)
 
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):

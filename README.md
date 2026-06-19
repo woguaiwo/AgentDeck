@@ -23,7 +23,9 @@ This repository starts with a minimal core:
 - Adapter protocol
 - Debug echo adapter
 - Codex non-interactive adapter using `codex exec --json`
+- Project registry for managing multiple source projects from one workspace
 - Agent registry with project defaults, role, team, and resume policy
+- Task board with project, agent, session, status, priority, and notes
 - Session registry with human-readable titles and provider session ids
 - Markdown memory store with `user`, `project`, `team`, `agent`, and `task` scopes
 - JSONL event log
@@ -43,9 +45,14 @@ The first real adapter targets should be:
 python -m agentdeck init
 python -m agentdeck doctor
 python -m agentdeck run "hello from AgentDeck"
-python -m agentdeck agents create owner --title "Project Owner" --adapter codex --cwd "$PWD"
-python -m agentdeck run --agent owner "Summarize this repository"
+python -m agentdeck projects create motionx --title "Motion-X" --cwd "$PWD" --default-agent owner
+python -m agentdeck agents create owner --title "Motion-X Owner" --project motionx --adapter codex
+python -m agentdeck tasks create "Summarize repository" --project motionx
+python -m agentdeck run --project motionx "Summarize this repository"
+python -m agentdeck run --task <task_id> "Continue"
+python -m agentdeck projects list
 python -m agentdeck agents list
+python -m agentdeck tasks list
 python -m agentdeck sessions list
 python -m agentdeck run --adapter codex --cwd "$PWD" "Summarize this repository"
 python -m agentdeck run --adapter codex --cwd "$PWD" --resume-last "Continue"
@@ -80,6 +87,8 @@ PYTHONPATH=src python -m pytest
 ```text
 .agentdeck/
 ├── config.toml
+├── projects/
+│   └── registry.json
 ├── agents/
 │   └── registry.json
 ├── events/
@@ -88,6 +97,7 @@ PYTHONPATH=src python -m pytest
 │   └── registry.json
 ├── inbox/
 ├── board/
+│   └── tasks.json
 └── memory/
     ├── user/
     ├── projects/
@@ -116,3 +126,10 @@ The current practical default is one `owner` agent per project. Agent records
 already include `role` and `team_id`, so later teams can add planners,
 developers, testers, reviewers, and managers without changing the storage
 model.
+
+## Project And Task Model
+
+Projects represent source directories such as `Motion-X`, `ReID`, or `WHAM`.
+Tasks represent units of work inside a project. `agentdeck run --task <task>`
+uses the task's project and agent defaults, then attaches the resulting session
+back to the task so later runs can continue the same work.

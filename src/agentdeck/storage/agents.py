@@ -18,6 +18,7 @@ class AgentRecord:
 
     agent_id: str
     title: str
+    project_id: str = ""
     role: str = "owner"
     team_id: str = "default"
     adapter: str = "echo"
@@ -36,6 +37,7 @@ class AgentRecord:
         return cls(
             agent_id=str(data["agent_id"]),
             title=str(data.get("title") or data["agent_id"]),
+            project_id=str(data.get("project_id") or ""),
             role=str(data.get("role") or "owner"),
             team_id=str(data.get("team_id") or "default"),
             adapter=str(data.get("adapter") or "echo"),
@@ -69,6 +71,7 @@ class AgentRegistry:
         *,
         agent_id: str,
         title: str | None = None,
+        project_id: str = "",
         role: str = "owner",
         team_id: str = "default",
         adapter: str = "echo",
@@ -91,6 +94,7 @@ class AgentRegistry:
         record = AgentRecord(
             agent_id=agent_id,
             title=_clean_title(title or "") or _title_from_id(agent_id),
+            project_id=_normalize_token(project_id) if project_id else "",
             role=_normalize_token(role or "owner"),
             team_id=_normalize_token(team_id or "default"),
             adapter=adapter,
@@ -121,13 +125,21 @@ class AgentRegistry:
             return None
         return sorted(matches, key=lambda item: item.updated_at, reverse=True)[0]
 
-    def list(self, *, team_id: str | None = None, role: str | None = None) -> list[AgentRecord]:
+    def list(
+        self,
+        *,
+        project_id: str | None = None,
+        team_id: str | None = None,
+        role: str | None = None,
+    ) -> list[AgentRecord]:
         records = list(self._read().values())
+        if project_id:
+            records = [record for record in records if record.project_id == _normalize_token(project_id)]
         if team_id:
             records = [record for record in records if record.team_id == _normalize_token(team_id)]
         if role:
             records = [record for record in records if record.role == _normalize_token(role)]
-        return sorted(records, key=lambda item: (item.team_id, item.role, item.agent_id))
+        return sorted(records, key=lambda item: (item.project_id, item.team_id, item.role, item.agent_id))
 
     def _read(self) -> dict[str, AgentRecord]:
         if not self.path.exists():
