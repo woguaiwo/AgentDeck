@@ -9,14 +9,9 @@ import json
 import sys
 from pathlib import Path
 
-from agentdeck.adapters.codex_exec import CodexExecAdapter
-from agentdeck.adapters.echo import EchoAdapter
-from agentdeck.adapters.kimi_print import KimiPrintAdapter
-from agentdeck.adapters.base import AgentAdapter
-from agentdeck.core.approvals import ApprovalMode
 from agentdeck.core.config import Workspace
-from agentdeck.core.events import EventKind
-from agentdeck.core.runtime import AgentRuntime
+from agentdeck.core.run_service import RunConfigurationError, RunRequest, run_agent_prompt
+from agentdeck.interfaces.telegram import TelegramBotApi, TelegramServer, config_from_env
 from agentdeck.storage.approvals import APPROVAL_STATUSES, ApprovalRecord, ApprovalRegistry
 from agentdeck.storage.event_log import EventLog
 from agentdeck.storage.agents import AgentRecord, AgentRegistry
@@ -177,6 +172,19 @@ def build_parser() -> argparse.ArgumentParser:
     task_status.add_argument("status", choices=sorted(TASK_STATUSES))
     task_status.add_argument("note", nargs="?")
 
+    telegram = sub.add_parser("telegram", help="Run Telegram remote interface")
+    telegram_sub = telegram.add_subparsers(dest="telegram_command", required=True)
+    telegram_serve = telegram_sub.add_parser("serve", help="Start Telegram long-polling bot")
+    telegram_serve.add_argument("--token", help="Telegram bot token; defaults to AGENTDECK_TELEGRAM_TOKEN")
+    telegram_serve.add_argument(
+        "--allowed-chat-id",
+        action="append",
+        default=[],
+        help="Allowed Telegram chat id. Can be repeated. Defaults to AGENTDECK_TELEGRAM_ALLOWED_CHATS.",
+    )
+    telegram_serve.add_argument("--poll-timeout", type=int, default=30)
+    telegram_serve.add_argument("--once", action="store_true", help="Process one polling response and exit")
+
     return parser
 
 
@@ -187,119 +195,33 @@ def resolve_workspace(args: argparse.Namespace, cwd: str | Path | None = None) -
 
 
 async def _run_prompt(args: argparse.Namespace, workspace: Workspace) -> int:
-    session_registry = SessionRegistry(workspace)
-    agent_registry = AgentRegistry(workspace)
-    project_registry = ProjectRegistry(workspace)
-    task_board = TaskBoard(workspace)
-    approval_registry = ApprovalRegistry(workspace)
-    args = argparse.Namespace(**vars(args))
-
-    task = task_board.resolve(args.task) if args.task else None
-    if args.task and task is None:
-        print(f"task not found: {args.task}", file=sys.stderr)
-        return 2
-    if task is not None:
-        _apply_task_defaults(args, task)
-
-    project = project_registry.resolve(args.project) if args.project else None
-    if args.project and project is None:
-        print(f"project not found: {args.project}", file=sys.stderr)
-        return 2
-    if project is not None:
-        _apply_project_defaults(args, project)
-
-    args.agent = args.agent or "default"
-    saved_agent = agent_registry.resolve(args.agent) if args.agent else None
-    if saved_agent is not None:
-        _apply_agent_defaults(args, saved_agent, session_registry)
-
-    session = session_registry.resolve(args.session) if args.session else None
-    if args.session and session is None:
-        print(f"session not found: {args.session}", file=sys.stderr)
-        return 2
-
-    session_id = None
-    if session is not None:
-        args.agent = session.agent_id
-        args.adapter = args.adapter or session.adapter
-        args.cwd = args.cwd or session.project_dir
-        if args.adapter in {"codex", "codex-exec", "kimi", "kimi-print"} and not args.resume and not args.resume_last:
-            if not session.provider_session_id:
-                print(
-                    f"session has no provider session id; pass --resume explicitly: {session.session_id}",
-                    file=sys.stderr,
-                )
-                return 2
-            args.resume = session.provider_session_id
-        session_id = session.session_id
-
-    args.adapter = args.adapter or "echo"
-    args.codex_bin = args.codex_bin or "codex"
-    args.kimi_bin = args.kimi_bin or "kimi"
-    args.approval_mode = args.approval_mode or "fail"
-    project_dir = Path(args.cwd or ".").expanduser().resolve()
-    adapter = _build_adapter(args)
-    if task is not None:
-        task_board.set_status(task.task_id, "doing")
-    runtime = AgentRuntime(
-        workspace,
-        adapter,
-        agent_id=args.agent,
-        project_dir=project_dir,
-        project_id=args.project or "",
-        task_id=task.task_id if task is not None else "",
-        session_registry=session_registry,
-        approval_registry=approval_registry,
+    request = RunRequest(
+        prompt=args.prompt,
+        adapter=args.adapter,
+        project=args.project,
+        task=args.task,
+        agent=args.agent,
+        session=args.session,
+        title=args.title,
+        cwd=args.cwd,
+        codex_bin=args.codex_bin,
+        kimi_bin=args.kimi_bin,
+        resume=args.resume,
+        resume_last=args.resume_last,
+        model=args.model,
+        sandbox=args.sandbox,
+        approval_mode=args.approval_mode,
+        no_skip_git_check=args.no_skip_git_check,
+        extra_args=tuple(args.extra_arg or ()),
     )
-    result = await runtime.run_prompt(args.prompt, session_id=session_id, title=args.title)
-    if task is not None:
-        approval_requested = any(event.kind == EventKind.APPROVAL_REQUESTED for event in result.events)
-        refreshed = task_board.resolve(task.task_id)
-        if refreshed is not None and not refreshed.session_id:
-            task_board.attach_session(refreshed.task_id, result.session_id)
-        task_board.add_note(
-            task.task_id,
-            f"Ran prompt with agent {args.agent}; session_id: {result.session_id}",
-            kind="run",
-        )
-        if approval_requested:
-            pending = approval_registry.list(status="pending", task_id=task.task_id)
-            approval_text = f"Approval required for session {result.session_id}"
-            if pending:
-                approval_text += f"; approval_id: {pending[0].approval_id}"
-            task_board.set_status(task.task_id, "blocked", note=approval_text)
+    try:
+        result = await run_agent_prompt(workspace, request)
+    except RunConfigurationError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     print(result.final_text)
     print(f"session_id: {result.session_id}")
     return 0
-
-
-def _build_adapter(args: argparse.Namespace) -> AgentAdapter:
-    adapter_name = args.adapter or "echo"
-    if adapter_name == "echo":
-        return EchoAdapter()
-    if adapter_name in {"codex", "codex-exec"}:
-        return CodexExecAdapter(
-            codex_bin=args.codex_bin,
-            cwd=Path(args.cwd or ".").expanduser().resolve(),
-            resume=args.resume,
-            resume_last=args.resume_last,
-            model=args.model,
-            sandbox=args.sandbox,
-            approval_mode=ApprovalMode.parse(args.approval_mode),
-            skip_git_repo_check=not args.no_skip_git_check,
-            extra_args=tuple(args.extra_arg or ()),
-        )
-    if adapter_name in {"kimi", "kimi-print"}:
-        return KimiPrintAdapter(
-            kimi_bin=args.kimi_bin,
-            cwd=Path(args.cwd or ".").expanduser().resolve(),
-            resume=args.resume,
-            resume_last=args.resume_last,
-            model=args.model,
-            approval_mode=ApprovalMode.parse(args.approval_mode),
-            extra_args=tuple(args.extra_arg or ()),
-        )
-    raise ValueError(f"unsupported adapter: {adapter_name}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -510,6 +432,20 @@ def main(argv: list[str] | None = None) -> int:
         if args.tasks_command == "status":
             return _update_task_status(board, args.task, args.status, note=args.note or "")
 
+    if args.command == "telegram":
+        workspace.ensure()
+        if args.telegram_command == "serve":
+            config = config_from_env(
+                token=args.token,
+                allowed_chat_ids=args.allowed_chat_id,
+                poll_timeout=args.poll_timeout,
+            )
+            if not config.token:
+                print("missing Telegram token; set AGENTDECK_TELEGRAM_TOKEN or pass --token", file=sys.stderr)
+                return 2
+            TelegramServer(workspace, TelegramBotApi(config.token), config).serve_forever(once=args.once)
+            return 0
+
     parser.error(f"unknown command: {args.command}")
     return 2
 
@@ -583,46 +519,6 @@ def _print_approvals(records: list[ApprovalRecord]) -> None:
                 ]
             )
         )
-
-
-def _apply_task_defaults(args: argparse.Namespace, task: TaskRecord) -> None:
-    args.project = args.project or task.project_id or None
-    args.agent = args.agent or task.agent_id
-    args.session = args.session or task.session_id or None
-    args.title = args.title or task.title
-
-
-def _apply_project_defaults(args: argparse.Namespace, project: ProjectRecord) -> None:
-    args.project = project.project_id
-    args.cwd = args.cwd or project.project_dir
-    args.agent = args.agent or project.default_agent_id
-
-
-def _apply_agent_defaults(args: argparse.Namespace, agent: AgentRecord, sessions: SessionRegistry) -> None:
-    args.agent = agent.agent_id
-    args.project = args.project or agent.project_id or None
-    args.adapter = args.adapter or agent.adapter
-    args.cwd = args.cwd or agent.project_dir
-    args.model = args.model or agent.model or None
-    args.sandbox = args.sandbox or agent.sandbox or None
-    args.approval_mode = args.approval_mode or agent.approval_mode
-    args.codex_bin = args.codex_bin or agent.codex_bin
-    args.kimi_bin = args.kimi_bin or agent.kimi_bin
-    args.title = args.title or agent.title
-
-    if args.session or args.resume or args.resume_last:
-        return
-    if agent.resume_policy != "latest":
-        return
-
-    adapter_name = args.adapter or agent.adapter
-    latest = sessions.latest_for_agent(
-        agent.agent_id,
-        adapter=adapter_name,
-        require_provider_session=adapter_name in {"codex", "codex-exec", "kimi", "kimi-print"},
-    )
-    if latest is not None:
-        args.session = latest.session_id
 
 
 def _print_projects(records: list[ProjectRecord]) -> None:

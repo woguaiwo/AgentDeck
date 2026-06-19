@@ -29,6 +29,7 @@ This repository starts with a minimal core:
 - Task board with project, agent, session, status, priority, and notes
 - Session registry with human-readable titles and provider session ids
 - Approval registry for backend approval requests and explicit decisions
+- Telegram long-polling interface for project/task/approval/run commands
 - Markdown memory store with `user`, `project`, `team`, `agent`, and `task` scopes
 - JSONL event log
 - CLI smoke path
@@ -57,6 +58,7 @@ python -m agentdeck agents list
 python -m agentdeck tasks list
 python -m agentdeck sessions list
 python -m agentdeck approvals list
+AGENTDECK_TELEGRAM_TOKEN="<bot-token>" python -m agentdeck telegram serve
 python -m agentdeck run --adapter codex --cwd "$PWD" "Summarize this repository"
 python -m agentdeck run --adapter kimi --cwd "$PWD" "Summarize this repository"
 python -m agentdeck run --adapter codex --cwd "$PWD" --resume-last "Continue"
@@ -90,6 +92,31 @@ python -m agentdeck approvals reject <approval_id> "too risky"
 
 Approving a request records the decision for audit and later remote interfaces.
 It does not implicitly rerun with bypassed permissions.
+
+## Telegram Interface
+
+The Telegram interface uses Bot API long polling and requires no extra Python
+dependency:
+
+```bash
+export AGENTDECK_TELEGRAM_TOKEN="<bot-token>"
+export AGENTDECK_TELEGRAM_ALLOWED_CHATS="<chat-id>,<chat-id>"
+python -m agentdeck telegram serve
+```
+
+Supported commands:
+
+```text
+/projects
+/agents [project]
+/tasks [project]
+/task <task_id>
+/run <task_id> <message>
+/approvals [pending|approved|rejected]
+/approval <approval_id>
+/approve <approval_id> [note]
+/reject <approval_id> [note]
+```
 
 For development without installing:
 
