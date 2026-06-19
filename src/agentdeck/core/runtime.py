@@ -9,6 +9,7 @@ from pathlib import Path
 from agentdeck.adapters.base import AgentAdapter
 from agentdeck.core.config import Workspace
 from agentdeck.core.events import AgentEvent, EventKind
+from agentdeck.storage.approvals import ApprovalRegistry
 from agentdeck.storage.event_log import EventLog
 from agentdeck.storage.sessions import SessionRegistry
 
@@ -30,14 +31,20 @@ class AgentRuntime:
         agent_id: str = "default",
         *,
         project_dir: str | Path | None = None,
+        project_id: str = "",
+        task_id: str = "",
         session_registry: SessionRegistry | None = None,
+        approval_registry: ApprovalRegistry | None = None,
     ) -> None:
         self.workspace = workspace
         self.adapter = adapter
         self.agent_id = agent_id
         self.event_log = EventLog(workspace)
         self.project_dir = Path(project_dir or Path.cwd()).expanduser().resolve()
+        self.project_id = project_id
+        self.task_id = task_id
         self.session_registry = session_registry or SessionRegistry(workspace)
+        self.approval_registry = approval_registry or ApprovalRegistry(workspace)
 
     async def run_prompt(
         self,
@@ -69,6 +76,14 @@ class AgentRuntime:
         async for event in self.adapter.send(prompt, agent_id=self.agent_id, session_id=sid, workspace=self.workspace):
             self.event_log.append(event)
             self.session_registry.update_from_event(event)
+            if event.kind == EventKind.APPROVAL_REQUESTED:
+                self.approval_registry.record_request(
+                    event,
+                    adapter=self.adapter.name,
+                    project_dir=self.project_dir,
+                    project_id=self.project_id,
+                    task_id=self.task_id,
+                )
             events.append(event)
             if event.kind == EventKind.ASSISTANT_FINAL:
                 final_text = event.text

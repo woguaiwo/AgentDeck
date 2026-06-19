@@ -96,6 +96,7 @@ class CodexExecAdapter:
                             ),
                             payload={
                                 "approval_mode": self.approval_mode.value,
+                                "approval_required": True,
                                 "hint": "Use --approval-mode record to only log requests, or --approval-mode bypass in an isolated environment.",
                             },
                         )

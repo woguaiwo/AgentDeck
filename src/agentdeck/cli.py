@@ -15,7 +15,9 @@ from agentdeck.adapters.kimi_print import KimiPrintAdapter
 from agentdeck.adapters.base import AgentAdapter
 from agentdeck.core.approvals import ApprovalMode
 from agentdeck.core.config import Workspace
+from agentdeck.core.events import EventKind
 from agentdeck.core.runtime import AgentRuntime
+from agentdeck.storage.approvals import APPROVAL_STATUSES, ApprovalRecord, ApprovalRegistry
 from agentdeck.storage.event_log import EventLog
 from agentdeck.storage.agents import AgentRecord, AgentRegistry
 from agentdeck.storage.memory import MarkdownMemoryStore
@@ -73,6 +75,22 @@ def build_parser() -> argparse.ArgumentParser:
 
     events = sub.add_parser("events", help="Inspect event log")
     events.add_argument("--tail", type=int, default=20)
+
+    approvals = sub.add_parser("approvals", help="Manage backend approval requests")
+    approval_sub = approvals.add_subparsers(dest="approvals_command", required=True)
+    approval_list = approval_sub.add_parser("list", help="List approval requests")
+    approval_list.add_argument("--status", choices=sorted(APPROVAL_STATUSES))
+    approval_list.add_argument("--project")
+    approval_list.add_argument("--task")
+    approval_list.add_argument("--agent")
+    approval_show = approval_sub.add_parser("show", help="Show one approval as JSON")
+    approval_show.add_argument("approval")
+    approval_approve = approval_sub.add_parser("approve", help="Mark an approval as approved")
+    approval_approve.add_argument("approval")
+    approval_approve.add_argument("note", nargs="?")
+    approval_reject = approval_sub.add_parser("reject", help="Mark an approval as rejected")
+    approval_reject.add_argument("approval")
+    approval_reject.add_argument("note", nargs="?")
 
     sessions = sub.add_parser("sessions", help="Inspect session registry")
     sess_sub = sessions.add_subparsers(dest="sessions_command", required=True)
@@ -173,6 +191,7 @@ async def _run_prompt(args: argparse.Namespace, workspace: Workspace) -> int:
     agent_registry = AgentRegistry(workspace)
     project_registry = ProjectRegistry(workspace)
     task_board = TaskBoard(workspace)
+    approval_registry = ApprovalRegistry(workspace)
     args = argparse.Namespace(**vars(args))
 
     task = task_board.resolve(args.task) if args.task else None
@@ -227,10 +246,14 @@ async def _run_prompt(args: argparse.Namespace, workspace: Workspace) -> int:
         adapter,
         agent_id=args.agent,
         project_dir=project_dir,
+        project_id=args.project or "",
+        task_id=task.task_id if task is not None else "",
         session_registry=session_registry,
+        approval_registry=approval_registry,
     )
     result = await runtime.run_prompt(args.prompt, session_id=session_id, title=args.title)
     if task is not None:
+        approval_requested = any(event.kind == EventKind.APPROVAL_REQUESTED for event in result.events)
         refreshed = task_board.resolve(task.task_id)
         if refreshed is not None and not refreshed.session_id:
             task_board.attach_session(refreshed.task_id, result.session_id)
@@ -239,6 +262,12 @@ async def _run_prompt(args: argparse.Namespace, workspace: Workspace) -> int:
             f"Ran prompt with agent {args.agent}; session_id: {result.session_id}",
             kind="run",
         )
+        if approval_requested:
+            pending = approval_registry.list(status="pending", task_id=task.task_id)
+            approval_text = f"Approval required for session {result.session_id}"
+            if pending:
+                approval_text += f"; approval_id: {pending[0].approval_id}"
+            task_board.set_status(task.task_id, "blocked", note=approval_text)
     print(result.final_text)
     print(f"session_id: {result.session_id}")
     return 0
@@ -313,6 +342,31 @@ def main(argv: list[str] | None = None) -> int:
         for event in EventLog(workspace).tail(args.tail):
             print(json.dumps(event.to_dict(), ensure_ascii=False, sort_keys=True))
         return 0
+
+    if args.command == "approvals":
+        workspace.ensure()
+        registry = ApprovalRegistry(workspace)
+        if args.approvals_command == "list":
+            _print_approvals(
+                registry.list(
+                    status=args.status,
+                    project_id=args.project,
+                    task_id=args.task,
+                    agent_id=args.agent,
+                )
+            )
+            return 0
+        if args.approvals_command == "show":
+            record = registry.resolve(args.approval)
+            if record is None:
+                print(f"approval not found: {args.approval}", file=sys.stderr)
+                return 2
+            print(json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+        if args.approvals_command == "approve":
+            return _resolve_approval(registry, TaskBoard(workspace), args.approval, "approved", note=args.note or "")
+        if args.approvals_command == "reject":
+            return _resolve_approval(registry, TaskBoard(workspace), args.approval, "rejected", note=args.note or "")
 
     if args.command == "sessions":
         workspace.ensure()
@@ -509,6 +563,28 @@ def _print_sessions(records: list[SessionRecord]) -> None:
         )
 
 
+def _print_approvals(records: list[ApprovalRecord]) -> None:
+    if not records:
+        print("no approvals")
+        return
+    print("title\tapproval_id\tstatus\tproject\ttask\tagent\tprovider\tsession")
+    for record in records:
+        print(
+            "\t".join(
+                [
+                    record.title,
+                    record.approval_id,
+                    record.status,
+                    record.project_id or "-",
+                    record.task_id or "-",
+                    record.agent_id,
+                    record.provider or record.adapter or "-",
+                    record.session_id or "-",
+                ]
+            )
+        )
+
+
 def _apply_task_defaults(args: argparse.Namespace, task: TaskRecord) -> None:
     args.project = args.project or task.project_id or None
     args.agent = args.agent or task.agent_id
@@ -631,6 +707,31 @@ def _update_task_note(board: TaskBoard, task: str, note: str) -> int:
         print(f"task not found: {task}", file=sys.stderr)
         return 2
     print(f"task: {record.title} ({record.task_id}) notes={len(record.notes)}")
+    return 0
+
+
+def _resolve_approval(
+    registry: ApprovalRegistry,
+    board: TaskBoard,
+    approval: str,
+    status: str,
+    *,
+    note: str = "",
+) -> int:
+    try:
+        record = registry.resolve_request(approval, status=status, note=note)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if record is None:
+        print(f"approval not found: {approval}", file=sys.stderr)
+        return 2
+    if record.task_id:
+        task_note = f"Approval {record.status}: {record.approval_id}"
+        if note:
+            task_note += f"; {note}"
+        board.add_note(record.task_id, task_note, kind=f"approval:{record.status}")
+    print(f"approval: {record.title} ({record.approval_id}) status={record.status}")
     return 0
 
 

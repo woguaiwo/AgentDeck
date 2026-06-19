@@ -130,7 +130,9 @@ class SessionRegistry:
         elif event.kind == EventKind.APPROVAL_REQUESTED:
             record.status = "waiting_approval"
         elif event.kind == EventKind.ERROR:
-            if not bool(event.payload.get("nonfatal")):
+            if bool(event.payload.get("approval_required")):
+                record.status = "waiting_approval"
+            elif not bool(event.payload.get("nonfatal")):
                 record.status = "error"
             record.metadata["last_error"] = event.text
         elif event.kind == EventKind.SESSION_IDLE:

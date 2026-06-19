@@ -11,6 +11,7 @@ def test_workspace_init_creates_expected_directories(tmp_path: Path) -> None:
     assert workspace.config_path.exists()
     assert workspace.agents_dir.is_dir()
     assert workspace.projects_dir.is_dir()
+    assert workspace.approvals_dir.is_dir()
     assert workspace.board_dir.is_dir()
     assert (workspace.memory_dir / "user").is_dir()
     assert (workspace.memory_dir / "projects").is_dir()

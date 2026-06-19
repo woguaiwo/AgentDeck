@@ -28,6 +28,7 @@ This repository starts with a minimal core:
 - Agent registry with project defaults, role, team, and resume policy
 - Task board with project, agent, session, status, priority, and notes
 - Session registry with human-readable titles and provider session ids
+- Approval registry for backend approval requests and explicit decisions
 - Markdown memory store with `user`, `project`, `team`, `agent`, and `task` scopes
 - JSONL event log
 - CLI smoke path
@@ -55,6 +56,7 @@ python -m agentdeck projects list
 python -m agentdeck agents list
 python -m agentdeck tasks list
 python -m agentdeck sessions list
+python -m agentdeck approvals list
 python -m agentdeck run --adapter codex --cwd "$PWD" "Summarize this repository"
 python -m agentdeck run --adapter kimi --cwd "$PWD" "Summarize this repository"
 python -m agentdeck run --adapter codex --cwd "$PWD" --resume-last "Continue"
@@ -77,6 +79,18 @@ approval loop is solved:
   `--dangerously-bypass-approvals-and-sandbox`. Use this only in an isolated,
   trusted environment.
 
+When a backend requests approval, AgentDeck records it in the approval registry:
+
+```bash
+python -m agentdeck approvals list
+python -m agentdeck approvals show <approval_id>
+python -m agentdeck approvals approve <approval_id> "approved by operator"
+python -m agentdeck approvals reject <approval_id> "too risky"
+```
+
+Approving a request records the decision for audit and later remote interfaces.
+It does not implicitly rerun with bypassed permissions.
+
 For development without installing:
 
 ```bash
@@ -90,6 +104,8 @@ PYTHONPATH=src python -m pytest
 .agentdeck/
 ├── config.toml
 ├── projects/
+│   └── registry.json
+├── approvals/
 │   └── registry.json
 ├── agents/
 │   └── registry.json
