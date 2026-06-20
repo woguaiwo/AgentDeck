@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from agentdeck.adapters.capabilities import adapter_requires_provider_session
 from agentdeck.core.cancel import CancellationToken
 from agentdeck.core.config import Workspace
 from agentdeck.core.events import EventKind
@@ -1836,7 +1837,7 @@ def _safe_session_id_for_resume(workspace: Workspace, session_id: str) -> str:
     session = SessionRegistry(workspace).get(session_id) if session_id else None
     if session is None:
         return ""
-    if session.adapter in {"codex", "codex-exec", "kimi", "kimi-print"} and not session.provider_session_id:
+    if adapter_requires_provider_session(session.adapter) and not session.provider_session_id:
         return ""
     return session.session_id
 

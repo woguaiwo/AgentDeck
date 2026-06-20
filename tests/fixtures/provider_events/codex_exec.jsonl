@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"thread-fixture-1","title":"Fixture Codex Run"}
+{"type":"turn.started"}
+{"type":"item.started","item":{"type":"tool_call","name":"shell","text":"python -m unittest"}}
+{"type":"item.completed","item":{"type":"tool_result","text":"OK"}}
+{"type":"assistant_final","text":"Codex fixture final answer."}
+{"type":"turn.completed"}

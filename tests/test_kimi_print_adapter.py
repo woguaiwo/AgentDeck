@@ -170,6 +170,38 @@ class KimiPrintAdapterTests(unittest.TestCase):
             self.assertIn("--session", calls[1])
             self.assertIn("11111111-2222-3333-4444-555555555555", calls[1])
 
+    def test_default_fail_mode_stops_on_approval_request(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            fake = tmp / "fake_kimi"
+            fake.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    import json
+                    import time
+
+                    print(json.dumps({{"type": "approval_requested", "text": "Allow shell?"}}), flush=True)
+                    time.sleep(5)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+
+            workspace = Workspace(tmp / ".agentdeck")
+            adapter = KimiPrintAdapter(kimi_bin=str(fake))
+            runtime = AgentRuntime(workspace, adapter, agent_id="kimi-test")
+
+            result = asyncio.run(runtime.run_prompt("hello"))
+
+            kinds = [event.kind for event in result.events]
+            self.assertIn(EventKind.APPROVAL_REQUESTED, kinds)
+            errors = [event for event in result.events if event.kind == EventKind.ERROR]
+            self.assertTrue(errors)
+            self.assertIn("cannot answer mid-run approval", errors[0].text)
+            self.assertEqual(errors[0].payload["error_kind"], "approval_required")
+
     def test_cancellation_terminates_kimi_process(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)

@@ -13,8 +13,10 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, ClassVar
 
+from agentdeck.adapters.capabilities import CODEX_EXEC_CAPABILITIES, AdapterCapabilities
+from agentdeck.adapters.errors import classify_adapter_error, command_not_found_payload, working_directory_not_found_payload
 from agentdeck.core.approvals import ApprovalMode
 from agentdeck.core.cancel import CancellationToken
 from agentdeck.core.config import Workspace
@@ -26,6 +28,7 @@ class CodexExecAdapter:
     """Run Codex through the non-interactive ``codex exec`` surface."""
 
     name: str = "codex"
+    capabilities: ClassVar[AdapterCapabilities] = CODEX_EXEC_CAPABILITIES
     codex_bin: str = "codex"
     cwd: Path | None = None
     resume: str | None = None
@@ -46,6 +49,16 @@ class CodexExecAdapter:
         cancellation: CancellationToken | None = None,
     ) -> AsyncIterator[AgentEvent]:
         run_cwd = (self.cwd or Path.cwd()).expanduser().resolve()
+        if not run_cwd.is_dir():
+            yield AgentEvent(
+                EventKind.ERROR,
+                agent_id,
+                session_id,
+                text=f"working directory not found: {run_cwd}",
+                payload=working_directory_not_found_payload(run_cwd),
+            )
+            return
+
         with tempfile.NamedTemporaryFile(
             prefix="agentdeck-codex-last-",
             suffix=".md",
@@ -98,6 +111,7 @@ class CodexExecAdapter:
                                 "mid-run approval prompts yet."
                             ),
                             payload={
+                                **classify_adapter_error("approval requested"),
                                 "approval_mode": self.approval_mode.value,
                                 "approval_required": True,
                                 "hint": "Use --approval-mode record to only log requests, or --approval-mode bypass in an isolated environment.",
@@ -155,7 +169,7 @@ class CodexExecAdapter:
                     session_id,
                     text=f"codex exec exited with status {return_code}",
                     payload={
-                        "return_code": return_code,
+                        **classify_adapter_error(stderr, return_code=return_code),
                         "stderr": stderr[-8000:],
                         "command": _redacted_command(command),
                     },
@@ -166,7 +180,11 @@ class CodexExecAdapter:
                     agent_id,
                     session_id,
                     text=stderr[-8000:],
-                    payload={"source": "codex_stderr", "nonfatal": True},
+                    payload={
+                        **classify_adapter_error(stderr),
+                        "source": "codex_stderr",
+                        "nonfatal": True,
+                    },
                 )
         except FileNotFoundError as exc:
             yield AgentEvent(
@@ -174,7 +192,7 @@ class CodexExecAdapter:
                 agent_id,
                 session_id,
                 text=f"codex executable not found: {self.codex_bin}",
-                payload={"error": str(exc)},
+                payload={**command_not_found_payload(self.codex_bin), "error": str(exc)},
             )
         finally:
             try:

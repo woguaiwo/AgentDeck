@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import AsyncIterator
 
+from agentdeck.adapters.capabilities import ECHO_CAPABILITIES
 from agentdeck.core.cancel import CancellationToken
 from agentdeck.core.config import Workspace
 from agentdeck.core.events import AgentEvent, EventKind
@@ -11,6 +12,7 @@ from agentdeck.core.events import AgentEvent, EventKind
 
 class EchoAdapter:
     name = "echo"
+    capabilities = ECHO_CAPABILITIES
 
     async def send(
         self,

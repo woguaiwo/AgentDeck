@@ -132,6 +132,7 @@ class CodexExecAdapterTests(unittest.TestCase):
             errors = [event for event in result.events if event.kind == EventKind.ERROR]
             self.assertTrue(errors)
             self.assertIn("cannot answer mid-run approval", errors[0].text)
+            self.assertEqual(errors[0].payload["error_kind"], "approval_required")
 
     def test_cancellation_terminates_codex_process(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

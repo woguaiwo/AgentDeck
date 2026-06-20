@@ -1,0 +1,5 @@
+{"role":"assistant","content":[{"type":"think","text":"private reasoning"},{"type":"text","text":"Kimi fixture answer."}]}
+{"type":"tool_call_started","text":"list files"}
+{"type":"tool_call_completed","text":"done"}
+{"type":"message_complete","text":"Kimi fixture final answer."}
+To resume this session: kimi -r 11111111-2222-3333-4444-555555555555

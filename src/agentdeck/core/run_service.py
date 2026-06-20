@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from agentdeck.adapters.base import AgentAdapter
+from agentdeck.adapters.capabilities import adapter_requires_provider_session
 from agentdeck.adapters.codex_exec import CodexExecAdapter
 from agentdeck.adapters.echo import EchoAdapter
 from agentdeck.adapters.kimi_print import KimiPrintAdapter
@@ -217,7 +218,7 @@ def _session_resume_problem(session: SessionRecord, request: RunRequest) -> str:
 
 
 def _requires_provider_session(adapter_name: str | None) -> bool:
-    return adapter_name in {"codex", "codex-exec", "kimi", "kimi-print"}
+    return adapter_requires_provider_session(adapter_name)
 
 
 def _apply_task_defaults(request: RunRequest, task: TaskRecord) -> None:
@@ -254,7 +255,7 @@ def _apply_agent_defaults(request: RunRequest, agent: AgentRecord, sessions: Ses
     latest = sessions.latest_for_agent(
         agent.agent_id,
         adapter=adapter_name,
-        require_provider_session=adapter_name in {"codex", "codex-exec", "kimi", "kimi-print"},
+        require_provider_session=_requires_provider_session(adapter_name),
     )
     if latest is not None:
         request.session = latest.session_id

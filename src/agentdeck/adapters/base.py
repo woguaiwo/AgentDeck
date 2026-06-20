@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import AsyncIterator, Protocol
 
+from agentdeck.adapters.capabilities import AdapterCapabilities
 from agentdeck.core.cancel import CancellationToken
 from agentdeck.core.config import Workspace
 from agentdeck.core.events import AgentEvent
@@ -13,6 +14,7 @@ class AgentAdapter(Protocol):
     """Common interface implemented by Codex/Kimi/Claude/DeepSeek adapters."""
 
     name: str
+    capabilities: AdapterCapabilities
 
     def send(
         self,
