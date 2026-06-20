@@ -138,6 +138,34 @@ echo
 ) &
 BOT_PID=$!
 
+send_exit_notice() {
+  python - "$WORKSPACE" <<'PY' >/dev/null 2>&1 || true
+import os
+import sys
+import urllib.parse
+import urllib.request
+
+workspace = sys.argv[1]
+token = os.environ.get("AGENTDECK_TELEGRAM_TOKEN", "").strip()
+chats = [item.strip() for item in os.environ.get("AGENTDECK_TELEGRAM_ALLOWED_CHATS", "").split(",") if item.strip()]
+if not token or not chats:
+    raise SystemExit(0)
+text = "AgentDeck test bot is stopping after Ctrl-D.\nworkspace: " + workspace
+body_base = {
+    "text": text,
+    "disable_web_page_preview": "true",
+}
+for chat_id in chats:
+    body = dict(body_base)
+    body["chat_id"] = chat_id
+    data = urllib.parse.urlencode(body).encode("utf-8")
+    urllib.request.urlopen(
+        urllib.request.Request(f"https://api.telegram.org/bot{token}/sendMessage", data=data),
+        timeout=10,
+    ).read()
+PY
+}
+
 cleanup() {
   local exit_code=$?
   trap - EXIT
@@ -162,3 +190,4 @@ done
 
 echo
 echo "Ctrl-D received."
+send_exit_notice

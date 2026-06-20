@@ -496,7 +496,7 @@ class TelegramJobQueue:
         if approval_requested:
             self._send(
                 job.chat_id,
-                "Auto mode paused: approval is required. Use /approvals, then /approve 1 or /reject 1.",
+                "Auto mode paused: approval is required. Use /approvals, then /approve <list #> or /reject <list #>.",
             )
             return
         if job.status != "done":
@@ -646,7 +646,7 @@ class TelegramCommandHandler:
             lines.append(f"   id: {record.project_id}")
             lines.append(f"   agent: {record.default_agent_id}  status: {record.status}")
         lines.append("")
-        lines.append("Use /use project 1 or /project new <id> <cwd> [title].")
+        lines.append("Use /use project <list #> or /project new <id> <cwd> [title].")
         return "\n".join(lines)
 
     def _project(self, rest: str, *, chat_id: int | None) -> str:
@@ -665,7 +665,7 @@ class TelegramCommandHandler:
                 if current:
                     project_ref = current
             if not project_ref:
-                return "Usage: /project <project_id or 1>, /project use 1, or /project new <id> <cwd> [title]"
+                return "Usage: /project <project_id or list #>, /project use <list #>, or /project new <id> <cwd> [title]"
         project = self._resolve_project(project_ref, chat_id=chat_id)
         if project is None:
             return f"Project not found: {project_ref}"
@@ -678,7 +678,7 @@ class TelegramCommandHandler:
             f"status: {project.status}",
         ]
         lines.append("")
-        lines.append("Use /project use <id or 1>, /agents, /tasks, or /task new <title>.")
+        lines.append("Use /project use <id or list #>, /agents, /tasks, or /task new <title>.")
         return "\n".join(lines)
 
     def _new_project(self, rest: str, *, chat_id: int | None) -> str:
@@ -736,7 +736,7 @@ class TelegramCommandHandler:
             lines.append(f"   status: {record.status}  priority: {record.priority}")
             lines.append(f"   project: {record.project_id or '-'}  agent: {record.agent_id}")
         lines.append("")
-        lines.append("Use /use task 1, /use 1, or /task new <title>.")
+        lines.append("Use /use task <list #>, /use <list #>, or /task new <title>.")
         return "\n".join(lines)
 
     def _task(self, rest: str, *, chat_id: int | None = None) -> str:
@@ -949,7 +949,7 @@ class TelegramCommandHandler:
         lines.append("")
         lines.append("Next:")
         lines.append("- /projects, /agents, /tasks")
-        lines.append("- /use project 1, /use agent 1, /use task 1")
+        lines.append("- /use project <list #>, /use agent <list #>, /use task <list #>")
         lines.append("- /run <message>, /auto start, /approvals")
         return "\n".join(lines)
 
@@ -1030,7 +1030,7 @@ class TelegramCommandHandler:
                 lines.append(f"   status: {session.status}  agent: {session.agent_id}")
 
         lines.append("")
-        lines.append("Use /use project 1, /use agent 1, /use task 1, /run 1 <message>, /job 1, or /resume 1 <message>.")
+        lines.append("Use /use project <list #>, /use agent <list #>, /use task <list #>, /run <list #> <message>, /job <list #>, or /resume <list #> <message>.")
         return "\n".join(lines)
 
     def _default_project(self, *, chat_id: int | None) -> ProjectRecord | None:
@@ -1132,7 +1132,7 @@ class TelegramCommandHandler:
             if record.last_assistant_final:
                 lines.append(f"   last: {_one_line(record.last_assistant_final, 120)}")
         lines.append("")
-        lines.append("Use /session 1 or /resume 1 <message>.")
+        lines.append("Use /session <list #> or /resume <list #> <message>.")
         return "\n".join(lines)
 
     def _session(self, rest: str, *, chat_id: int | None) -> str:
@@ -1160,7 +1160,7 @@ class TelegramCommandHandler:
         if record.last_assistant_final:
             lines.append(f"last reply: {_one_line(record.last_assistant_final, 240)}")
         lines.append("")
-        lines.append("Use /resume <message> if this is the current task session, or /resume 1 <message>.")
+        lines.append("Use /resume <message> if this is the current task session, or /resume <list #> <message>.")
         return "\n".join(lines)
 
     async def _resume(self, rest: str, *, chat_id: int | None) -> str:
@@ -1225,7 +1225,7 @@ class TelegramCommandHandler:
 
         if session_ref and not maybe_prompt and self._resolve_session(session_ref, chat_id=chat_id) is not None:
             return None, "", "Usage: /resume <session number> <message>"
-        return None, "", "No current resumable session. Use /sessions, then /resume 1 <message>."
+        return None, "", "No current resumable session. Use /sessions, then /resume <list #> <message>."
 
     def _task_for_session(self, session_id: str) -> TaskRecord | None:
         if not session_id:
@@ -1259,7 +1259,7 @@ class TelegramCommandHandler:
             lines.append(f"   id: {record.agent_id}  role: {record.role}")
             lines.append(f"   project: {record.project_id or '-'}  adapter: {record.adapter}")
         lines.append("")
-        lines.append("Use /use agent 1 or /agent new <id> [adapter] [role] [title].")
+        lines.append("Use /use agent <list #> or /agent new <id> [adapter] [role] [title].")
         return "\n".join(lines)
 
     def _agent(self, rest: str, *, chat_id: int | None) -> str:
@@ -1278,7 +1278,7 @@ class TelegramCommandHandler:
                 if current:
                     agent_ref = current
             if not agent_ref:
-                return "Usage: /agent <agent_id or 1>, /agent use 1, or /agent new <id> [adapter] [role] [title]"
+                return "Usage: /agent <agent_id or list #>, /agent use <list #>, or /agent new <id> [adapter] [role] [title]"
         agent = self._resolve_agent(agent_ref, chat_id=chat_id)
         if agent is None:
             return f"Agent not found: {agent_ref}"
@@ -1294,7 +1294,7 @@ class TelegramCommandHandler:
             f"resume: {agent.resume_policy}",
         ]
         lines.append("")
-        lines.append("Use /agent use <id or 1> to select it.")
+        lines.append("Use /agent use <id or list #> to select it.")
         return "\n".join(lines)
 
     def _new_agent(self, rest: str, *, chat_id: int | None) -> str:
@@ -1356,7 +1356,7 @@ class TelegramCommandHandler:
             lines.append(f"   task: {record.task_id or '-'}  agent: {record.agent_id}")
             lines.append(f"   provider: {record.provider or record.adapter or '-'}")
         lines.append("")
-        lines.append("Use /approval 1, /approve 1, or /reject 1.")
+        lines.append("Use /approval <list #>, /approve <list #>, or /reject <list #>.")
         return "\n".join(lines)
 
     def _approval(self, rest: str, *, chat_id: int | None) -> str:
@@ -1910,24 +1910,24 @@ def _help_text() -> str:
             "AgentDeck Telegram commands:",
             "/status",
             "/projects",
-            "/project <project_id or 1>",
+            "/project <project_id or list #>",
             "/project new <project_id> <cwd> [title]",
-            "/use project <project_id or 1>",
+            "/use project <project_id or list #>",
             "/agents [project]",
-            "/agent <agent_id or 1>",
+            "/agent <agent_id or list #>",
             "/agent new <agent_id> [adapter] [role] [title]",
-            "/use agent <agent_id or 1>",
+            "/use agent <agent_id or list #>",
             "/tasks [project]",
             "/task <task_id>",
             "/task new <task title>",
             "/newtask <task title>",
             "/use <task_id or exact task title>",
-            "/use task <task_id or 1>",
+            "/use task <task_id or list #>",
             "/current",
             "/list",
             "/sessions [agent]",
-            "/session <session_id or 1>",
-            "/resume <session_id or 1> <message>",
+            "/session <session_id or list #>",
+            "/resume <session_id or list #> <message>",
             "/auto start [hours]",
             "/auto -h start [hours]",
             "/auto <hours>",
@@ -1936,13 +1936,13 @@ def _help_text() -> str:
             "/run <task_id> <message>",
             "/run <message>  (after /use)",
             "/approvals [pending|approved|rejected]",
-            "/approval <approval_id or 1>",
-            "/approve <approval_id or 1> [note]",
-            "/reject <approval_id or 1> [note]",
+            "/approval <approval_id or list #>",
+            "/approve <approval_id or list #> [note]",
+            "/reject <approval_id or list #> [note]",
             "/jobs",
             "/job <job_id>",
-            "/job 1",
+            "/job <list #>",
             "/cancel <job_id>",
-            "/cancel 1",
+            "/cancel <list #>",
         ]
     )

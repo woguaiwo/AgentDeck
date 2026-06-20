@@ -123,25 +123,25 @@ Supported commands:
 
 ```text
 /projects
-/project <project_id or 1>
+/project <project_id or list #>
 /project new <project_id> <cwd> [title]
-/use project <project_id or 1>
+/use project <project_id or list #>
 /agents [project]
-/agent <agent_id or 1>
+/agent <agent_id or list #>
 /agent new <agent_id> [adapter] [role] [title]
-/use agent <agent_id or 1>
+/use agent <agent_id or list #>
 /tasks [project]
 /task <task_id>
 /task new <task title>
 /newtask <task title>
 /use <task_id or exact task title>
-/use task <task_id or 1>
+/use task <task_id or list #>
 /current
 /status
 /list
 /sessions [agent]
-/session <session_id or 1>
-/resume <session_id or 1> <message>
+/session <session_id or list #>
+/resume <session_id or list #> <message>
 /auto start [hours]
 /auto -h start [hours]
 /auto --human start [hours]
@@ -150,19 +150,19 @@ Supported commands:
 /auto prompt <message>
 /auto end
 /run <task_id> <message>
-/run 1 <message>
+/run <list #> <message>
 /run <message>
 /jobs
 /job <job_id>
-/job 1
+/job <list #>
 /job
 /cancel <job_id>
-/cancel 1
+/cancel <list #>
 /cancel
 /approvals [pending|approved|rejected]
-/approval <approval_id or 1>
-/approve <approval_id or 1> [note]
-/reject <approval_id or 1> [note]
+/approval <approval_id or list #>
+/approve <approval_id or list #> [note]
+/reject <approval_id or list #> [note]
 ```
 
 `/run` starts a background job and returns immediately with a job id. The bot
@@ -175,8 +175,9 @@ For phone use, `/status` is the main control panel. It shows the current
 project, agent, task, latest job, auto mode, pending approvals, and recent
 sessions. `/projects`, `/agents`, `/tasks`, `/jobs`, `/sessions`, and
 `/approvals` store numbered lists for the current chat, so commands like
-`/use project 1`, `/use agent 1`, `/use task 1`, `/run 1 <message>`, `/job 1`,
-`/cancel 1`, and `/resume 1 <message>` avoid copying long ids.
+`/use project <list #>`, `/use agent <list #>`, `/use task <list #>`,
+`/run <list #> <message>`, `/job <list #>`, `/cancel <list #>`, and
+`/resume <list #> <message>` avoid copying long ids.
 
 Projects, agents, and tasks can also be created from Telegram:
 
@@ -186,7 +187,7 @@ Projects, agents, and tasks can also be created from Telegram:
 /task new Fix data loading
 ```
 
-After selecting a task once with `/use task 1` or creating one with
+After selecting a task once with `/use task <list #>` or creating one with
 `/task new <title>`, `/run <message>` uses the current task. `/job` shows the
 latest job in the chat, and `/cancel` cancels the latest queued or running job.
 
@@ -204,7 +205,7 @@ Auto mode defaults to automatic approval: auto-created jobs run with
 should stop and wait for a human approval decision instead.
 
 Approval commands also support numbered selections after `/approvals`. When a
-Telegram user sends `/approve 1` for a pending approval that belongs to a task,
+Telegram user sends `/approve <list #>` for a pending approval that belongs to a task,
 AgentDeck records the approval and starts a follow-up background job with
 `approval_mode=bypass`. This is a new run against the same task/session when it
 is safely resumable; it is not an in-place continuation of a stopped provider
