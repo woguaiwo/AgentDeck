@@ -16,7 +16,9 @@ from agentdeck.core.events import AgentEvent, EventKind
 from agentdeck.core.run_service import RunRequest, RunServiceResult
 from agentdeck.interfaces.telegram import TelegramCommandHandler, TelegramJobQueue, config_from_env, split_message
 from agentdeck.storage.approvals import ApprovalRegistry
+from agentdeck.storage.agents import AgentRegistry
 from agentdeck.storage.jobs import JobRegistry
+from agentdeck.storage.projects import ProjectRegistry
 from agentdeck.storage.sessions import SessionRegistry
 from agentdeck.storage.tasks import TaskBoard
 
@@ -262,6 +264,83 @@ class TelegramInterfaceTests(unittest.TestCase):
             latest = asyncio.run(handler.handle_text("/job", chat_id=42))[0]
             self.assertIn(f"Job: {job_id}", latest)
             self.assertIn("done: continue without ids", latest)
+
+    def test_phone_console_selects_project_agent_and_task_by_number(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            alpha = tmp / "alpha"
+            beta = tmp / "beta"
+            alpha.mkdir()
+            beta.mkdir()
+            self._main(["--workspace", str(workspace.root), "projects", "create", "alpha", "--title", "Alpha", "--cwd", str(alpha)])
+            self._main(["--workspace", str(workspace.root), "projects", "create", "beta", "--title", "Beta", "--cwd", str(beta), "--default-agent", "beta-owner"])
+            self._main(["--workspace", str(workspace.root), "agents", "create", "beta-owner", "--title", "Beta Owner", "--project", "beta", "--adapter", "echo", "--cwd", str(beta)])
+            task_out = self._main(["--workspace", str(workspace.root), "tasks", "create", "Beta task", "--project", "beta", "--agent", "beta-owner"])
+            task_id = re.search(r"\((task-[^)]+)\)", task_out).group(1)
+
+            handler = TelegramCommandHandler(workspace)
+
+            projects = asyncio.run(handler.handle_text("/projects", chat_id=42))[0]
+            self.assertIn("1. Alpha", projects)
+            self.assertIn("2. Beta", projects)
+
+            project_selected = asyncio.run(handler.handle_text("/use project 2", chat_id=42))[0]
+            self.assertIn("Current project set", project_selected)
+            self.assertIn("Beta", project_selected)
+
+            agents = asyncio.run(handler.handle_text("/agents", chat_id=42))[0]
+            self.assertIn("1. Beta Owner", agents)
+            agent_selected = asyncio.run(handler.handle_text("/use agent 1", chat_id=42))[0]
+            self.assertIn("Current agent set", agent_selected)
+            self.assertIn("beta-owner", agent_selected)
+
+            tasks = asyncio.run(handler.handle_text("/tasks", chat_id=42))[0]
+            self.assertIn("Tasks (Beta):", tasks)
+            self.assertIn("1. Beta task", tasks)
+            task_selected = asyncio.run(handler.handle_text("/use task 1", chat_id=42))[0]
+            self.assertIn("Current task set", task_selected)
+            self.assertIn(task_id, task_selected)
+
+            status = asyncio.run(handler.handle_text("/status", chat_id=42))[0]
+            self.assertIn("Project: Beta", status)
+            self.assertIn("Agent: Beta Owner", status)
+            self.assertIn("Current task: Beta task", status)
+
+    def test_phone_console_creates_project_agent_and_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            project_dir = tmp / "mobile-project"
+            project_dir.mkdir()
+            handler = TelegramCommandHandler(workspace)
+
+            project_reply = asyncio.run(
+                handler.handle_text(f"/project new mobileproj {project_dir} Mobile Project", chat_id=42)
+            )[0]
+            self.assertIn("Project created and selected", project_reply)
+            project = ProjectRegistry(workspace).resolve("mobileproj")
+            assert project is not None
+            self.assertEqual(project.title, "Mobile Project")
+            self.assertEqual(project.project_dir, str(project_dir.resolve()))
+
+            agent_reply = asyncio.run(handler.handle_text("/agent new developer codex developer Developer Agent", chat_id=42))[0]
+            self.assertIn("Agent created and selected", agent_reply)
+            agent = AgentRegistry(workspace).resolve("developer")
+            assert agent is not None
+            self.assertEqual(agent.project_id, "mobileproj")
+            self.assertEqual(agent.adapter, "codex")
+            self.assertEqual(agent.role, "developer")
+            self.assertEqual(agent.project_dir, str(project_dir.resolve()))
+
+            task_reply = asyncio.run(handler.handle_text("/task new Implement phone flow", chat_id=42))[0]
+            self.assertIn("Task created and selected", task_reply)
+            task_id = re.search(r"id: (task-\S+)", task_reply).group(1)
+            task = TaskBoard(workspace).get(task_id)
+            assert task is not None
+            self.assertEqual(task.project_id, "mobileproj")
+            self.assertEqual(task.agent_id, "developer")
+            self.assertEqual(task.title, "Implement phone flow")
 
     def test_auto_mode_starts_followup_jobs_and_can_be_stopped(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

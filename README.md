@@ -123,11 +123,19 @@ Supported commands:
 
 ```text
 /projects
+/project <project_id or 1>
+/project new <project_id> <cwd> [title]
+/use project <project_id or 1>
 /agents [project]
+/agent <agent_id or 1>
+/agent new <agent_id> [adapter] [role] [title]
+/use agent <agent_id or 1>
 /tasks [project]
 /task <task_id>
+/task new <task title>
 /newtask <task title>
 /use <task_id or exact task title>
+/use task <task_id or 1>
 /current
 /status
 /list
@@ -163,15 +171,24 @@ the final result back to the chat when the job finishes. Job records are stored
 under `.agentdeck/jobs/`; if AgentDeck restarts while a job is still queued or
 running, that job is marked `interrupted`.
 
-For phone use, select a task once with `/use <task title>` or create one with
-`/newtask <task title>`. After that, `/run <message>` uses the current task,
-`/job` shows the latest job in the chat, and `/cancel` cancels the latest queued
-or running job. Use `/list` to show numbered recent tasks and jobs; after that,
-commands like `/use 1`, `/run 1 <message>`, `/job 1`, and `/cancel 1` use the
-numbered list instead of long ids. `/status` shows the current task, latest
-job, pending approvals, and recent sessions in one phone-friendly summary.
-`/sessions` stores a numbered session list, so `/resume 1 <message>` can resume
-a known AgentDeck session without copying a session id.
+For phone use, `/status` is the main control panel. It shows the current
+project, agent, task, latest job, auto mode, pending approvals, and recent
+sessions. `/projects`, `/agents`, `/tasks`, `/jobs`, `/sessions`, and
+`/approvals` store numbered lists for the current chat, so commands like
+`/use project 1`, `/use agent 1`, `/use task 1`, `/run 1 <message>`, `/job 1`,
+`/cancel 1`, and `/resume 1 <message>` avoid copying long ids.
+
+Projects, agents, and tasks can also be created from Telegram:
+
+```text
+/project new motionx /data/lyxie/Motion-X Motion-X
+/agent new developer codex developer Motion-X Developer
+/task new Fix data loading
+```
+
+After selecting a task once with `/use task 1` or creating one with
+`/task new <title>`, `/run <message>` uses the current task. `/job` shows the
+latest job in the chat, and `/cancel` cancels the latest queued or running job.
 
 Auto mode is a task-level job loop. After selecting a task with `/use`, send
 `/auto start` to start one run immediately and then keep starting the next run

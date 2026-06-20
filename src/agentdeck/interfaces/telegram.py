@@ -18,6 +18,7 @@ from agentdeck.core.config import Workspace
 from agentdeck.core.events import EventKind
 from agentdeck.core.run_service import RunConfigurationError, RunRequest, run_agent_prompt
 from agentdeck.storage.approvals import ApprovalRecord, ApprovalRegistry
+from agentdeck.storage.agents import AgentRecord, AgentRegistry
 from agentdeck.storage.jobs import JobRecord, JobRegistry
 from agentdeck.storage.projects import ProjectRecord, ProjectRegistry
 from agentdeck.storage.sessions import SessionRecord, SessionRegistry
@@ -94,6 +95,32 @@ class TelegramChatStateStore:
             data[str(chat_id)] = chat
             self._write(data)
 
+    def current_project(self, chat_id: int) -> str:
+        with self._lock:
+            data = self._read()
+            return str(data.get(str(chat_id), {}).get("current_project_id") or "")
+
+    def set_current_project(self, chat_id: int, project_id: str) -> None:
+        with self._lock:
+            data = self._read()
+            chat = dict(data.get(str(chat_id)) or {})
+            chat["current_project_id"] = project_id
+            data[str(chat_id)] = chat
+            self._write(data)
+
+    def current_agent(self, chat_id: int) -> str:
+        with self._lock:
+            data = self._read()
+            return str(data.get(str(chat_id), {}).get("current_agent_id") or "")
+
+    def set_current_agent(self, chat_id: int, agent_id: str) -> None:
+        with self._lock:
+            data = self._read()
+            chat = dict(data.get(str(chat_id)) or {})
+            chat["current_agent_id"] = agent_id
+            data[str(chat_id)] = chat
+            self._write(data)
+
     def auto_state(self, chat_id: int) -> dict[str, Any]:
         with self._lock:
             data = self._read()
@@ -159,6 +186,22 @@ class TelegramChatStateStore:
             data[str(chat_id)] = chat
             self._write(data)
 
+    def set_recent_projects(self, chat_id: int, project_ids: list[str]) -> None:
+        with self._lock:
+            data = self._read()
+            chat = dict(data.get(str(chat_id)) or {})
+            chat["recent_project_ids"] = project_ids
+            data[str(chat_id)] = chat
+            self._write(data)
+
+    def set_recent_agents(self, chat_id: int, agent_ids: list[str]) -> None:
+        with self._lock:
+            data = self._read()
+            chat = dict(data.get(str(chat_id)) or {})
+            chat["recent_agent_ids"] = agent_ids
+            data[str(chat_id)] = chat
+            self._write(data)
+
     def set_recent_sessions(self, chat_id: int, session_ids: list[str]) -> None:
         with self._lock:
             data = self._read()
@@ -198,6 +241,22 @@ class TelegramChatStateStore:
             if not isinstance(task_ids, list) or index < 1 or index > len(task_ids):
                 return ""
             return str(task_ids[index - 1])
+
+    def recent_project_id(self, chat_id: int, index: int) -> str:
+        with self._lock:
+            data = self._read()
+            project_ids = data.get(str(chat_id), {}).get("recent_project_ids") or []
+            if not isinstance(project_ids, list) or index < 1 or index > len(project_ids):
+                return ""
+            return str(project_ids[index - 1])
+
+    def recent_agent_id(self, chat_id: int, index: int) -> str:
+        with self._lock:
+            data = self._read()
+            agent_ids = data.get(str(chat_id), {}).get("recent_agent_ids") or []
+            if not isinstance(agent_ids, list) or index < 1 or index > len(agent_ids):
+                return ""
+            return str(agent_ids[index - 1])
 
     def recent_job_id(self, chat_id: int, index: int) -> str:
         with self._lock:
@@ -519,10 +578,15 @@ class TelegramCommandHandler:
         if command in {"/start", "/help", "help"}:
             return [_help_text()]
         if command in {"/projects", "projects"}:
-            return [self._projects()]
+            return [self._projects(chat_id=chat_id)]
+        if command in {"/project", "project"}:
+            return [self._project(rest, chat_id=chat_id)]
         if command in {"/tasks", "tasks"}:
             return [self._tasks(rest, chat_id=chat_id)]
         if command in {"/task", "task"}:
+            subcommand, subrest = _split_once(rest)
+            if subcommand.lower() == "new":
+                return [self._newtask(subrest, chat_id=chat_id)]
             return [self._task(rest, chat_id=chat_id)]
         if command in {"/newtask", "newtask"}:
             return [self._newtask(rest, chat_id=chat_id)]
@@ -547,7 +611,9 @@ class TelegramCommandHandler:
             if subcommand.lower().split("@", 1)[0] == "auto":
                 return [self._auto(subrest, chat_id=chat_id)]
         if command in {"/agents", "agents"}:
-            return [self._agents(rest)]
+            return [self._agents(rest, chat_id=chat_id)]
+        if command in {"/agent", "agent"}:
+            return [self._agent(rest, chat_id=chat_id)]
         if command in {"/approvals", "approvals"}:
             return [self._approvals(rest, chat_id=chat_id)]
         if command in {"/approval", "approval"}:
@@ -566,30 +632,111 @@ class TelegramCommandHandler:
             return [await self._run(rest, chat_id=chat_id)]
         return [f"Unknown command: {command}\n\n{_help_text()}"]
 
-    def _projects(self) -> str:
+    def _projects(self, *, chat_id: int | None = None) -> str:
         records = ProjectRegistry(self.workspace).list()
         if not records:
             return "No projects."
+        if chat_id is not None:
+            self.chat_state.set_recent_projects(chat_id, [record.project_id for record in records])
+        current_project_id = self.chat_state.current_project(chat_id) if chat_id is not None else ""
         lines = ["Projects:"]
         for index, record in enumerate(records, 1):
-            lines.append(f"{index}. {record.title}")
+            marker = " [current]" if record.project_id == current_project_id else ""
+            lines.append(f"{index}. {record.title}{marker}")
             lines.append(f"   id: {record.project_id}")
             lines.append(f"   agent: {record.default_agent_id}  status: {record.status}")
+        lines.append("")
+        lines.append("Use /use project 1 or /project new <id> <cwd> [title].")
         return "\n".join(lines)
 
+    def _project(self, rest: str, *, chat_id: int | None) -> str:
+        command, tail = _split_once(rest.strip())
+        lowered = command.lower()
+        if lowered in {"new", "create"}:
+            return self._new_project(tail, chat_id=chat_id)
+        if lowered in {"use", "select"}:
+            if chat_id is None:
+                return "This command requires a Telegram chat."
+            return self._use_project(tail, chat_id=chat_id)
+        project_ref = rest.strip()
+        if not project_ref:
+            if chat_id is not None:
+                current = self.chat_state.current_project(chat_id)
+                if current:
+                    project_ref = current
+            if not project_ref:
+                return "Usage: /project <project_id or 1>, /project use 1, or /project new <id> <cwd> [title]"
+        project = self._resolve_project(project_ref, chat_id=chat_id)
+        if project is None:
+            return f"Project not found: {project_ref}"
+        lines = [
+            project.title,
+            f"id: {project.project_id}",
+            f"cwd: {project.project_dir}",
+            f"team: {project.team_id}",
+            f"default agent: {project.default_agent_id}",
+            f"status: {project.status}",
+        ]
+        lines.append("")
+        lines.append("Use /project use <id or 1>, /agents, /tasks, or /task new <title>.")
+        return "\n".join(lines)
+
+    def _new_project(self, rest: str, *, chat_id: int | None) -> str:
+        project_id, tail = _split_once(rest.strip())
+        project_dir, title = _split_once(tail)
+        if not project_id or not project_dir:
+            return "Usage: /project new <project_id> <cwd> [title]"
+        try:
+            project = ProjectRegistry(self.workspace).upsert(
+                project_id=project_id,
+                title=title or None,
+                project_dir=project_dir,
+                team_id=project_id,
+                default_agent_id="owner",
+                replace=False,
+            )
+        except ValueError as exc:
+            return str(exc)
+        if chat_id is not None:
+            self.chat_state.set_current_project(chat_id, project.project_id)
+            self.chat_state.set_current_agent(chat_id, project.default_agent_id)
+        return "\n".join(
+            [
+                "Project created and selected:",
+                project.title,
+                f"id: {project.project_id}",
+                f"cwd: {project.project_dir}",
+                f"default agent: {project.default_agent_id}",
+                "Next: /agent new owner codex owner, or /task new <title>",
+            ]
+        )
+
     def _tasks(self, rest: str, *, chat_id: int | None) -> str:
-        project = rest.strip() or None
-        records = TaskBoard(self.workspace).list(project_id=project)
+        project_ref = rest.strip()
+        project: ProjectRecord | None = None
+        if project_ref:
+            project = self._resolve_project(project_ref, chat_id=chat_id)
+            if project is None:
+                return f"Project not found: {project_ref}"
+        elif chat_id is not None:
+            project_id = self.chat_state.current_project(chat_id)
+            project = self._resolve_project(project_id) if project_id else None
+        records = TaskBoard(self.workspace).list(project_id=project.project_id if project is not None else None)
         if not records:
             return "No tasks."
         if chat_id is not None:
             self.chat_state.set_recent_tasks(chat_id, [record.task_id for record in records])
-        lines = ["Tasks:"]
+        heading = f"Tasks ({project.title}):" if project is not None else "Tasks:"
+        current_task_id = self.chat_state.current_task(chat_id) if chat_id is not None else ""
+        lines = [heading]
         for index, record in enumerate(records, 1):
-            lines.append(f"{index}. {record.title}")
+            marker = " [current]" if record.task_id == current_task_id else ""
+            lines.append(f"{index}. {record.title}{marker}")
             lines.append(f"   id: {record.task_id}")
             lines.append(f"   status: {record.status}  priority: {record.priority}")
             lines.append(f"   project: {record.project_id or '-'}  agent: {record.agent_id}")
+        lines.append("")
+        lines.append("Use /use task 1, /use 1, or /task new <title>.")
         return "\n".join(lines)
 
     def _task(self, rest: str, *, chat_id: int | None = None) -> str:
@@ -619,16 +766,21 @@ class TelegramCommandHandler:
     def _newtask(self, rest: str, *, chat_id: int | None) -> str:
         title = rest.strip()
         if not title:
-            return "Usage: /newtask <task title>"
+            return "Usage: /newtask <task title> or /task new <task title>"
         project = self._default_project(chat_id=chat_id)
+        agent = self._default_agent(chat_id=chat_id, project=project)
         record = TaskBoard(self.workspace).create(
             title=title,
             project_id=project.project_id if project is not None else "",
-            agent_id=project.default_agent_id if project is not None else "owner",
+            agent_id=agent.agent_id if agent is not None else (project.default_agent_id if project is not None else "owner"),
             team_id=project.team_id if project is not None else "default",
         )
         if chat_id is not None:
             self.chat_state.set_current_task(chat_id, record.task_id)
+            if record.project_id:
+                self.chat_state.set_current_project(chat_id, record.project_id)
+            if record.agent_id:
+                self.chat_state.set_current_agent(chat_id, record.agent_id)
         lines = [
             "Task created and selected:",
             record.title,
@@ -636,25 +788,79 @@ class TelegramCommandHandler:
         ]
         if record.project_id:
             lines.append(f"project: {record.project_id}")
+        lines.append(f"agent: {record.agent_id}")
         lines.append("Now you can send /run <message>")
         return "\n".join(lines)
 
     def _use(self, rest: str, *, chat_id: int | None) -> str:
         if chat_id is None:
             return "This command requires a Telegram chat."
-        task_ref = rest.strip()
+        kind, value = _split_once(rest.strip())
+        lowered_kind = kind.lower()
+        if lowered_kind in {"project", "proj"}:
+            return self._use_project(value, chat_id=chat_id)
+        if lowered_kind in {"agent", "role"}:
+            return self._use_agent(value, chat_id=chat_id)
+        if lowered_kind in {"task", "todo"}:
+            task_ref = value.strip()
+        else:
+            task_ref = rest.strip()
         if not task_ref:
-            return "Usage: /use <task_id or exact task title>"
+            return "Usage: /use <task>, /use project <project>, or /use agent <agent>"
         task = self._resolve_task(task_ref, chat_id=chat_id)
         if task is None:
             return f"Task not found: {task_ref}"
         self.chat_state.set_current_task(chat_id, task.task_id)
+        if task.project_id:
+            self.chat_state.set_current_project(chat_id, task.project_id)
+        if task.agent_id:
+            self.chat_state.set_current_agent(chat_id, task.agent_id)
         return "\n".join(
             [
                 "Current task set:",
                 task.title,
                 f"id: {task.task_id}",
+                f"project: {task.project_id or '-'}",
+                f"agent: {task.agent_id}",
                 "Now you can send /run <message>",
+            ]
+        )
+
+    def _use_project(self, project_ref: str, *, chat_id: int) -> str:
+        if not project_ref.strip():
+            return "Usage: /use project <project_id, title, or number>"
+        project = self._resolve_project(project_ref, chat_id=chat_id)
+        if project is None:
+            return f"Project not found: {project_ref}"
+        self.chat_state.set_current_project(chat_id, project.project_id)
+        self.chat_state.set_current_agent(chat_id, project.default_agent_id)
+        return "\n".join(
+            [
+                "Current project set:",
+                project.title,
+                f"id: {project.project_id}",
+                f"default agent: {project.default_agent_id}",
+                "Use /tasks, /agents, /task new <title>, or /run after selecting a task.",
+            ]
+        )
+
+    def _use_agent(self, agent_ref: str, *, chat_id: int) -> str:
+        if not agent_ref.strip():
+            return "Usage: /use agent <agent_id, title, or number>"
+        agent = self._resolve_agent(agent_ref, chat_id=chat_id)
+        if agent is None:
+            return f"Agent not found: {agent_ref}"
+        self.chat_state.set_current_agent(chat_id, agent.agent_id)
+        if agent.project_id:
+            self.chat_state.set_current_project(chat_id, agent.project_id)
+        return "\n".join(
+            [
+                "Current agent set:",
+                agent.title,
+                f"id: {agent.agent_id}",
+                f"role: {agent.role}",
+                f"project: {agent.project_id or '-'}",
+                f"adapter: {agent.adapter}",
             ]
         )
 
@@ -662,11 +868,21 @@ class TelegramCommandHandler:
         if chat_id is None:
             return "This command requires a Telegram chat."
         lines: list[str] = []
+        project = self._resolve_project(self.chat_state.current_project(chat_id))
+        agent = self._resolve_agent(self.chat_state.current_agent(chat_id))
+        if project is None:
+            lines.append("Current project: none")
+        else:
+            lines.append(f"Current project: {project.title} ({project.project_id})")
+        if agent is None:
+            lines.append("Current agent: none")
+        else:
+            lines.append(f"Current agent: {agent.title} ({agent.agent_id})")
         current_task_id = self.chat_state.current_task(chat_id)
         task = self._resolve_task(current_task_id) if current_task_id else None
         if task is None:
             lines.append("Current task: none")
-            lines.append("Use /use <task_id or task title>")
+            lines.append("Use /use task <task>, /tasks, or /task new <title>")
         else:
             lines.append("Current task:")
             lines.append(task.title)
@@ -682,23 +898,31 @@ class TelegramCommandHandler:
         return "\n".join(lines)
 
     def _status(self, *, chat_id: int | None) -> str:
-        lines: list[str] = ["Status:"]
+        lines: list[str] = ["AgentDeck Status"]
+        project = self._resolve_project(self.chat_state.current_project(chat_id)) if chat_id is not None else None
+        agent = self._resolve_agent(self.chat_state.current_agent(chat_id)) if chat_id is not None else None
+        lines.append(f"Project: {project.title if project is not None else '-'}")
+        if project is not None:
+            lines.append(f"Project id: {project.project_id}")
+        lines.append(f"Agent: {agent.title if agent is not None else '-'}")
+        if agent is not None:
+            lines.append(f"Agent id: {agent.agent_id}  adapter: {agent.adapter}  role: {agent.role}")
         current_task_id = self.chat_state.current_task(chat_id) if chat_id is not None else ""
         current_task = self._resolve_task(current_task_id) if current_task_id else None
         if current_task is None:
-            lines.append("Current task: none")
+            lines.append("Current task: -")
         else:
             lines.append(f"Current task: {current_task.title}")
-            lines.append(f"Task status: {current_task.status}")
+            lines.append(f"Task status: {current_task.status}  priority: {current_task.priority}")
 
         if self.job_queue is not None and chat_id is not None:
             latest = self.job_queue.latest_for_chat(chat_id)
             if latest is None:
-                lines.append("Latest job: none")
+                lines.append("Job: -")
             else:
                 task = self._resolve_task(latest.task_id)
                 task_title = task.title if task is not None else (latest.task_id or "-")
-                lines.append(f"Latest job: {latest.status}")
+                lines.append(f"Job: {latest.status}  {latest.job_id}")
                 lines.append(f"Job task: {task_title}")
 
         pending = ApprovalRegistry(self.workspace).list(status="pending")
@@ -707,9 +931,9 @@ class TelegramCommandHandler:
             auto_state = self.chat_state.auto_state(chat_id)
             if bool(auto_state.get("enabled")):
                 lines.append(
-                    "Auto: on  "
-                    f"timer: {_format_auto_until(float(auto_state.get('until') or 0.0))}  "
-                    f"approval: {_format_auto_approval_mode(_auto_approval_mode(auto_state))}"
+                    "Auto: on"
+                    f"  timer: {_format_auto_until(float(auto_state.get('until') or 0.0))}"
+                    f"  approval: {_format_auto_approval_mode(_auto_approval_mode(auto_state))}"
                 )
             else:
                 lines.append("Auto: off")
@@ -723,14 +947,23 @@ class TelegramCommandHandler:
             lines.append("Recent sessions: none")
 
         lines.append("")
-        lines.append("Use /list, /sessions, /approvals, or /run <message>.")
+        lines.append("Next:")
+        lines.append("- /projects, /agents, /tasks")
+        lines.append("- /use project 1, /use agent 1, /use task 1")
+        lines.append("- /run <message>, /auto start, /approvals")
         return "\n".join(lines)
 
     def _recent(self, *, chat_id: int | None) -> str:
+        projects = ProjectRegistry(self.workspace).list()[:8]
+        current_project_id = self.chat_state.current_project(chat_id) if chat_id is not None else ""
+        scoped_project = self._resolve_project(current_project_id) if current_project_id else None
+        agents = AgentRegistry(self.workspace).list(project_id=scoped_project.project_id if scoped_project is not None else None)[:8]
         tasks = TaskBoard(self.workspace).list()[:8]
         jobs = self.job_queue.list(chat_id=chat_id, limit=8) if self.job_queue is not None else []
         sessions = SessionRegistry(self.workspace).list()[:8]
         if chat_id is not None:
+            self.chat_state.set_recent_projects(chat_id, [project.project_id for project in projects])
+            self.chat_state.set_recent_agents(chat_id, [agent.agent_id for agent in agents])
             self.chat_state.set_recent(
                 chat_id,
                 task_ids=[task.task_id for task in tasks],
@@ -740,9 +973,32 @@ class TelegramCommandHandler:
 
         current_task_id = self.chat_state.current_task(chat_id) if chat_id is not None else ""
         lines: list[str] = ["Recent:"]
+        if not projects:
+            lines.append("Projects: none")
+        else:
+            lines.append("Projects:")
+            for index, project in enumerate(projects, 1):
+                marker = " [current]" if project.project_id == current_project_id else ""
+                lines.append(f"{index}. {project.title}{marker}")
+                lines.append(f"   id: {project.project_id}  agent: {project.default_agent_id}")
+
+        current_agent_id = self.chat_state.current_agent(chat_id) if chat_id is not None else ""
+        if not agents:
+            lines.append("")
+            lines.append("Agents: none")
+        else:
+            lines.append("")
+            lines.append("Agents:")
+            for index, agent in enumerate(agents, 1):
+                marker = " [current]" if agent.agent_id == current_agent_id else ""
+                lines.append(f"{index}. {agent.title}{marker}")
+                lines.append(f"   id: {agent.agent_id}  adapter: {agent.adapter}  role: {agent.role}")
+
         if not tasks:
+            lines.append("")
             lines.append("Tasks: none")
         else:
+            lines.append("")
             lines.append("Tasks:")
             for index, task in enumerate(tasks, 1):
                 marker = " [current]" if task.task_id == current_task_id else ""
@@ -774,11 +1030,15 @@ class TelegramCommandHandler:
                 lines.append(f"   status: {session.status}  agent: {session.agent_id}")
 
         lines.append("")
-        lines.append("Use /use 1, /run 1 <message>, /job 1, /cancel 1, or /resume 1 <message>.")
+        lines.append("Use /use project 1, /use agent 1, /use task 1, /run 1 <message>, /job 1, or /resume 1 <message>.")
         return "\n".join(lines)
 
     def _default_project(self, *, chat_id: int | None) -> ProjectRecord | None:
         if chat_id is not None:
+            current_project_id = self.chat_state.current_project(chat_id)
+            project = self._resolve_project(current_project_id) if current_project_id else None
+            if project is not None:
+                return project
             current_task_id = self.chat_state.current_task(chat_id)
             task = self._resolve_task(current_task_id) if current_task_id else None
             if task is not None and task.project_id:
@@ -788,6 +1048,54 @@ class TelegramCommandHandler:
         projects = ProjectRegistry(self.workspace).list(status="active")
         if len(projects) == 1:
             return projects[0]
+        return None
+
+    def _default_agent(self, *, chat_id: int | None, project: ProjectRecord | None = None) -> AgentRecord | None:
+        if chat_id is not None:
+            current_agent_id = self.chat_state.current_agent(chat_id)
+            agent = self._resolve_agent(current_agent_id) if current_agent_id else None
+            if agent is not None:
+                return agent
+        if project is not None:
+            agent = AgentRegistry(self.workspace).resolve(project.default_agent_id)
+            if agent is not None:
+                return agent
+        return None
+
+    def _resolve_project(self, value: str, *, chat_id: int | None = None) -> ProjectRecord | None:
+        clean = value.strip()
+        if not clean:
+            return None
+        if chat_id is not None and clean.isdigit():
+            mapped = self.chat_state.recent_project_id(chat_id, int(clean))
+            if mapped:
+                clean = mapped
+        registry = ProjectRegistry(self.workspace)
+        project = registry.resolve(clean)
+        if project is not None:
+            return project
+        lowered = " ".join(clean.split()).lower()
+        matches = [record for record in registry.list() if record.title.lower() == lowered]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    def _resolve_agent(self, value: str, *, chat_id: int | None = None) -> AgentRecord | None:
+        clean = value.strip()
+        if not clean:
+            return None
+        if chat_id is not None and clean.isdigit():
+            mapped = self.chat_state.recent_agent_id(chat_id, int(clean))
+            if mapped:
+                clean = mapped
+        registry = AgentRegistry(self.workspace)
+        agent = registry.resolve(clean)
+        if agent is not None:
+            return agent
+        lowered = " ".join(clean.split()).lower()
+        matches = [record for record in registry.list() if record.title.lower() == lowered]
+        if len(matches) == 1:
+            return matches[0]
         return None
 
     def _resolve_task(self, value: str, *, chat_id: int | None = None) -> TaskRecord | None:
@@ -927,19 +1235,109 @@ class TelegramCommandHandler:
             return None
         return matches[0]
 
-    def _agents(self, rest: str) -> str:
-        project = rest.strip() or None
-        from agentdeck.storage.agents import AgentRegistry
-
-        records = AgentRegistry(self.workspace).list(project_id=project)
+    def _agents(self, rest: str, *, chat_id: int | None) -> str:
+        project_ref = rest.strip()
+        project: ProjectRecord | None = None
+        if project_ref:
+            project = self._resolve_project(project_ref, chat_id=chat_id)
+            if project is None:
+                return f"Project not found: {project_ref}"
+        elif chat_id is not None:
+            current_project = self.chat_state.current_project(chat_id)
+            project = self._resolve_project(current_project) if current_project else None
+        records = AgentRegistry(self.workspace).list(project_id=project.project_id if project is not None else None)
         if not records:
             return "No agents."
-        lines = ["Agents:"]
+        if chat_id is not None:
+            self.chat_state.set_recent_agents(chat_id, [record.agent_id for record in records])
+        current_agent_id = self.chat_state.current_agent(chat_id) if chat_id is not None else ""
+        heading = f"Agents ({project.title}):" if project is not None else "Agents:"
+        lines = [heading]
         for index, record in enumerate(records, 1):
-            lines.append(f"{index}. {record.title}")
+            marker = " [current]" if record.agent_id == current_agent_id else ""
+            lines.append(f"{index}. {record.title}{marker}")
             lines.append(f"   id: {record.agent_id}  role: {record.role}")
             lines.append(f"   project: {record.project_id or '-'}  adapter: {record.adapter}")
+        lines.append("")
+        lines.append("Use /use agent 1 or /agent new <id> [adapter] [role] [title].")
         return "\n".join(lines)
+
+    def _agent(self, rest: str, *, chat_id: int | None) -> str:
+        command, tail = _split_once(rest.strip())
+        lowered = command.lower()
+        if lowered in {"new", "create"}:
+            return self._new_agent(tail, chat_id=chat_id)
+        if lowered in {"use", "select"}:
+            if chat_id is None:
+                return "This command requires a Telegram chat."
+            return self._use_agent(tail, chat_id=chat_id)
+        agent_ref = rest.strip()
+        if not agent_ref:
+            if chat_id is not None:
+                current = self.chat_state.current_agent(chat_id)
+                if current:
+                    agent_ref = current
+            if not agent_ref:
+                return "Usage: /agent <agent_id or 1>, /agent use 1, or /agent new <id> [adapter] [role] [title]"
+        agent = self._resolve_agent(agent_ref, chat_id=chat_id)
+        if agent is None:
+            return f"Agent not found: {agent_ref}"
+        lines = [
+            agent.title,
+            f"id: {agent.agent_id}",
+            f"project: {agent.project_id or '-'}",
+            f"role: {agent.role}",
+            f"team: {agent.team_id}",
+            f"adapter: {agent.adapter}",
+            f"cwd: {agent.project_dir}",
+            f"approval: {agent.approval_mode}",
+            f"resume: {agent.resume_policy}",
+        ]
+        lines.append("")
+        lines.append("Use /agent use <id or 1> to select it.")
+        return "\n".join(lines)
+
+    def _new_agent(self, rest: str, *, chat_id: int | None) -> str:
+        agent_id, tail = _split_once(rest.strip())
+        if not agent_id:
+            return "Usage: /agent new <agent_id> [adapter] [role] [title]"
+        adapter, tail = _consume_optional_choice(tail, {"echo", "codex", "codex-exec", "kimi", "kimi-print"}, default="echo")
+        role, title = _split_once(tail)
+        if not role:
+            role = agent_id
+        project = self._default_project(chat_id=chat_id)
+        project_dir = project.project_dir if project is not None else "."
+        project_id = project.project_id if project is not None else ""
+        team_id = project.team_id if project is not None else "default"
+        try:
+            agent = AgentRegistry(self.workspace).upsert(
+                agent_id=agent_id,
+                title=title or None,
+                project_id=project_id,
+                role=role,
+                team_id=team_id,
+                adapter=adapter,
+                project_dir=project_dir,
+                approval_mode="fail",
+                replace=False,
+            )
+        except ValueError as exc:
+            return str(exc)
+        if chat_id is not None:
+            self.chat_state.set_current_agent(chat_id, agent.agent_id)
+            if agent.project_id:
+                self.chat_state.set_current_project(chat_id, agent.project_id)
+        return "\n".join(
+            [
+                "Agent created and selected:",
+                agent.title,
+                f"id: {agent.agent_id}",
+                f"project: {agent.project_id or '-'}",
+                f"role: {agent.role}",
+                f"adapter: {agent.adapter}",
+                "Next: /task new <title> or /tasks",
+            ]
+        )
 
     def _approvals(self, rest: str, *, chat_id: int | None) -> str:
         status = rest.strip() or "pending"
@@ -1366,6 +1764,13 @@ def _split_once(text: str) -> tuple[str, str]:
     return parts[0], parts[1]
 
 
+def _consume_optional_choice(text: str, choices: set[str], *, default: str) -> tuple[str, str]:
+    first, rest = _split_once(text)
+    if first.lower() in choices:
+        return first.lower(), rest
+    return default, text.strip()
+
+
 def _parse_allowed_chat_ids(values: list[str]) -> list[int]:
     chat_ids: list[int] = []
     for value in values:
@@ -1505,11 +1910,19 @@ def _help_text() -> str:
             "AgentDeck Telegram commands:",
             "/status",
             "/projects",
+            "/project <project_id or 1>",
+            "/project new <project_id> <cwd> [title]",
+            "/use project <project_id or 1>",
             "/agents [project]",
+            "/agent <agent_id or 1>",
+            "/agent new <agent_id> [adapter] [role] [title]",
+            "/use agent <agent_id or 1>",
             "/tasks [project]",
             "/task <task_id>",
+            "/task new <task title>",
             "/newtask <task title>",
             "/use <task_id or exact task title>",
+            "/use task <task_id or 1>",
             "/current",
             "/list",
             "/sessions [agent]",
