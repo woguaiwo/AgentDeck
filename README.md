@@ -104,6 +104,21 @@ export AGENTDECK_TELEGRAM_ALLOWED_CHATS="<chat-id>,<chat-id>"
 python -m agentdeck telegram serve
 ```
 
+`telegram serve` is foreground mode for debugging. To keep the Telegram
+controller alive after disconnecting SSH, start it as a detached workspace
+daemon:
+
+```bash
+python -m agentdeck telegram start
+python -m agentdeck telegram status
+python -m agentdeck telegram stop
+```
+
+The daemon pid and log are stored under `.agentdeck/telegram/`. The daemon keeps
+receiving phone commands and running queued jobs after the launching SSH session
+disconnects. If the server itself restarts or the daemon crashes, start it
+again; unfinished Telegram jobs are marked `interrupted`.
+
 Supported commands:
 
 ```text
@@ -114,7 +129,18 @@ Supported commands:
 /newtask <task title>
 /use <task_id or exact task title>
 /current
+/status
 /list
+/sessions [agent]
+/session <session_id or 1>
+/resume <session_id or 1> <message>
+/auto start [hours]
+/auto -h start [hours]
+/auto --human start [hours]
+/auto <hours>
+/auto status
+/auto prompt <message>
+/auto end
 /run <task_id> <message>
 /run 1 <message>
 /run <message>
@@ -126,9 +152,9 @@ Supported commands:
 /cancel 1
 /cancel
 /approvals [pending|approved|rejected]
-/approval <approval_id>
-/approve <approval_id> [note]
-/reject <approval_id> [note]
+/approval <approval_id or 1>
+/approve <approval_id or 1> [note]
+/reject <approval_id or 1> [note]
 ```
 
 `/run` starts a background job and returns immediately with a job id. The bot
@@ -142,7 +168,30 @@ For phone use, select a task once with `/use <task title>` or create one with
 `/job` shows the latest job in the chat, and `/cancel` cancels the latest queued
 or running job. Use `/list` to show numbered recent tasks and jobs; after that,
 commands like `/use 1`, `/run 1 <message>`, `/job 1`, and `/cancel 1` use the
-numbered list instead of long ids.
+numbered list instead of long ids. `/status` shows the current task, latest
+job, pending approvals, and recent sessions in one phone-friendly summary.
+`/sessions` stores a numbered session list, so `/resume 1 <message>` can resume
+a known AgentDeck session without copying a session id.
+
+Auto mode is a task-level job loop. After selecting a task with `/use`, send
+`/auto start` to start one run immediately and then keep starting the next run
+after each successful completion. `/auto 7.5` enables the same loop for 7.5
+hours. `/auto end` stops future automatic jobs; it does not kill a job already
+running, so use `/cancel` for that. The default auto prompt asks the agent to
+continue useful work and record important progress in project logs or task
+notes. Use `/auto prompt <message>` to replace that instruction.
+
+Auto mode defaults to automatic approval: auto-created jobs run with
+`approval_mode=bypass`, so they do not stop on backend approval prompts. Use
+`/auto -h start`, `/auto --human start`, or `/auto -h 2` when the automatic loop
+should stop and wait for a human approval decision instead.
+
+Approval commands also support numbered selections after `/approvals`. When a
+Telegram user sends `/approve 1` for a pending approval that belongs to a task,
+AgentDeck records the approval and starts a follow-up background job with
+`approval_mode=bypass`. This is a new run against the same task/session when it
+is safely resumable; it is not an in-place continuation of a stopped provider
+process.
 
 `/cancel <job_id>` cancels queued jobs immediately. For running Codex/Kimi
 print jobs, AgentDeck requests adapter-level process termination and records the

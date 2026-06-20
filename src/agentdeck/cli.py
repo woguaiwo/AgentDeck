@@ -6,7 +6,11 @@ import argparse
 import asyncio
 from datetime import datetime
 import json
+import os
+import signal
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 from agentdeck.core.config import Workspace
@@ -184,6 +188,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     telegram_serve.add_argument("--poll-timeout", type=int, default=30)
     telegram_serve.add_argument("--once", action="store_true", help="Process one polling response and exit")
+    telegram_start = telegram_sub.add_parser("start", help="Start Telegram bot as a detached background process")
+    telegram_start.add_argument("--token", help="Telegram bot token; defaults to AGENTDECK_TELEGRAM_TOKEN")
+    telegram_start.add_argument(
+        "--allowed-chat-id",
+        action="append",
+        default=[],
+        help="Allowed Telegram chat id. Can be repeated. Defaults to AGENTDECK_TELEGRAM_ALLOWED_CHATS.",
+    )
+    telegram_start.add_argument("--poll-timeout", type=int, default=30)
+    telegram_stop = telegram_sub.add_parser("stop", help="Stop detached Telegram bot")
+    telegram_stop.add_argument("--force", action="store_true", help="Send SIGKILL if SIGTERM does not stop the bot")
+    telegram_sub.add_parser("status", help="Show detached Telegram bot status")
 
     return parser
 
@@ -445,9 +461,144 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             TelegramServer(workspace, TelegramBotApi(config.token), config).serve_forever(once=args.once)
             return 0
+        if args.telegram_command == "start":
+            return _telegram_start(args, workspace)
+        if args.telegram_command == "stop":
+            return _telegram_stop(args, workspace)
+        if args.telegram_command == "status":
+            return _telegram_status(workspace)
 
     parser.error(f"unknown command: {args.command}")
     return 2
+
+
+def _telegram_start(args: argparse.Namespace, workspace: Workspace) -> int:
+    config = config_from_env(
+        token=args.token,
+        allowed_chat_ids=args.allowed_chat_id,
+        poll_timeout=args.poll_timeout,
+    )
+    if not config.token:
+        print("missing Telegram token; set AGENTDECK_TELEGRAM_TOKEN or pass --token", file=sys.stderr)
+        return 2
+
+    pid = _read_pid(_telegram_pid_path(workspace))
+    if pid and _pid_alive(pid):
+        print(f"telegram bot already running: pid={pid}")
+        print(f"log: {_telegram_log_path(workspace)}")
+        return 0
+
+    daemon_dir = workspace.root / "telegram"
+    daemon_dir.mkdir(parents=True, exist_ok=True)
+    log_path = _telegram_log_path(workspace)
+    pid_path = _telegram_pid_path(workspace)
+    env = os.environ.copy()
+    env["AGENTDECK_TELEGRAM_TOKEN"] = config.token
+    if config.allowed_chat_ids:
+        env["AGENTDECK_TELEGRAM_ALLOWED_CHATS"] = ",".join(str(chat_id) for chat_id in sorted(config.allowed_chat_ids))
+    command = [
+        sys.executable,
+        "-m",
+        "agentdeck",
+        "--workspace",
+        str(workspace.root),
+        "telegram",
+        "serve",
+        "--poll-timeout",
+        str(config.poll_timeout),
+    ]
+    with log_path.open("ab") as log:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env=env,
+            close_fds=True,
+            start_new_session=True,
+        )
+    pid_path.write_text(str(process.pid), encoding="utf-8")
+    print(f"telegram bot started: pid={process.pid}")
+    print(f"workspace: {workspace.root}")
+    print(f"log: {log_path}")
+    return 0
+
+
+def _telegram_stop(args: argparse.Namespace, workspace: Workspace) -> int:
+    pid_path = _telegram_pid_path(workspace)
+    pid = _read_pid(pid_path)
+    if not pid:
+        print("telegram bot is not running")
+        return 0
+    if not _pid_alive(pid):
+        _unlink_quietly(pid_path)
+        print(f"telegram bot is not running; removed stale pid {pid}")
+        return 0
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(50):
+        if not _pid_alive(pid):
+            _unlink_quietly(pid_path)
+            print(f"telegram bot stopped: pid={pid}")
+            return 0
+        time.sleep(0.1)
+    if args.force:
+        os.kill(pid, signal.SIGKILL)
+        _unlink_quietly(pid_path)
+        print(f"telegram bot killed: pid={pid}")
+        return 0
+    print(f"telegram bot did not stop after SIGTERM: pid={pid}", file=sys.stderr)
+    print("rerun with: agentdeck telegram stop --force", file=sys.stderr)
+    return 1
+
+
+def _telegram_status(workspace: Workspace) -> int:
+    pid = _read_pid(_telegram_pid_path(workspace))
+    log_path = _telegram_log_path(workspace)
+    if pid and _pid_alive(pid):
+        print(f"telegram bot: running pid={pid}")
+        print(f"log: {log_path}")
+        return 0
+    if pid:
+        print(f"telegram bot: stopped stale_pid={pid}")
+        print(f"log: {log_path}")
+        return 1
+    print("telegram bot: stopped")
+    print(f"log: {log_path}")
+    return 1
+
+
+def _telegram_pid_path(workspace: Workspace) -> Path:
+    return workspace.root / "telegram" / "agentdeck-telegram.pid"
+
+
+def _telegram_log_path(workspace: Workspace) -> Path:
+    return workspace.root / "telegram" / "agentdeck-telegram.log"
+
+
+def _read_pid(path: Path) -> int:
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _unlink_quietly(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def _normalize_argv(argv: list[str] | None) -> list[str]:

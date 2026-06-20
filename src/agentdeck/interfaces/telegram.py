@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import threading
+import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
@@ -16,13 +17,22 @@ from agentdeck.core.cancel import CancellationToken
 from agentdeck.core.config import Workspace
 from agentdeck.core.events import EventKind
 from agentdeck.core.run_service import RunConfigurationError, RunRequest, run_agent_prompt
-from agentdeck.storage.approvals import ApprovalRegistry
+from agentdeck.storage.approvals import ApprovalRecord, ApprovalRegistry
 from agentdeck.storage.jobs import JobRecord, JobRegistry
 from agentdeck.storage.projects import ProjectRecord, ProjectRegistry
+from agentdeck.storage.sessions import SessionRecord, SessionRegistry
 from agentdeck.storage.tasks import TaskBoard, TaskRecord
 
 
 MAX_TELEGRAM_MESSAGE = 3900
+AUTO_CONTINUE_DELAY_SECONDS = 1.0
+DEFAULT_AUTO_APPROVAL_MODE = "bypass"
+HUMAN_AUTO_APPROVAL_MODE = "fail"
+DEFAULT_AUTO_PROMPT = (
+    "请继续推进当前任务。要求：主动完成下一步；如果取得阶段性进展、"
+    "做出重要决定或遇到阻塞，请用简短要点记录到项目日志或任务备注里；"
+    "如果需要用户决策、权限或外部信息，请停止并明确说明。"
+)
 
 
 @dataclass
@@ -84,12 +94,84 @@ class TelegramChatStateStore:
             data[str(chat_id)] = chat
             self._write(data)
 
+    def auto_state(self, chat_id: int) -> dict[str, Any]:
+        with self._lock:
+            data = self._read()
+            state = data.get(str(chat_id), {}).get("auto") or {}
+            return dict(state) if isinstance(state, dict) else {}
+
+    def set_auto_state(
+        self,
+        chat_id: int,
+        *,
+        enabled: bool,
+        task_id: str = "",
+        prompt: str = DEFAULT_AUTO_PROMPT,
+        until: float = 0.0,
+        turns_started: int = 0,
+        last_job_id: str = "",
+        approval_mode: str = DEFAULT_AUTO_APPROVAL_MODE,
+    ) -> None:
+        with self._lock:
+            data = self._read()
+            chat = dict(data.get(str(chat_id)) or {})
+            chat["auto"] = {
+                "enabled": enabled,
+                "task_id": task_id,
+                "prompt": prompt,
+                "until": until,
+                "turns_started": turns_started,
+                "last_job_id": last_job_id,
+                "approval_mode": _normalize_auto_approval_mode(approval_mode),
+            }
+            data[str(chat_id)] = chat
+            self._write(data)
+
+    def disable_auto(self, chat_id: int) -> None:
+        with self._lock:
+            data = self._read()
+            chat = dict(data.get(str(chat_id)) or {})
+            state = dict(chat.get("auto") or {})
+            state["enabled"] = False
+            chat["auto"] = state
+            data[str(chat_id)] = chat
+            self._write(data)
+
+    def mark_auto_job(self, chat_id: int, *, job_id: str, task_id: str) -> dict[str, Any]:
+        with self._lock:
+            data = self._read()
+            chat = dict(data.get(str(chat_id)) or {})
+            state = dict(chat.get("auto") or {})
+            state["last_job_id"] = job_id
+            state["task_id"] = task_id or str(state.get("task_id") or "")
+            state["turns_started"] = int(state.get("turns_started") or 0) + 1
+            chat["auto"] = state
+            data[str(chat_id)] = chat
+            self._write(data)
+            return state
+
     def set_recent(self, chat_id: int, *, task_ids: list[str], job_ids: list[str]) -> None:
         with self._lock:
             data = self._read()
             chat = dict(data.get(str(chat_id)) or {})
             chat["recent_task_ids"] = task_ids
             chat["recent_job_ids"] = job_ids
+            data[str(chat_id)] = chat
+            self._write(data)
+
+    def set_recent_sessions(self, chat_id: int, session_ids: list[str]) -> None:
+        with self._lock:
+            data = self._read()
+            chat = dict(data.get(str(chat_id)) or {})
+            chat["recent_session_ids"] = session_ids
+            data[str(chat_id)] = chat
+            self._write(data)
+
+    def set_recent_approvals(self, chat_id: int, approval_ids: list[str]) -> None:
+        with self._lock:
+            data = self._read()
+            chat = dict(data.get(str(chat_id)) or {})
+            chat["recent_approval_ids"] = approval_ids
             data[str(chat_id)] = chat
             self._write(data)
 
@@ -124,6 +206,22 @@ class TelegramChatStateStore:
             if not isinstance(job_ids, list) or index < 1 or index > len(job_ids):
                 return ""
             return str(job_ids[index - 1])
+
+    def recent_session_id(self, chat_id: int, index: int) -> str:
+        with self._lock:
+            data = self._read()
+            session_ids = data.get(str(chat_id), {}).get("recent_session_ids") or []
+            if not isinstance(session_ids, list) or index < 1 or index > len(session_ids):
+                return ""
+            return str(session_ids[index - 1])
+
+    def recent_approval_id(self, chat_id: int, index: int) -> str:
+        with self._lock:
+            data = self._read()
+            approval_ids = data.get(str(chat_id), {}).get("recent_approval_ids") or []
+            if not isinstance(approval_ids, list) or index < 1 or index > len(approval_ids):
+                return ""
+            return str(approval_ids[index - 1])
 
     def _read(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():
@@ -161,6 +259,7 @@ class TelegramJobQueue:
         self.sender = sender
         self.runner = runner
         self.registry = JobRegistry(workspace)
+        self.chat_state = TelegramChatStateStore(workspace)
         self._lock = threading.Lock()
         self._threads: dict[str, threading.Thread] = {}
         self._cancellations: dict[str, CancellationToken] = {}
@@ -169,9 +268,22 @@ class TelegramJobQueue:
             reason="AgentDeck restarted before this job finished.",
         )
 
-    def start(self, *, chat_id: int, task_id: str, prompt: str) -> JobRecord:
+    def start(
+        self,
+        *,
+        chat_id: int,
+        task_id: str = "",
+        prompt: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> JobRecord:
         with self._lock:
-            job = self.registry.create(interface="telegram", chat_id=chat_id, task_id=task_id, prompt=prompt)
+            job = self.registry.create(
+                interface="telegram",
+                chat_id=chat_id,
+                task_id=task_id,
+                prompt=prompt,
+                metadata=metadata,
+            )
             self._cancellations[job.job_id] = CancellationToken()
             thread = threading.Thread(target=self._run_job, args=(job.job_id,), daemon=True)
             self._threads[job.job_id] = thread
@@ -217,18 +329,27 @@ class TelegramJobQueue:
             return
         cancellation = self._get_cancellation(job_id)
         try:
+            metadata = dict(job.metadata or {})
             result = asyncio.run(
                 self.runner(
                     self.workspace,
-                    RunRequest(prompt=job.prompt, task=job.task_id, cancellation=cancellation),
+                    RunRequest(
+                        prompt=job.prompt,
+                        task=job.task_id or None,
+                        session=str(metadata.get("session_id") or "") or None,
+                        approval_mode=str(metadata.get("approval_mode") or "") or None,
+                        cancellation=cancellation,
+                    ),
                 )
             )
         except RunConfigurationError as exc:
-            self._finish_job(job_id, status="error", error=str(exc))
+            finished = self._finish_job(job_id, status="error", error=str(exc))
             self._send(job.chat_id, f"Job failed: {job_id}\n{exc}")
+            self._stop_auto_after_failure(finished or job, str(exc))
         except Exception as exc:  # keep the polling loop alive even if a background job crashes
-            self._finish_job(job_id, status="error", error=str(exc))
+            finished = self._finish_job(job_id, status="error", error=str(exc))
             self._send(job.chat_id, f"Job failed: {job_id}\n{exc}")
+            self._stop_auto_after_failure(finished or job, str(exc))
         else:
             cancel_event = next((event for event in result.events if event.kind == EventKind.CANCELLED), None)
             cancel_was_requested = self._cancel_was_requested(job_id)
@@ -253,6 +374,7 @@ class TelegramJobQueue:
                     ),
                 )
             self._send(job.chat_id, _format_job_completion(finished or job, result.approval_requested))
+            self._continue_auto_if_needed(finished or job, result.approval_requested)
         finally:
             with self._lock:
                 self._cancellations.pop(job_id, None)
@@ -306,6 +428,72 @@ class TelegramJobQueue:
         except Exception:
             pass
 
+    def _continue_auto_if_needed(self, job: JobRecord, approval_requested: bool) -> None:
+        if not job.chat_id or not job.task_id:
+            return
+        state = self.chat_state.auto_state(job.chat_id)
+        if not _auto_enabled_for_job(state, job):
+            return
+        if approval_requested:
+            self._send(
+                job.chat_id,
+                "Auto mode paused: approval is required. Use /approvals, then /approve 1 or /reject 1.",
+            )
+            return
+        if job.status != "done":
+            self.chat_state.disable_auto(job.chat_id)
+            self._send(job.chat_id, f"Auto mode stopped: job ended with status {job.status}.")
+            return
+        if job.error:
+            self.chat_state.disable_auto(job.chat_id)
+            self._send(job.chat_id, f"Auto mode stopped: {_one_line(job.error, 180)}")
+            return
+        if _auto_expired(state):
+            self.chat_state.disable_auto(job.chat_id)
+            self._send(job.chat_id, "Auto mode ended: timer expired.")
+            return
+        prompt = str(state.get("prompt") or DEFAULT_AUTO_PROMPT).strip() or DEFAULT_AUTO_PROMPT
+        metadata: dict[str, Any] = {
+            "auto": True,
+            "auto_parent_job_id": job.job_id,
+            "approval_mode": _auto_approval_mode(state),
+        }
+        session_id = _safe_session_id_for_resume(self.workspace, job.session_id)
+        if session_id:
+            metadata["session_id"] = session_id
+
+        def enqueue_next() -> None:
+            current = self.chat_state.auto_state(job.chat_id)
+            if not _auto_enabled_for_job(current, job) or _auto_expired(current):
+                if _auto_expired(current):
+                    self.chat_state.disable_auto(job.chat_id)
+                    self._send(job.chat_id, "Auto mode ended: timer expired.")
+                return
+            next_job = self.start(chat_id=job.chat_id, task_id=job.task_id, prompt=prompt, metadata=metadata)
+            self.chat_state.mark_auto_job(job.chat_id, job_id=next_job.job_id, task_id=job.task_id)
+            self._send(
+                job.chat_id,
+                "\n".join(
+                    [
+                        f"Auto mode: next job started: {next_job.job_id}",
+                        "Use /auto status or /auto end.",
+                    ]
+                ),
+            )
+
+        timer = threading.Timer(AUTO_CONTINUE_DELAY_SECONDS, enqueue_next)
+        timer.daemon = True
+        timer.start()
+
+    def _stop_auto_after_failure(self, job: JobRecord, reason: str) -> None:
+        if not job.chat_id or not job.task_id:
+            return
+        state = self.chat_state.auto_state(job.chat_id)
+        if not _auto_enabled_for_job(state, job):
+            return
+        self.chat_state.disable_auto(job.chat_id)
+        self._send(job.chat_id, f"Auto mode stopped: {_one_line(reason, 180)}")
+
 
 class TelegramCommandHandler:
     """Parse Telegram messages into AgentDeck operations."""
@@ -342,18 +530,32 @@ class TelegramCommandHandler:
             return [self._use(rest, chat_id=chat_id)]
         if command in {"/current", "current"}:
             return [self._current(chat_id=chat_id)]
+        if command in {"/status", "status"}:
+            return [self._status(chat_id=chat_id)]
         if command in {"/list", "list", "/recent", "recent"}:
             return [self._recent(chat_id=chat_id)]
+        if command in {"/sessions", "sessions"}:
+            return [self._sessions(rest, chat_id=chat_id)]
+        if command in {"/session", "session"}:
+            return [self._session(rest, chat_id=chat_id)]
+        if command in {"/resume", "resume"}:
+            return [await self._resume(rest, chat_id=chat_id)]
+        if command in {"/auto", "auto"}:
+            return [self._auto(rest, chat_id=chat_id)]
+        if command in {"/ta", "ta"}:
+            subcommand, subrest = _split_once(rest)
+            if subcommand.lower().split("@", 1)[0] == "auto":
+                return [self._auto(subrest, chat_id=chat_id)]
         if command in {"/agents", "agents"}:
             return [self._agents(rest)]
         if command in {"/approvals", "approvals"}:
-            return [self._approvals(rest)]
+            return [self._approvals(rest, chat_id=chat_id)]
         if command in {"/approval", "approval"}:
-            return [self._approval(rest)]
+            return [self._approval(rest, chat_id=chat_id)]
         if command in {"/approve", "approve"}:
-            return [self._resolve_approval(rest, "approved")]
+            return [self._resolve_approval(rest, "approved", chat_id=chat_id)]
         if command in {"/reject", "reject"}:
-            return [self._resolve_approval(rest, "rejected")]
+            return [self._resolve_approval(rest, "rejected", chat_id=chat_id)]
         if command in {"/jobs", "jobs"}:
             return [self._jobs(chat_id=chat_id)]
         if command in {"/job", "job"}:
@@ -479,15 +681,62 @@ class TelegramCommandHandler:
                 lines.append(f"status: {latest.status}")
         return "\n".join(lines)
 
+    def _status(self, *, chat_id: int | None) -> str:
+        lines: list[str] = ["Status:"]
+        current_task_id = self.chat_state.current_task(chat_id) if chat_id is not None else ""
+        current_task = self._resolve_task(current_task_id) if current_task_id else None
+        if current_task is None:
+            lines.append("Current task: none")
+        else:
+            lines.append(f"Current task: {current_task.title}")
+            lines.append(f"Task status: {current_task.status}")
+
+        if self.job_queue is not None and chat_id is not None:
+            latest = self.job_queue.latest_for_chat(chat_id)
+            if latest is None:
+                lines.append("Latest job: none")
+            else:
+                task = self._resolve_task(latest.task_id)
+                task_title = task.title if task is not None else (latest.task_id or "-")
+                lines.append(f"Latest job: {latest.status}")
+                lines.append(f"Job task: {task_title}")
+
+        pending = ApprovalRegistry(self.workspace).list(status="pending")
+        lines.append(f"Pending approvals: {len(pending)}")
+        if chat_id is not None:
+            auto_state = self.chat_state.auto_state(chat_id)
+            if bool(auto_state.get("enabled")):
+                lines.append(
+                    "Auto: on  "
+                    f"timer: {_format_auto_until(float(auto_state.get('until') or 0.0))}  "
+                    f"approval: {_format_auto_approval_mode(_auto_approval_mode(auto_state))}"
+                )
+            else:
+                lines.append("Auto: off")
+
+        sessions = SessionRegistry(self.workspace).list()[:3]
+        if sessions:
+            lines.append("Recent sessions:")
+            for index, session in enumerate(sessions, 1):
+                lines.append(f"{index}. {session.title}  [{session.status}]")
+        else:
+            lines.append("Recent sessions: none")
+
+        lines.append("")
+        lines.append("Use /list, /sessions, /approvals, or /run <message>.")
+        return "\n".join(lines)
+
     def _recent(self, *, chat_id: int | None) -> str:
         tasks = TaskBoard(self.workspace).list()[:8]
         jobs = self.job_queue.list(chat_id=chat_id, limit=8) if self.job_queue is not None else []
+        sessions = SessionRegistry(self.workspace).list()[:8]
         if chat_id is not None:
             self.chat_state.set_recent(
                 chat_id,
                 task_ids=[task.task_id for task in tasks],
                 job_ids=[job.job_id for job in jobs],
             )
+            self.chat_state.set_recent_sessions(chat_id, [session.session_id for session in sessions])
 
         current_task_id = self.chat_state.current_task(chat_id) if chat_id is not None else ""
         lines: list[str] = ["Recent:"]
@@ -514,8 +763,18 @@ class TelegramCommandHandler:
                     if job.session_id:
                         lines.append(f"   session: {job.session_id}")
 
+        if not sessions:
+            lines.append("")
+            lines.append("Sessions: none")
+        else:
+            lines.append("")
+            lines.append("Sessions:")
+            for index, session in enumerate(sessions, 1):
+                lines.append(f"{index}. {session.title}")
+                lines.append(f"   status: {session.status}  agent: {session.agent_id}")
+
         lines.append("")
-        lines.append("Use /use 1, /run 1 <message>, /job 1, or /cancel 1.")
+        lines.append("Use /use 1, /run 1 <message>, /job 1, /cancel 1, or /resume 1 <message>.")
         return "\n".join(lines)
 
     def _default_project(self, *, chat_id: int | None) -> ProjectRecord | None:
@@ -548,6 +807,126 @@ class TelegramCommandHandler:
             return matches[0]
         return None
 
+    def _sessions(self, rest: str, *, chat_id: int | None) -> str:
+        agent_id = rest.strip() or None
+        records = SessionRegistry(self.workspace).list(agent_id=agent_id)
+        if not records:
+            return "No sessions."
+        records = records[:10]
+        if chat_id is not None:
+            self.chat_state.set_recent_sessions(chat_id, [record.session_id for record in records])
+        lines = ["Sessions:"]
+        for index, record in enumerate(records, 1):
+            lines.append(f"{index}. {record.title}")
+            lines.append(f"   status: {record.status}  agent: {record.agent_id}  adapter: {record.adapter}")
+            if record.provider_session_id:
+                lines.append(f"   provider: {record.provider_session_kind or 'session'}")
+            if record.last_assistant_final:
+                lines.append(f"   last: {_one_line(record.last_assistant_final, 120)}")
+        lines.append("")
+        lines.append("Use /session 1 or /resume 1 <message>.")
+        return "\n".join(lines)
+
+    def _session(self, rest: str, *, chat_id: int | None) -> str:
+        session_ref = rest.strip()
+        if not session_ref:
+            return "Usage: /session <session_id, title, or number>"
+        record = self._resolve_session(session_ref, chat_id=chat_id)
+        if record is None:
+            return f"Session not found: {session_ref}"
+        lines = [
+            record.title,
+            f"id: {record.session_id}",
+            f"status: {record.status}",
+            f"agent: {record.agent_id}",
+            f"adapter: {record.adapter}",
+            f"project_dir: {record.project_dir}",
+        ]
+        task = self._task_for_session(record.session_id)
+        if task is not None:
+            lines.append(f"task: {task.title}")
+        if record.provider_session_id:
+            lines.append(f"provider_session: {record.provider_session_kind or 'provider_session'}")
+        if record.last_user_message:
+            lines.append(f"last user: {_one_line(record.last_user_message, 180)}")
+        if record.last_assistant_final:
+            lines.append(f"last reply: {_one_line(record.last_assistant_final, 240)}")
+        lines.append("")
+        lines.append("Use /resume <message> if this is the current task session, or /resume 1 <message>.")
+        return "\n".join(lines)
+
+    async def _resume(self, rest: str, *, chat_id: int | None) -> str:
+        if chat_id is None:
+            return "This command requires a Telegram chat."
+        session, prompt, error = self._resolve_resume_target(rest, chat_id=chat_id)
+        if error:
+            return error
+        assert session is not None
+
+        task = self._task_for_session(session.session_id)
+        if task is not None:
+            self.chat_state.set_current_task(chat_id, task.task_id)
+        metadata = {"session_id": session.session_id}
+        if self.job_queue is not None:
+            job = self.job_queue.start(
+                chat_id=chat_id,
+                task_id=task.task_id if task is not None else "",
+                prompt=prompt,
+                metadata=metadata,
+            )
+            return "\n".join(
+                [
+                    f"Resume job started: {job.job_id}",
+                    f"session: {session.title}",
+                    f"status: queued",
+                    "Use /job to view the latest job",
+                ]
+            )
+        try:
+            result = await self.runner(self.workspace, RunRequest(prompt=prompt, session=session.session_id))
+        except RunConfigurationError as exc:
+            return str(exc)
+        lines = [result.final_text or "Run finished without a final text response.", "", f"session: {result.session_id}"]
+        return "\n".join(lines)
+
+    def _resolve_session(self, value: str, *, chat_id: int | None = None) -> SessionRecord | None:
+        clean = value.strip()
+        if chat_id is not None and clean.isdigit():
+            mapped = self.chat_state.recent_session_id(chat_id, int(clean))
+            if mapped:
+                clean = mapped
+        return SessionRegistry(self.workspace).resolve(clean)
+
+    def _resolve_resume_target(self, rest: str, *, chat_id: int) -> tuple[SessionRecord | None, str, str]:
+        clean = rest.strip()
+        if not clean:
+            return None, "", "Usage: /resume <session number> <message>, or /resume <message> after /use"
+
+        session_ref, maybe_prompt = _split_once(clean)
+        if session_ref and maybe_prompt:
+            session = self._resolve_session(session_ref, chat_id=chat_id)
+            if session is not None:
+                return session, maybe_prompt, ""
+
+        current_task_id = self.chat_state.current_task(chat_id)
+        current_task = self._resolve_task(current_task_id) if current_task_id else None
+        if current_task is not None and current_task.session_id:
+            session = SessionRegistry(self.workspace).resolve(current_task.session_id)
+            if session is not None:
+                return session, clean, ""
+
+        if session_ref and not maybe_prompt and self._resolve_session(session_ref, chat_id=chat_id) is not None:
+            return None, "", "Usage: /resume <session number> <message>"
+        return None, "", "No current resumable session. Use /sessions, then /resume 1 <message>."
+
+    def _task_for_session(self, session_id: str) -> TaskRecord | None:
+        if not session_id:
+            return None
+        matches = [task for task in TaskBoard(self.workspace).list() if task.session_id == session_id]
+        if not matches:
+            return None
+        return matches[0]
+
     def _agents(self, rest: str) -> str:
         project = rest.strip() or None
         from agentdeck.storage.agents import AgentRegistry
@@ -562,7 +941,7 @@ class TelegramCommandHandler:
             lines.append(f"   project: {record.project_id or '-'}  adapter: {record.adapter}")
         return "\n".join(lines)
 
-    def _approvals(self, rest: str) -> str:
+    def _approvals(self, rest: str, *, chat_id: int | None) -> str:
         status = rest.strip() or "pending"
         try:
             records = ApprovalRegistry(self.workspace).list(status=status)
@@ -570,19 +949,23 @@ class TelegramCommandHandler:
             return str(exc)
         if not records:
             return f"No {status} approvals."
+        if chat_id is not None:
+            self.chat_state.set_recent_approvals(chat_id, [record.approval_id for record in records])
         lines = [f"Approvals ({status}):"]
         for index, record in enumerate(records, 1):
             lines.append(f"{index}. {record.title}")
             lines.append(f"   id: {record.approval_id}")
             lines.append(f"   task: {record.task_id or '-'}  agent: {record.agent_id}")
             lines.append(f"   provider: {record.provider or record.adapter or '-'}")
+        lines.append("")
+        lines.append("Use /approval 1, /approve 1, or /reject 1.")
         return "\n".join(lines)
 
-    def _approval(self, rest: str) -> str:
+    def _approval(self, rest: str, *, chat_id: int | None) -> str:
         approval_id = rest.strip()
         if not approval_id:
             return "Usage: /approval <approval_id>"
-        record = ApprovalRegistry(self.workspace).resolve(approval_id)
+        record = self._resolve_approval_record(approval_id, chat_id=chat_id)
         if record is None:
             return f"Approval not found: {approval_id}"
         lines = [
@@ -599,11 +982,15 @@ class TelegramCommandHandler:
             lines.append(f"resolution: {record.resolution_note}")
         return "\n".join(lines)
 
-    def _resolve_approval(self, rest: str, status: str) -> str:
+    def _resolve_approval(self, rest: str, status: str, *, chat_id: int | None) -> str:
         approval_id, note = _split_once(rest.strip())
         if not approval_id:
             verb = "approve" if status == "approved" else "reject"
             return f"Usage: /{verb} <approval_id> [note]"
+        existing_approval = self._resolve_approval_record(approval_id, chat_id=chat_id)
+        previous_status = existing_approval.status if existing_approval is not None else ""
+        if existing_approval is not None:
+            approval_id = existing_approval.approval_id
         registry = ApprovalRegistry(self.workspace)
         record = registry.resolve_request(approval_id, status=status, resolved_by="telegram", note=note)
         if record is None:
@@ -614,7 +1001,151 @@ class TelegramCommandHandler:
                 f"Approval {record.status}: {record.approval_id}" + (f"; {note}" if note else ""),
                 kind=f"approval:{record.status}",
             )
-        return f"Approval {record.status}: {record.title}\nid: {record.approval_id}"
+        lines = [f"Approval {record.status}: {record.title}", f"id: {record.approval_id}"]
+        if (
+            status == "approved"
+            and previous_status == "pending"
+            and self.job_queue is not None
+            and chat_id is not None
+            and record.task_id
+        ):
+            session_id = self._safe_session_id_for_resume(record.session_id)
+            prompt = _approval_resume_prompt(record)
+            metadata = {"approval_id": record.approval_id, "approval_mode": "bypass"}
+            if session_id:
+                metadata["session_id"] = session_id
+            job = self.job_queue.start(
+                chat_id=chat_id,
+                task_id=record.task_id,
+                prompt=prompt,
+                metadata=metadata,
+            )
+            lines.extend(
+                [
+                    "",
+                    f"Follow-up job started: {job.job_id}",
+                    "approval_mode: bypass",
+                    "Use /job to view the latest job",
+                ]
+            )
+        return "\n".join(lines)
+
+    def _resolve_approval_record(self, value: str, *, chat_id: int | None = None) -> ApprovalRecord | None:
+        clean = value.strip()
+        if chat_id is not None and clean.isdigit():
+            mapped = self.chat_state.recent_approval_id(chat_id, int(clean))
+            if mapped:
+                clean = mapped
+        return ApprovalRegistry(self.workspace).resolve(clean)
+
+    def _safe_session_id_for_resume(self, session_id: str) -> str:
+        return _safe_session_id_for_resume(self.workspace, session_id)
+
+    def _auto(self, rest: str, *, chat_id: int | None) -> str:
+        if chat_id is None:
+            return "This command requires a Telegram chat."
+        clean, approval_mode = _extract_auto_approval_mode(rest.strip())
+        action, tail = _split_once(clean)
+        action = action.lower()
+        if not action or action in {"status", "show"}:
+            return self._auto_status(chat_id)
+        if action in {"end", "stop", "off", "disable"}:
+            self.chat_state.disable_auto(chat_id)
+            return "Auto mode disabled."
+        if action == "prompt":
+            prompt = tail.strip()
+            if not prompt:
+                return "Usage: /auto prompt <message>"
+            state = self.chat_state.auto_state(chat_id)
+            self.chat_state.set_auto_state(
+                chat_id,
+                enabled=bool(state.get("enabled")),
+                task_id=str(state.get("task_id") or self.chat_state.current_task(chat_id)),
+                prompt=prompt,
+                until=float(state.get("until") or 0.0),
+                turns_started=int(state.get("turns_started") or 0),
+                last_job_id=str(state.get("last_job_id") or ""),
+                approval_mode=_auto_approval_mode(state),
+            )
+            return f"Auto prompt updated:\n{prompt}"
+        if action == "start" or action == "on":
+            return self._auto_start(tail, chat_id=chat_id, approval_mode=approval_mode)
+        if _looks_like_float(action):
+            return self._auto_start(clean, chat_id=chat_id, approval_mode=approval_mode)
+        return "Usage: /auto start [hours], /auto <hours>, /auto -h start, /auto status, /auto prompt <message>, or /auto end"
+
+    def _auto_start(self, rest: str, *, chat_id: int, approval_mode: str) -> str:
+        task_id = self.chat_state.current_task(chat_id)
+        task = self._resolve_task(task_id) if task_id else None
+        if task is None:
+            return "No current task. Use /use <task_id or title>, then /auto start."
+        duration_text, prompt_override = _split_once(rest.strip())
+        until = 0.0
+        if duration_text:
+            if not _looks_like_float(duration_text):
+                prompt_override = rest.strip()
+            else:
+                hours = float(duration_text)
+                if hours <= 0:
+                    return "Auto duration must be positive hours, or omit it for no timer."
+                until = time.time() + hours * 3600.0
+        state = self.chat_state.auto_state(chat_id)
+        prompt = prompt_override.strip() or str(state.get("prompt") or DEFAULT_AUTO_PROMPT)
+        normalized_approval_mode = _normalize_auto_approval_mode(approval_mode)
+        self.chat_state.set_auto_state(
+            chat_id,
+            enabled=True,
+            task_id=task.task_id,
+            prompt=prompt,
+            until=until,
+            turns_started=0,
+            last_job_id="",
+            approval_mode=normalized_approval_mode,
+        )
+        lines = [
+            "Auto mode enabled.",
+            f"task: {task.title}",
+            f"timer: {_format_auto_until(until)}",
+            f"approval: {_format_auto_approval_mode(normalized_approval_mode)}",
+        ]
+        if self.job_queue is None:
+            lines.append("Jobs are not enabled for this interface.")
+            return "\n".join(lines)
+
+        active = self.job_queue.latest_for_chat(chat_id, statuses={"queued", "running", "cancel_requested"})
+        if active is not None:
+            lines.append(f"active job: {active.job_id}")
+            lines.append("Auto will continue after the active job finishes.")
+            return "\n".join(lines)
+
+        metadata = {"auto": True, "approval_mode": normalized_approval_mode}
+        session_id = self._safe_session_id_for_resume(task.session_id)
+        if session_id:
+            metadata["session_id"] = session_id
+        job = self.job_queue.start(chat_id=chat_id, task_id=task.task_id, prompt=prompt, metadata=metadata)
+        self.chat_state.mark_auto_job(chat_id, job_id=job.job_id, task_id=task.task_id)
+        lines.append(f"Job started: {job.job_id}")
+        lines.append("Use /auto status or /auto end.")
+        return "\n".join(lines)
+
+    def _auto_status(self, chat_id: int) -> str:
+        state = self.chat_state.auto_state(chat_id)
+        if not bool(state.get("enabled")):
+            return "Auto mode: off\nUse /auto start after selecting a task with /use."
+        task = self._resolve_task(str(state.get("task_id") or ""))
+        lines = [
+            "Auto mode: on",
+            f"task: {task.title if task is not None else str(state.get('task_id') or '-')}",
+            f"timer: {_format_auto_until(float(state.get('until') or 0.0))}",
+            f"approval: {_format_auto_approval_mode(_auto_approval_mode(state))}",
+            f"turns started: {int(state.get('turns_started') or 0)}",
+        ]
+        if state.get("last_job_id"):
+            lines.append(f"last auto job: {state['last_job_id']}")
+        prompt = str(state.get("prompt") or DEFAULT_AUTO_PROMPT)
+        lines.append(f"prompt: {_one_line(prompt, 220)}")
+        lines.append("Use /auto end to stop.")
+        return "\n".join(lines)
 
     async def _run(self, rest: str, *, chat_id: int | None = None) -> str:
         task, prompt, error = self._resolve_run_target(rest, chat_id=chat_id)
@@ -855,11 +1386,96 @@ def _normalize_bot_token(value: str) -> str:
     return "".join(clean.split())
 
 
+def _looks_like_float(value: str) -> bool:
+    try:
+        float(value)
+    except ValueError:
+        return False
+    return True
+
+
+def _extract_auto_approval_mode(text: str) -> tuple[str, str]:
+    tokens = text.split()
+    kept: list[str] = []
+    approval_mode = DEFAULT_AUTO_APPROVAL_MODE
+    for token in tokens:
+        lowered = token.lower()
+        if lowered in {"-h", "--human", "--human-approval"}:
+            approval_mode = HUMAN_AUTO_APPROVAL_MODE
+            continue
+        if lowered in {"--auto", "--auto-approval", "-a"}:
+            approval_mode = DEFAULT_AUTO_APPROVAL_MODE
+            continue
+        kept.append(token)
+    return " ".join(kept), approval_mode
+
+
+def _normalize_auto_approval_mode(value: str) -> str:
+    clean = (value or "").strip().lower()
+    if clean in {"human", "manual", "fail", "ask"}:
+        return HUMAN_AUTO_APPROVAL_MODE
+    if clean in {"auto", "bypass", "approve", "approved"}:
+        return DEFAULT_AUTO_APPROVAL_MODE
+    return DEFAULT_AUTO_APPROVAL_MODE
+
+
+def _auto_approval_mode(state: dict[str, Any]) -> str:
+    return _normalize_auto_approval_mode(str(state.get("approval_mode") or DEFAULT_AUTO_APPROVAL_MODE))
+
+
+def _format_auto_approval_mode(value: str) -> str:
+    return "human" if _normalize_auto_approval_mode(value) == HUMAN_AUTO_APPROVAL_MODE else "auto"
+
+
+def _safe_session_id_for_resume(workspace: Workspace, session_id: str) -> str:
+    session = SessionRegistry(workspace).get(session_id) if session_id else None
+    if session is None:
+        return ""
+    if session.adapter in {"codex", "codex-exec", "kimi", "kimi-print"} and not session.provider_session_id:
+        return ""
+    return session.session_id
+
+
+def _auto_enabled_for_job(state: dict[str, Any], job: JobRecord) -> bool:
+    if not bool(state.get("enabled")):
+        return False
+    task_id = str(state.get("task_id") or "")
+    return bool(job.task_id) and task_id == job.task_id
+
+
+def _auto_expired(state: dict[str, Any]) -> bool:
+    until = float(state.get("until") or 0.0)
+    return bool(until) and time.time() >= until
+
+
+def _format_auto_until(until: float) -> str:
+    if not until:
+        return "none"
+    remaining = max(0.0, until - time.time())
+    if remaining < 60:
+        return f"{remaining:.1f}s remaining"
+    if remaining < 3600:
+        return f"{remaining / 60:.1f}m remaining"
+    return f"{remaining / 3600:.2f}h remaining"
+
+
+def _approval_resume_prompt(record: ApprovalRecord) -> str:
+    request = _one_line(record.request_text, 300)
+    lines = [
+        "Approval was granted from Telegram.",
+        "Continue the interrupted task now.",
+        "Use the approved operation only if it is still necessary, and report the result clearly.",
+    ]
+    if request:
+        lines.append(f"Approved request: {request}")
+    return "\n".join(lines)
+
+
 def _format_job_completion(job: JobRecord, approval_requested: bool) -> str:
     heading = "Job cancelled" if job.status == "cancelled" else "Job done"
     lines = [
         f"{heading}: {job.job_id}",
-        f"task: {job.task_id}",
+        f"task: {job.task_id or '-'}",
     ]
     if job.session_id:
         lines.append(f"session: {job.session_id}")
@@ -887,6 +1503,7 @@ def _help_text() -> str:
     return "\n".join(
         [
             "AgentDeck Telegram commands:",
+            "/status",
             "/projects",
             "/agents [project]",
             "/tasks [project]",
@@ -895,12 +1512,20 @@ def _help_text() -> str:
             "/use <task_id or exact task title>",
             "/current",
             "/list",
+            "/sessions [agent]",
+            "/session <session_id or 1>",
+            "/resume <session_id or 1> <message>",
+            "/auto start [hours]",
+            "/auto -h start [hours]",
+            "/auto <hours>",
+            "/auto status",
+            "/auto end",
             "/run <task_id> <message>",
             "/run <message>  (after /use)",
             "/approvals [pending|approved|rejected]",
-            "/approval <approval_id>",
-            "/approve <approval_id> [note]",
-            "/reject <approval_id> [note]",
+            "/approval <approval_id or 1>",
+            "/approve <approval_id or 1> [note]",
+            "/reject <approval_id or 1> [note]",
             "/jobs",
             "/job <job_id>",
             "/job 1",

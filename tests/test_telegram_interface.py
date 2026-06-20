@@ -5,9 +5,11 @@ import os
 import re
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 
+import agentdeck.interfaces.telegram as telegram_module
 from agentdeck.cli import main
 from agentdeck.core.config import Workspace
 from agentdeck.core.events import AgentEvent, EventKind
@@ -89,6 +91,86 @@ class TelegramInterfaceTests(unittest.TestCase):
             assert resolved is not None
             self.assertEqual(resolved.status, "approved")
             self.assertEqual(resolved.resolved_by, "telegram")
+
+    def test_status_sessions_resume_and_numbered_approvals(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            workspace.ensure()
+            task = TaskBoard(workspace).create(title="Phone control task")
+            SessionRegistry(workspace).upsert_start(
+                session_id="session-phone",
+                agent_id="owner",
+                adapter="echo",
+                project_dir=tmpdir,
+                prompt="initial work",
+                title="Phone session",
+            )
+            TaskBoard(workspace).attach_session(task.task_id, "session-phone")
+            event = AgentEvent(
+                EventKind.APPROVAL_REQUESTED,
+                "owner",
+                "session-phone",
+                text="Allow command?",
+                payload={"provider": "codex", "type": "approval_requested"},
+            )
+            approval = ApprovalRegistry(workspace).record_request(
+                event,
+                adapter="codex",
+                project_dir=tmpdir,
+                task_id=task.task_id,
+            )
+            seen: list[RunRequest] = []
+
+            async def runner(workspace_arg: Workspace, request: RunRequest) -> RunServiceResult:
+                seen.append(request)
+                return RunServiceResult(
+                    session_id=request.session or "session-new",
+                    final_text=f"done: {request.prompt}",
+                    events=[],
+                    agent_id="owner",
+                    adapter="echo",
+                    task_id=request.task or "",
+                )
+
+            queue = TelegramJobQueue(workspace, sender=lambda chat_id, text: None, runner=runner)
+            handler = TelegramCommandHandler(workspace, job_queue=queue)
+
+            selected = asyncio.run(handler.handle_text(f"/use {task.task_id}", chat_id=42))[0]
+            self.assertIn("Current task set", selected)
+
+            status = asyncio.run(handler.handle_text("/status", chat_id=42))[0]
+            self.assertIn("Current task: Phone control task", status)
+            self.assertIn("Pending approvals: 1", status)
+            self.assertIn("Phone session", status)
+
+            sessions = asyncio.run(handler.handle_text("/sessions", chat_id=42))[0]
+            self.assertIn("1. Phone session", sessions)
+
+            resume = asyncio.run(handler.handle_text("/resume 1 continue session", chat_id=42))[0]
+            resume_job = re.search(r"Resume job started: (job-\S+)", resume).group(1)
+            queue.wait(resume_job, timeout=2)
+            self.assertEqual(seen[-1].session, "session-phone")
+            self.assertEqual(seen[-1].prompt, "continue session")
+
+            approvals = asyncio.run(handler.handle_text("/approvals", chat_id=42))[0]
+            self.assertIn("1. Allow command?", approvals)
+            detail = asyncio.run(handler.handle_text("/approval 1", chat_id=42))[0]
+            self.assertIn(approval.approval_id, detail)
+
+            approved = asyncio.run(handler.handle_text("/approve 1 ok", chat_id=42))[0]
+            self.assertIn("Approval approved", approved)
+            self.assertIn("Follow-up job started", approved)
+            followup_job = re.search(r"Follow-up job started: (job-\S+)", approved).group(1)
+            queue.wait(followup_job, timeout=2)
+            self.assertEqual(seen[-1].task, task.task_id)
+            self.assertEqual(seen[-1].approval_mode, "bypass")
+            self.assertIn("Approval was granted", seen[-1].prompt)
+            runs_after_first_approval = len(seen)
+
+            approved_again = asyncio.run(handler.handle_text("/approve 1 again", chat_id=42))[0]
+            self.assertIn("Approval approved", approved_again)
+            self.assertNotIn("Follow-up job started", approved_again)
+            self.assertEqual(len(seen), runs_after_first_approval)
 
     def test_run_command_can_start_background_job(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -180,6 +262,93 @@ class TelegramInterfaceTests(unittest.TestCase):
             latest = asyncio.run(handler.handle_text("/job", chat_id=42))[0]
             self.assertIn(f"Job: {job_id}", latest)
             self.assertIn("done: continue without ids", latest)
+
+    def test_auto_mode_starts_followup_jobs_and_can_be_stopped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            workspace.ensure()
+            task = TaskBoard(workspace).create(title="Auto task")
+            seen: list[RunRequest] = []
+            second_started = threading.Event()
+            release_second = threading.Event()
+
+            async def runner(workspace_arg: Workspace, request: RunRequest) -> RunServiceResult:
+                seen.append(request)
+                if len(seen) == 2:
+                    second_started.set()
+                    release_second.wait(timeout=2)
+                return RunServiceResult(
+                    session_id=f"session-auto-{len(seen)}",
+                    final_text=f"done: {request.prompt}",
+                    events=[],
+                    agent_id="owner",
+                    adapter="echo",
+                    task_id=request.task or "",
+                )
+
+            old_delay = telegram_module.AUTO_CONTINUE_DELAY_SECONDS
+            telegram_module.AUTO_CONTINUE_DELAY_SECONDS = 0.01
+            try:
+                queue = TelegramJobQueue(workspace, sender=lambda chat_id, text: None, runner=runner)
+                handler = TelegramCommandHandler(workspace, job_queue=queue)
+
+                asyncio.run(handler.handle_text(f"/use {task.task_id}", chat_id=42))
+                reply = asyncio.run(handler.handle_text("/auto start 1", chat_id=42))[0]
+                first_job = re.search(r"Job started: (job-\S+)", reply).group(1)
+                queue.wait(first_job, timeout=2)
+                self.assertTrue(second_started.wait(timeout=2))
+                self.assertEqual(seen[0].task, task.task_id)
+                self.assertEqual(seen[0].approval_mode, "bypass")
+                self.assertEqual(seen[1].approval_mode, "bypass")
+                self.assertIn("请继续推进当前任务", seen[0].prompt)
+                self.assertIn("请继续推进当前任务", seen[1].prompt)
+
+                status = asyncio.run(handler.handle_text("/auto status", chat_id=42))[0]
+                self.assertIn("Auto mode: on", status)
+                self.assertIn("Auto task", status)
+                self.assertIn("approval: auto", status)
+
+                stopped = asyncio.run(handler.handle_text("/auto end", chat_id=42))[0]
+                self.assertIn("Auto mode disabled", stopped)
+                release_second.set()
+                jobs = queue.list(chat_id=42, limit=5)
+                second_job = next(job for job in jobs if job.job_id != first_job)
+                queue.wait(second_job.job_id, timeout=2)
+                time.sleep(0.05)
+                self.assertEqual(len(seen), 2)
+            finally:
+                telegram_module.AUTO_CONTINUE_DELAY_SECONDS = old_delay
+
+    def test_auto_human_mode_uses_fail_approval_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            workspace.ensure()
+            task = TaskBoard(workspace).create(title="Human auto task")
+            seen: list[RunRequest] = []
+
+            async def runner(workspace_arg: Workspace, request: RunRequest) -> RunServiceResult:
+                seen.append(request)
+                return RunServiceResult(
+                    session_id="session-human-auto",
+                    final_text="done",
+                    events=[],
+                    agent_id="owner",
+                    adapter="echo",
+                    task_id=request.task or "",
+                )
+
+            queue = TelegramJobQueue(workspace, sender=lambda chat_id, text: None, runner=runner)
+            handler = TelegramCommandHandler(workspace, job_queue=queue)
+
+            asyncio.run(handler.handle_text(f"/use {task.task_id}", chat_id=42))
+            reply = asyncio.run(handler.handle_text("/auto -h start 0.0001", chat_id=42))[0]
+            self.assertIn("approval: human", reply)
+            first_job = re.search(r"Job started: (job-\S+)", reply).group(1)
+            queue.wait(first_job, timeout=2)
+            self.assertEqual(seen[0].approval_mode, "fail")
+
+            status = asyncio.run(handler.handle_text("/auto status", chat_id=42))[0]
+            self.assertIn("approval: human", status)
 
     def test_recent_lists_allow_numeric_task_and_job_selection(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -441,6 +610,15 @@ class TelegramInterfaceTests(unittest.TestCase):
                 os.environ["AGENTDECK_TELEGRAM_ALLOWED_CHATS"] = old_allowed
             if old_token is not None:
                 os.environ["AGENTDECK_TELEGRAM_TOKEN"] = old_token
+
+    def test_telegram_daemon_status_without_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--workspace", str(workspace.root), "telegram", "status"])
+            self.assertEqual(code, 1)
+            self.assertIn("telegram bot: stopped", stdout.getvalue())
 
     def _main(self, args: list[str]) -> str:
         stdout = io.StringIO()
