@@ -70,6 +70,18 @@ class Workspace:
         return self.root / "jobs"
 
     @property
+    def journal_dir(self) -> Path:
+        return self.root / "journal"
+
+    @property
+    def session_state_dir(self) -> Path:
+        return self.root / "session-state"
+
+    @property
+    def project_state_dir(self) -> Path:
+        return self.root / "project-state"
+
+    @property
     def inbox_dir(self) -> Path:
         return self.root / "inbox"
 
@@ -90,6 +102,9 @@ class Workspace:
             self.projects_dir,
             self.approvals_dir,
             self.jobs_dir,
+            self.journal_dir,
+            self.session_state_dir,
+            self.project_state_dir,
             self.inbox_dir,
             self.board_dir,
             self.memory_dir / "user",
@@ -114,5 +129,8 @@ class Workspace:
             "projects": str(self.projects_dir),
             "approvals": str(self.approvals_dir),
             "jobs": str(self.jobs_dir),
+            "journal": str(self.journal_dir),
+            "session_state": str(self.session_state_dir),
+            "project_state": str(self.project_state_dir),
             "memory": str(self.memory_dir),
         }

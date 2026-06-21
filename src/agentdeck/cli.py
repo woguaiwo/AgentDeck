@@ -14,15 +14,19 @@ import time
 from pathlib import Path
 
 from agentdeck.core.config import Workspace
-from agentdeck.core.run_service import RunConfigurationError, RunRequest, run_agent_prompt
+from agentdeck.core.run_service import RunConfigurationError, RunRequest, build_agentdeck_context, run_agent_prompt
 from agentdeck.interfaces.telegram import TelegramBotApi, TelegramServer, config_from_env
 from agentdeck.storage.approvals import APPROVAL_STATUSES, ApprovalRecord, ApprovalRegistry
 from agentdeck.storage.event_log import EventLog
-from agentdeck.storage.agents import AgentRecord, AgentRegistry
+from agentdeck.storage.agents import ASSISTANT_AGENT_ID, DEFAULT_ASSISTANT_TEMPLATE, AgentRecord, AgentRegistry
 from agentdeck.storage.memory import MarkdownMemoryStore
+from agentdeck.storage.progress import ProgressJournal, format_handoff, format_review
 from agentdeck.storage.projects import ProjectRecord, ProjectRegistry
+from agentdeck.storage.project_state import ProjectStateStore
+from agentdeck.storage.session_state import SessionStateStore
 from agentdeck.storage.sessions import SessionRecord, SessionRegistry
 from agentdeck.storage.tasks import TASK_PRIORITIES, TASK_STATUSES, TaskBoard, TaskRecord
+from agentdeck.storage.telegram_bots import TelegramBotRegistry, redacted_token
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -61,6 +65,19 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--no-skip-git-check", action="store_true", help="Do not pass --skip-git-repo-check to Codex")
     run.add_argument("--extra-arg", action="append", default=[], help="Extra raw argument forwarded to the adapter")
 
+    assistant = sub.add_parser("assistant", help="Manage the default AgentDeck assistant")
+    assistant_sub = assistant.add_subparsers(dest="assistant_command", required=True)
+    assistant_setup = assistant_sub.add_parser("setup", help="Create or replace the default assistant agent")
+    assistant_setup.add_argument("--agent", default=ASSISTANT_AGENT_ID)
+    assistant_setup.add_argument("--title", default="AgentDeck Assistant")
+    assistant_setup.add_argument("--adapter", default="echo", choices=["echo", "codex", "codex-exec", "kimi", "kimi-print"])
+    assistant_setup.add_argument("--cwd", default=".", help="Working directory for the assistant")
+    assistant_setup.add_argument("--model")
+    assistant_setup.add_argument("--approval-mode", default="fail", choices=["fail", "record", "bypass"])
+    assistant_setup.add_argument("--replace", action="store_true")
+    assistant_show = assistant_sub.add_parser("show", help="Show the default assistant agent")
+    assistant_show.add_argument("--agent", default=ASSISTANT_AGENT_ID)
+
     memory = sub.add_parser("memory", help="Manage markdown memory")
     mem_sub = memory.add_subparsers(dest="memory_command", required=True)
     mem_add = mem_sub.add_parser("add", help="Add a memory entry")
@@ -68,9 +85,25 @@ def build_parser() -> argparse.ArgumentParser:
     mem_add.add_argument("content")
     mem_add.add_argument("--scope", default="project", choices=["user", "project", "team", "agent", "task"])
     mem_add.add_argument("--owner")
+    mem_add.add_argument("--pin", action="store_true", help="Prioritize this memory in retrieval")
     mem_list = mem_sub.add_parser("list", help="List memory entries")
     mem_list.add_argument("--scope", default="project", choices=["user", "project", "team", "agent", "task"])
     mem_list.add_argument("--owner")
+    mem_disable = mem_sub.add_parser("disable", help="Soft-disable a memory entry")
+    mem_disable.add_argument("memory")
+    mem_disable.add_argument("--scope", choices=["user", "project", "team", "agent", "task"])
+    mem_disable.add_argument("--owner")
+    mem_enable = mem_sub.add_parser("enable", help="Re-enable a soft-disabled memory entry")
+    mem_enable.add_argument("memory")
+    mem_enable.add_argument("--scope", choices=["user", "project", "team", "agent", "task"])
+    mem_enable.add_argument("--owner")
+    mem_compact_task = mem_sub.add_parser("compact-task", help="Create a durable memory snapshot from one task context")
+    mem_compact_task.add_argument("task")
+    mem_compact_task.add_argument("--scope", default="project", choices=["project", "team", "agent", "task"])
+    mem_compact_task.add_argument("--owner")
+    mem_compact_task.add_argument("--title")
+    mem_compact_task.add_argument("--max-chars", type=int, default=6000)
+    mem_compact_task.add_argument("--pin", action="store_true", help="Prioritize this snapshot in retrieval")
 
     events = sub.add_parser("events", help="Inspect event log")
     events.add_argument("--tail", type=int, default=20)
@@ -97,6 +130,8 @@ def build_parser() -> argparse.ArgumentParser:
     sess_list.add_argument("--agent")
     sess_show = sess_sub.add_parser("show", help="Show one session as JSON")
     sess_show.add_argument("session")
+    sess_state = sess_sub.add_parser("state", help="Show one session state card as JSON")
+    sess_state.add_argument("session")
     sess_rename = sess_sub.add_parser("rename", help="Rename one session")
     sess_rename.add_argument("session")
     sess_rename.add_argument("title")
@@ -124,6 +159,10 @@ def build_parser() -> argparse.ArgumentParser:
     agent_list.add_argument("--role")
     agent_show = agent_sub.add_parser("show", help="Show one agent as JSON")
     agent_show.add_argument("agent")
+    agent_template = agent_sub.add_parser("template", help="Set or clear one agent role template")
+    agent_template.add_argument("agent")
+    agent_template.add_argument("--prompt", action="append", default=[], help="Template guidance line. Can be repeated.")
+    agent_template.add_argument("--clear", action="store_true", help="Clear custom template and use the default for the role")
 
     projects = sub.add_parser("projects", help="Manage projects")
     project_sub = projects.add_subparsers(dest="projects_command", required=True)
@@ -140,6 +179,28 @@ def build_parser() -> argparse.ArgumentParser:
     project_list.add_argument("--status")
     project_show = project_sub.add_parser("show", help="Show one project as JSON")
     project_show.add_argument("project")
+    project_state = project_sub.add_parser("state", help="Show one project state card as JSON")
+    project_state.add_argument("project")
+    project_update_state = project_sub.add_parser("update-state", help="Create or update one project state card")
+    project_update_state.add_argument("project")
+    project_update_state.add_argument("--goal")
+    project_update_state.add_argument("--phase")
+    project_update_state.add_argument("--focus")
+    project_update_state.add_argument("--next", dest="next_steps", action="append")
+    project_update_state.add_argument("--constraint", dest="constraints", action="append")
+    project_update_state.add_argument("--blocker", dest="blockers", action="append")
+    project_update_state.add_argument("--artifact", dest="artifacts", action="append")
+    project_update_state.add_argument("--by", dest="updated_by")
+    project_decide = project_sub.add_parser("decide", help="Append one project decision")
+    project_decide.add_argument("project")
+    project_decide.add_argument("decision")
+    project_decide.add_argument("--reason", default="")
+    project_decide.add_argument("--impact", default="")
+    project_decide.add_argument("--alternative", dest="alternatives", action="append", default=[])
+    project_decide.add_argument("--by", dest="made_by", default="")
+    project_decisions = project_sub.add_parser("decisions", help="List recent project decisions")
+    project_decisions.add_argument("project")
+    project_decisions.add_argument("--limit", type=int, default=10)
 
     tasks = sub.add_parser("tasks", help="Manage task board")
     task_sub = tasks.add_subparsers(dest="tasks_command", required=True)
@@ -157,9 +218,46 @@ def build_parser() -> argparse.ArgumentParser:
     task_list.add_argument("--status", choices=sorted(TASK_STATUSES))
     task_show = task_sub.add_parser("show", help="Show one task as JSON")
     task_show.add_argument("task")
+    task_context = task_sub.add_parser("context", help="Show the AgentDeck context injected for one task")
+    task_context.add_argument("task")
+    task_context.add_argument("--session", help="Session id; defaults to the task's attached session")
+    task_handoffs = task_sub.add_parser("handoffs", help="List recent handoffs for one task")
+    task_handoffs.add_argument("task")
+    task_handoffs.add_argument("--limit", type=int, default=5)
+    task_reviews = task_sub.add_parser("reviews", help="List recent manager reviews for one task")
+    task_reviews.add_argument("task")
+    task_reviews.add_argument("--limit", type=int, default=5)
     task_note = task_sub.add_parser("note", help="Append a task note")
     task_note.add_argument("task")
     task_note.add_argument("note")
+    task_handoff = task_sub.add_parser("handoff", help="Append a structured handoff and update session state")
+    task_handoff.add_argument("task")
+    task_handoff.add_argument("--summary", required=True)
+    task_handoff.add_argument("--completed", action="append", default=[])
+    task_handoff.add_argument("--verified", action="append", default=[])
+    task_handoff.add_argument("--next", dest="next_steps", action="append", default=[])
+    task_handoff.add_argument("--blocker", dest="blockers", action="append", default=[])
+    task_handoff.add_argument("--decision", dest="decisions", action="append", default=[])
+    task_handoff.add_argument("--artifact", dest="artifacts", action="append", default=[])
+    task_handoff.add_argument("--session", help="Session id; defaults to the task's attached session")
+    task_handoff.add_argument("--agent", help="Agent id; defaults to the task owner")
+    task_manager_review = task_sub.add_parser(
+        "manager-review",
+        help="Append a structured manager review and update session state",
+    )
+    task_manager_review.add_argument("task")
+    task_manager_review.add_argument("--summary", required=True)
+    task_manager_review.add_argument(
+        "--status",
+        choices=["noted", "approved", "changes-requested", "blocked"],
+        default="noted",
+    )
+    task_manager_review.add_argument("--next", dest="next_steps", action="append", default=[])
+    task_manager_review.add_argument("--blocker", dest="blockers", action="append", default=[])
+    task_manager_review.add_argument("--decision", dest="decisions", action="append", default=[])
+    task_manager_review.add_argument("--artifact", dest="artifacts", action="append", default=[])
+    task_manager_review.add_argument("--session", help="Session id; defaults to the task's attached session")
+    task_manager_review.add_argument("--reviewer", default="manager")
     task_start = task_sub.add_parser("start", help="Mark a task as doing")
     task_start.add_argument("task")
     task_done = task_sub.add_parser("done", help="Mark a task as done")
@@ -179,6 +277,7 @@ def build_parser() -> argparse.ArgumentParser:
     telegram = sub.add_parser("telegram", help="Run Telegram remote interface")
     telegram_sub = telegram.add_subparsers(dest="telegram_command", required=True)
     telegram_serve = telegram_sub.add_parser("serve", help="Start Telegram long-polling bot")
+    telegram_serve.add_argument("--bot", help="Saved bot id from telegram bots registry")
     telegram_serve.add_argument("--token", help="Telegram bot token; defaults to AGENTDECK_TELEGRAM_TOKEN")
     telegram_serve.add_argument(
         "--allowed-chat-id",
@@ -189,6 +288,7 @@ def build_parser() -> argparse.ArgumentParser:
     telegram_serve.add_argument("--poll-timeout", type=int, default=30)
     telegram_serve.add_argument("--once", action="store_true", help="Process one polling response and exit")
     telegram_start = telegram_sub.add_parser("start", help="Start Telegram bot as a detached background process")
+    telegram_start.add_argument("--bot", help="Saved bot id from telegram bots registry")
     telegram_start.add_argument("--token", help="Telegram bot token; defaults to AGENTDECK_TELEGRAM_TOKEN")
     telegram_start.add_argument(
         "--allowed-chat-id",
@@ -200,6 +300,16 @@ def build_parser() -> argparse.ArgumentParser:
     telegram_stop = telegram_sub.add_parser("stop", help="Stop detached Telegram bot")
     telegram_stop.add_argument("--force", action="store_true", help="Send SIGKILL if SIGTERM does not stop the bot")
     telegram_sub.add_parser("status", help="Show detached Telegram bot status")
+    telegram_bots = telegram_sub.add_parser("bots", help="Manage saved Telegram bot configs")
+    telegram_bots_sub = telegram_bots.add_subparsers(dest="telegram_bots_command", required=True)
+    telegram_bots_add = telegram_bots_sub.add_parser("add", help="Add or replace one saved Telegram bot")
+    telegram_bots_add.add_argument("bot_id")
+    telegram_bots_add.add_argument("--title", default="")
+    telegram_bots_add.add_argument("--token", required=True)
+    telegram_bots_add.add_argument("--allowed-chat-id", action="append", default=[])
+    telegram_bots_import = telegram_bots_sub.add_parser("import", help="Import bot configs from TOML or loose text")
+    telegram_bots_import.add_argument("path")
+    telegram_bots_sub.add_parser("list", help="List saved Telegram bots")
 
     return parser
 
@@ -262,11 +372,24 @@ def main(argv: list[str] | None = None) -> int:
         workspace.ensure()
         return asyncio.run(_run_prompt(args, workspace))
 
+    if args.command == "assistant":
+        workspace.ensure()
+        registry = AgentRegistry(workspace)
+        if args.assistant_command == "setup":
+            return _setup_assistant(registry, args)
+        if args.assistant_command == "show":
+            record = registry.resolve(args.agent)
+            if record is None:
+                print(f"assistant not configured: {args.agent}", file=sys.stderr)
+                return 2
+            print(json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+
     if args.command == "memory":
         workspace.ensure()
         store = MarkdownMemoryStore(workspace)
         if args.memory_command == "add":
-            entry = store.add(args.title, args.content, scope=args.scope, owner=args.owner)
+            entry = store.add(args.title, args.content, scope=args.scope, owner=args.owner, pinned=args.pin)
             print(f"added: {entry.path}")
             return 0
         if args.memory_command == "list":
@@ -274,6 +397,12 @@ def main(argv: list[str] | None = None) -> int:
             for path in paths:
                 print(path)
             return 0
+        if args.memory_command == "disable":
+            return _set_memory_disabled(store, args.memory, disabled=True, scope=args.scope, owner=args.owner)
+        if args.memory_command == "enable":
+            return _set_memory_disabled(store, args.memory, disabled=False, scope=args.scope, owner=args.owner)
+        if args.memory_command == "compact-task":
+            return _compact_task_memory(workspace, args)
 
     if args.command == "events":
         workspace.ensure()
@@ -318,6 +447,13 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"session not found: {args.session}", file=sys.stderr)
                 return 2
             print(json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+        if args.sessions_command == "state":
+            card = SessionStateStore(workspace).get(args.session)
+            if card is None:
+                print(f"session state not found: {args.session}", file=sys.stderr)
+                return 2
+            print(json.dumps(card.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
             return 0
         if args.sessions_command == "rename":
             record = registry.rename(args.session, args.title)
@@ -370,6 +506,8 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             print(json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
             return 0
+        if args.agents_command == "template":
+            return _set_agent_template(registry, args.agent, prompts=args.prompt, clear=args.clear)
 
     if args.command == "projects":
         workspace.ensure()
@@ -400,6 +538,14 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             print(json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
             return 0
+        if args.projects_command == "state":
+            return _print_project_state(workspace, registry, args.project)
+        if args.projects_command == "update-state":
+            return _update_project_state(workspace, registry, args)
+        if args.projects_command == "decide":
+            return _record_project_decision(workspace, registry, args)
+        if args.projects_command == "decisions":
+            return _print_project_decisions(workspace, registry, args.project, limit=args.limit)
 
     if args.command == "tasks":
         workspace.ensure()
@@ -435,8 +581,18 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             print(json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
             return 0
+        if args.tasks_command == "context":
+            return _print_task_context(workspace, board, args.task, session_id=args.session or "")
+        if args.tasks_command == "handoffs":
+            return _print_task_handoffs(workspace, board, args.task, limit=args.limit)
+        if args.tasks_command == "reviews":
+            return _print_task_reviews(workspace, board, args.task, limit=args.limit)
         if args.tasks_command == "note":
             return _update_task_note(board, args.task, args.note)
+        if args.tasks_command == "handoff":
+            return _record_task_handoff(workspace, board, args)
+        if args.tasks_command == "manager-review":
+            return _record_manager_review(workspace, board, args)
         if args.tasks_command == "start":
             return _update_task_status(board, args.task, "doing")
         if args.tasks_command == "done":
@@ -451,16 +607,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "telegram":
         workspace.ensure()
         if args.telegram_command == "serve":
-            config = config_from_env(
-                token=args.token,
-                allowed_chat_ids=args.allowed_chat_id,
-                poll_timeout=args.poll_timeout,
-            )
+            config = _telegram_config_from_args(args, workspace)
             if not config.token:
                 print("missing Telegram token; set AGENTDECK_TELEGRAM_TOKEN or pass --token", file=sys.stderr)
                 return 2
             TelegramServer(workspace, TelegramBotApi(config.token), config).serve_forever(once=args.once)
             return 0
+        if args.telegram_command == "bots":
+            return _telegram_bots(args, workspace)
         if args.telegram_command == "start":
             return _telegram_start(args, workspace)
         if args.telegram_command == "stop":
@@ -473,11 +627,7 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _telegram_start(args: argparse.Namespace, workspace: Workspace) -> int:
-    config = config_from_env(
-        token=args.token,
-        allowed_chat_ids=args.allowed_chat_id,
-        poll_timeout=args.poll_timeout,
-    )
+    config = _telegram_config_from_args(args, workspace)
     if not config.token:
         print("missing Telegram token; set AGENTDECK_TELEGRAM_TOKEN or pass --token", file=sys.stderr)
         return 2
@@ -522,6 +672,54 @@ def _telegram_start(args: argparse.Namespace, workspace: Workspace) -> int:
     print(f"workspace: {workspace.root}")
     print(f"log: {log_path}")
     return 0
+
+
+def _telegram_config_from_args(args: argparse.Namespace, workspace: Workspace):
+    token = getattr(args, "token", None)
+    allowed = list(getattr(args, "allowed_chat_id", []) or [])
+    bot_id = getattr(args, "bot", "") or ""
+    if bot_id:
+        bot = TelegramBotRegistry(workspace).get(bot_id)
+        if bot is None:
+            print(f"telegram bot not found: {bot_id}", file=sys.stderr)
+            return config_from_env(token="", allowed_chat_ids=[], poll_timeout=args.poll_timeout)
+        token = token or bot.token
+        if not allowed:
+            allowed = [str(chat_id) for chat_id in bot.allowed_chat_ids]
+    return config_from_env(token=token, allowed_chat_ids=allowed, poll_timeout=args.poll_timeout)
+
+
+def _telegram_bots(args: argparse.Namespace, workspace: Workspace) -> int:
+    registry = TelegramBotRegistry(workspace)
+    if args.telegram_bots_command == "add":
+        record = registry.upsert(
+            bot_id=args.bot_id,
+            title=args.title,
+            token=args.token,
+            allowed_chat_ids=[int(value) for value in args.allowed_chat_id if str(value).strip().lstrip("-").isdigit()],
+            source="cli",
+        )
+        print(f"bot: {record.title} ({record.bot_id})")
+        print(f"token: {redacted_token(record.token)}")
+        if record.allowed_chat_ids:
+            print("allowed_chat_ids: " + ", ".join(str(value) for value in record.allowed_chat_ids))
+        return 0
+    if args.telegram_bots_command == "import":
+        records = registry.import_file(args.path)
+        print(f"imported: {len(records)}")
+        for record in records:
+            print(f"- {record.title} ({record.bot_id}) token={redacted_token(record.token)}")
+        return 0
+    if args.telegram_bots_command == "list":
+        records = registry.list()
+        if not records:
+            print("no telegram bots")
+            return 0
+        for record in records:
+            chats = ",".join(str(value) for value in record.allowed_chat_ids) or "-"
+            print(f"{record.bot_id}\t{record.title}\t{redacted_token(record.token)}\tchats={chats}")
+        return 0
+    return 2
 
 
 def _telegram_stop(args: argparse.Namespace, workspace: Workspace) -> int:
@@ -692,6 +890,85 @@ def _print_projects(records: list[ProjectRecord]) -> None:
         )
 
 
+def _print_project_state(workspace: Workspace, registry: ProjectRegistry, project: str) -> int:
+    record = registry.resolve(project)
+    if record is None:
+        print(f"project not found: {project}", file=sys.stderr)
+        return 2
+    state = ProjectStateStore(workspace).get(record.project_id)
+    if state is None:
+        print(f"project state not found: {record.project_id}", file=sys.stderr)
+        return 2
+    print(json.dumps(state.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
+
+
+def _update_project_state(workspace: Workspace, registry: ProjectRegistry, args: argparse.Namespace) -> int:
+    record = registry.resolve(args.project)
+    if record is None:
+        print(f"project not found: {args.project}", file=sys.stderr)
+        return 2
+    state = ProjectStateStore(workspace).update(
+        record.project_id,
+        goal=args.goal,
+        phase=args.phase,
+        current_focus=args.focus,
+        next_steps=args.next_steps,
+        constraints=args.constraints,
+        blockers=args.blockers,
+        active_artifacts=args.artifacts,
+        updated_by=args.updated_by or "",
+    )
+    print(f"project_state: {record.title} ({state.project_id})")
+    if state.current_focus:
+        print(f"focus: {state.current_focus}")
+    if state.next_steps:
+        print(f"next: {state.next_steps[0]}")
+    return 0
+
+
+def _record_project_decision(workspace: Workspace, registry: ProjectRegistry, args: argparse.Namespace) -> int:
+    record = registry.resolve(args.project)
+    if record is None:
+        print(f"project not found: {args.project}", file=sys.stderr)
+        return 2
+    try:
+        decision = ProjectStateStore(workspace).add_decision(
+            record.project_id,
+            args.decision,
+            reason=args.reason,
+            impact=args.impact,
+            alternatives=args.alternatives,
+            made_by=args.made_by,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print(f"decision: {decision.decision_id}")
+    print(f"project: {record.title} ({record.project_id})")
+    print(f"text: {decision.decision}")
+    return 0
+
+
+def _print_project_decisions(workspace: Workspace, registry: ProjectRegistry, project: str, *, limit: int = 10) -> int:
+    record = registry.resolve(project)
+    if record is None:
+        print(f"project not found: {project}", file=sys.stderr)
+        return 2
+    decisions = ProjectStateStore(workspace).decisions(record.project_id, limit=limit)
+    if not decisions:
+        print(f"no decisions for project: {record.title} ({record.project_id})")
+        return 0
+    print(f"decisions for: {record.title} ({record.project_id})")
+    for decision in decisions:
+        print(f"- {decision.decision}")
+        if decision.reason:
+            print(f"  reason: {decision.reason}")
+        if decision.impact:
+            print(f"  impact: {decision.impact}")
+    return 0
+
+
 def _print_agents(records: list[AgentRecord]) -> None:
     if not records:
         print("no agents")
@@ -735,6 +1012,133 @@ def _print_tasks(records: list[TaskRecord]) -> None:
         )
 
 
+def _setup_assistant(registry: AgentRegistry, args: argparse.Namespace) -> int:
+    try:
+        record = registry.upsert(
+            agent_id=args.agent,
+            title=args.title,
+            project_id="",
+            role="manager",
+            team_id="agentdeck",
+            adapter=args.adapter,
+            project_dir=args.cwd,
+            model=args.model or "",
+            approval_mode=args.approval_mode,
+            replace=args.replace,
+        )
+        record = registry.set_role_template(record.agent_id, DEFAULT_ASSISTANT_TEMPLATE)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print(f"assistant: {record.title} ({record.agent_id})")
+    print(f"adapter: {record.adapter}")
+    print(f"cwd: {record.project_dir}")
+    return 0
+
+
+def _set_agent_template(registry: AgentRegistry, agent: str, *, prompts: list[str], clear: bool) -> int:
+    if clear:
+        template = ""
+    else:
+        template = "\n".join(prompt for prompt in prompts if prompt.strip())
+        if not template.strip():
+            print("missing template prompt; pass --prompt or --clear", file=sys.stderr)
+            return 2
+    try:
+        record = registry.set_role_template(agent, template)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if clear:
+        print(f"agent template cleared: {record.title} ({record.agent_id})")
+    else:
+        print(f"agent template set: {record.title} ({record.agent_id})")
+        print(str(record.metadata.get("role_template") or ""))
+    return 0
+
+
+def _set_memory_disabled(
+    store: MarkdownMemoryStore,
+    memory: str,
+    *,
+    disabled: bool,
+    scope: str | None,
+    owner: str | None,
+) -> int:
+    try:
+        document = store.set_disabled(memory, disabled=disabled, scope=scope, owner=owner)  # type: ignore[arg-type]
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    state = "disabled" if disabled else "enabled"
+    print(f"memory {state}: {document.title}")
+    print(f"id: {document.memory_id}")
+    print(f"path: {document.path}")
+    return 0
+
+
+def _compact_task_memory(workspace: Workspace, args: argparse.Namespace) -> int:
+    board = TaskBoard(workspace)
+    task = board.resolve(args.task)
+    if task is None:
+        print(f"task not found: {args.task}", file=sys.stderr)
+        return 2
+    context = build_agentdeck_context(
+        workspace,
+        task=task,
+        session_id=task.session_id,
+        max_chars=max(args.max_chars, 500),
+        include_memories=False,
+    )
+    if not context:
+        print(f"no task context to compact: {task.title} ({task.task_id})")
+        return 0
+
+    owner = args.owner or _default_memory_owner(args.scope, task)
+    title = args.title or f"{task.title} context snapshot"
+    content = "\n".join(
+        [
+            f"# {title}",
+            "",
+            "This memory was generated from structured AgentDeck state, not a raw chat transcript.",
+            "",
+            context,
+        ]
+    )
+    try:
+        entry = MarkdownMemoryStore(workspace).add(
+            title,
+            content,
+            scope=args.scope,
+            owner=owner,
+            memory_type="task-context",
+            source="agentdeck-context",
+            pinned=args.pin,
+            tags=["agentdeck", "task-context"],
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print(f"memory: {entry.memory_id}")
+    print(f"path: {entry.path}")
+    print(f"scope: {args.scope}")
+    if owner:
+        print(f"owner: {owner}")
+    return 0
+
+
+def _default_memory_owner(scope: str, task: TaskRecord) -> str:
+    if scope == "project":
+        return task.project_id
+    if scope == "team":
+        return task.team_id
+    if scope == "agent":
+        return task.agent_id
+    if scope == "task":
+        return task.task_id
+    return ""
+
+
 def _update_task_status(board: TaskBoard, task: str, status: str, *, note: str = "") -> int:
     try:
         record = board.set_status(task, status, note=note)
@@ -754,6 +1158,145 @@ def _update_task_note(board: TaskBoard, task: str, note: str) -> int:
         print(f"task not found: {task}", file=sys.stderr)
         return 2
     print(f"task: {record.title} ({record.task_id}) notes={len(record.notes)}")
+    return 0
+
+
+def _print_task_context(workspace: Workspace, board: TaskBoard, task: str, *, session_id: str = "") -> int:
+    record = board.resolve(task)
+    if record is None:
+        print(f"task not found: {task}", file=sys.stderr)
+        return 2
+    context = build_agentdeck_context(
+        workspace,
+        task=record,
+        session_id=session_id or record.session_id,
+        max_chars=8000,
+    )
+    if not context:
+        print(f"no AgentDeck context for task: {record.title} ({record.task_id})")
+        return 0
+    print(context)
+    return 0
+
+
+def _print_task_handoffs(workspace: Workspace, board: TaskBoard, task: str, *, limit: int = 5) -> int:
+    record = board.resolve(task)
+    if record is None:
+        print(f"task not found: {task}", file=sys.stderr)
+        return 2
+    entries = ProgressJournal(workspace).list(kind="handoff", task_id=record.task_id, limit=max(limit, 0))
+    if not entries:
+        print(f"no handoffs for task: {record.title} ({record.task_id})")
+        return 0
+    print(f"handoffs for: {record.title} ({record.task_id})")
+    for entry in entries:
+        print(f"- {entry.summary}")
+        if entry.next_steps:
+            print(f"  next: {entry.next_steps[0]}")
+        if entry.blockers:
+            print(f"  blocker: {entry.blockers[0]}")
+        if entry.decisions:
+            print(f"  decision: {entry.decisions[0]}")
+    return 0
+
+
+def _print_task_reviews(workspace: Workspace, board: TaskBoard, task: str, *, limit: int = 5) -> int:
+    record = board.resolve(task)
+    if record is None:
+        print(f"task not found: {task}", file=sys.stderr)
+        return 2
+    entries = ProgressJournal(workspace).list(kind="manager-review", task_id=record.task_id, limit=max(limit, 0))
+    if not entries:
+        print(f"no manager reviews for task: {record.title} ({record.task_id})")
+        return 0
+    print(f"manager reviews for: {record.title} ({record.task_id})")
+    for entry in entries:
+        status = str(entry.metadata.get("status") or "").strip()
+        prefix = f"{status}: " if status else ""
+        print(f"- {prefix}{entry.summary}")
+        if entry.next_steps:
+            print(f"  next: {entry.next_steps[0]}")
+        if entry.blockers:
+            print(f"  blocker: {entry.blockers[0]}")
+        if entry.decisions:
+            print(f"  decision: {entry.decisions[0]}")
+    return 0
+
+
+def _record_task_handoff(workspace: Workspace, board: TaskBoard, args: argparse.Namespace) -> int:
+    task = board.resolve(args.task)
+    if task is None:
+        print(f"task not found: {args.task}", file=sys.stderr)
+        return 2
+    session_id = (args.session or task.session_id or "").strip()
+    agent_id = (args.agent or task.agent_id or "").strip()
+    try:
+        entry = ProgressJournal(workspace).append(
+            kind="handoff",
+            summary=args.summary,
+            project_id=task.project_id,
+            task_id=task.task_id,
+            session_id=session_id,
+            agent_id=agent_id,
+            completed=args.completed,
+            verified=args.verified,
+            next_steps=args.next_steps,
+            blockers=args.blockers,
+            decisions=args.decisions,
+            artifacts=args.artifacts,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    note_record = board.add_note(task.task_id, format_handoff(entry), kind="handoff")
+    if session_id:
+        objective = task.description or task.title
+        SessionStateStore(workspace).upsert_from_progress(entry, objective=objective)
+
+    notes_count = len(note_record.notes) if note_record is not None else 0
+    print(f"handoff: {entry.entry_id}")
+    print(f"task: {task.title} ({task.task_id}) notes={notes_count}")
+    if session_id:
+        print(f"session_state: {session_id}")
+    return 0
+
+
+def _record_manager_review(workspace: Workspace, board: TaskBoard, args: argparse.Namespace) -> int:
+    task = board.resolve(args.task)
+    if task is None:
+        print(f"task not found: {args.task}", file=sys.stderr)
+        return 2
+    session_id = (args.session or task.session_id or "").strip()
+    reviewer = (args.reviewer or "manager").strip()
+    try:
+        entry = ProgressJournal(workspace).append(
+            kind="manager-review",
+            summary=args.summary,
+            project_id=task.project_id,
+            task_id=task.task_id,
+            session_id=session_id,
+            agent_id=reviewer,
+            next_steps=args.next_steps,
+            blockers=args.blockers,
+            decisions=args.decisions,
+            artifacts=args.artifacts,
+            metadata={"status": args.status, "reviewer": reviewer},
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    note_record = board.add_note(task.task_id, format_review(entry), kind="manager-review")
+    if session_id:
+        objective = task.description or task.title
+        SessionStateStore(workspace).upsert_from_progress(entry, objective=objective)
+
+    notes_count = len(note_record.notes) if note_record is not None else 0
+    print(f"manager_review: {entry.entry_id}")
+    print(f"task: {task.title} ({task.task_id}) notes={notes_count}")
+    if session_id:
+        print(f"session_state: {session_id}")
     return 0
 
 

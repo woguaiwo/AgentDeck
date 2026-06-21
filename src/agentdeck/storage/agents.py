@@ -12,6 +12,44 @@ from typing import Any
 from agentdeck.core.config import Workspace
 
 
+ROLE_TEMPLATE_METADATA_KEY = "role_template"
+
+ASSISTANT_AGENT_ID = "assistant"
+
+DEFAULT_ASSISTANT_TEMPLATE = (
+    "You are the user's AgentDeck assistant. Before a project or task is selected, "
+    "help route the user to the right project, agent, and task. Prefer concise questions when information is missing. "
+    "When useful, suggest exact AgentDeck or Telegram commands. You may help create projects, agents, tasks, and bot bindings, "
+    "but do not expose secrets such as bot tokens. Keep responses suitable for a phone chat."
+)
+
+DEFAULT_ROLE_TEMPLATES: dict[str, str] = {
+    "owner": (
+        "Coordinate the current task end to end. Keep project state, task handoffs, "
+        "and durable memory current when important progress or decisions happen."
+    ),
+    "manager": (
+        "Own direction and review. Keep the goal, constraints, and next step clear; "
+        "record decisions and manager reviews; avoid doing broad executor work unless it is necessary to unblock the team."
+    ),
+    "planner": (
+        "Break goals into small executable tasks, update project state, and call out sequencing, dependencies, and risks."
+    ),
+    "executor": (
+        "Implement the next scoped step, verify the result, and record a concise handoff with completed work, evidence, blockers, and next steps."
+    ),
+    "developer": (
+        "Make narrow code changes for the active task, follow existing project patterns, run relevant tests, and record a concise handoff."
+    ),
+    "tester": (
+        "Verify behavior with focused tests or inspection, report evidence clearly, and avoid unrelated implementation changes."
+    ),
+    "reviewer": (
+        "Review for correctness, regressions, missing tests, and task alignment; record requested changes or approval as a manager review."
+    ),
+}
+
+
 @dataclass
 class AgentRecord:
     """Saved defaults for one project agent."""
@@ -145,6 +183,21 @@ class AgentRegistry:
             records = [record for record in records if record.role == _normalize_token(role)]
         return sorted(records, key=lambda item: (item.project_id, item.team_id, item.role, item.agent_id))
 
+    def set_role_template(self, agent: str, template: str) -> AgentRecord:
+        records = self._read()
+        record = self.resolve(agent)
+        if record is None:
+            raise ValueError(f"agent not found: {agent}")
+        clean = _clean_multiline(template)
+        if clean:
+            record.metadata[ROLE_TEMPLATE_METADATA_KEY] = clean
+        else:
+            record.metadata.pop(ROLE_TEMPLATE_METADATA_KEY, None)
+        record.updated_at = time.time()
+        records[record.agent_id] = record
+        self._write(records)
+        return record
+
     def _read(self) -> dict[str, AgentRecord]:
         if not self.path.exists():
             return {}
@@ -201,3 +254,15 @@ def _title_from_id(value: str) -> str:
 
 def _clean_title(value: str) -> str:
     return " ".join(value.strip().split())
+
+
+def _clean_multiline(value: str) -> str:
+    lines = [" ".join(line.strip().split()) for line in value.splitlines()]
+    return "\n".join(line for line in lines if line)
+
+
+def role_template_for_agent(record: AgentRecord) -> str:
+    explicit = str(record.metadata.get(ROLE_TEMPLATE_METADATA_KEY) or "").strip()
+    if explicit:
+        return explicit
+    return DEFAULT_ROLE_TEMPLATES.get(record.role, "")

@@ -23,6 +23,9 @@ from agentdeck.core.config import Workspace
 from agentdeck.core.events import AgentEvent, EventKind
 
 
+SUBPROCESS_STREAM_LIMIT = 8 * 1024 * 1024
+
+
 @dataclass(frozen=True)
 class CodexExecAdapter:
     """Run Codex through the non-interactive ``codex exec`` surface."""
@@ -78,6 +81,7 @@ class CodexExecAdapter:
                 stdin=subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=SUBPROCESS_STREAM_LIMIT,
             )
             cancel_task = asyncio.create_task(_terminate_on_cancel(process, cancellation))
 

@@ -16,9 +16,12 @@ from agentdeck.core.events import AgentEvent, EventKind
 from agentdeck.core.run_service import RunRequest, RunServiceResult
 from agentdeck.interfaces.telegram import TelegramCommandHandler, TelegramJobQueue, config_from_env, split_message
 from agentdeck.storage.approvals import ApprovalRegistry
-from agentdeck.storage.agents import AgentRegistry
+from agentdeck.storage.agents import DEFAULT_ASSISTANT_TEMPLATE, AgentRegistry, role_template_for_agent
 from agentdeck.storage.jobs import JobRegistry
+from agentdeck.storage.progress import ProgressJournal
 from agentdeck.storage.projects import ProjectRegistry
+from agentdeck.storage.project_state import ProjectStateStore
+from agentdeck.storage.session_state import SessionStateCard, SessionStateStore
 from agentdeck.storage.sessions import SessionRegistry
 from agentdeck.storage.tasks import TaskBoard
 
@@ -225,7 +228,7 @@ class TelegramInterfaceTests(unittest.TestCase):
             workspace = Workspace(tmp / ".agentdeck")
             project = tmp / "project"
             project.mkdir()
-            seen: list[tuple[str, str]] = []
+            seen: list[tuple[str, str, str]] = []
             sent: list[tuple[int, str]] = []
 
             self._main(["--workspace", str(workspace.root), "projects", "create", "proj", "--title", "Project One", "--cwd", str(project)])
@@ -234,7 +237,7 @@ class TelegramInterfaceTests(unittest.TestCase):
             task_id = re.search(r"\((task-[^)]+)\)", task_out).group(1)
 
             async def runner(workspace_arg: Workspace, request: RunRequest) -> RunServiceResult:
-                seen.append((request.task or "", request.prompt))
+                seen.append((request.task or "", request.prompt, request.agent or ""))
                 return RunServiceResult(
                     session_id="session-current",
                     final_text=f"done: {request.prompt}",
@@ -259,11 +262,205 @@ class TelegramInterfaceTests(unittest.TestCase):
             job_id = re.search(r"Job started: (job-\S+)", reply).group(1)
             job = queue.wait(job_id, timeout=2)
             assert job is not None
-            self.assertEqual(seen, [(task_id, "continue without ids")])
+            self.assertEqual(seen, [(task_id, "continue without ids", "")])
 
             latest = asyncio.run(handler.handle_text("/job", chat_id=42))[0]
             self.assertIn(f"Job: {job_id}", latest)
             self.assertIn("done: continue without ids", latest)
+
+    def test_plain_text_runs_current_task_or_shows_connection_hint(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            project = tmp / "project"
+            project.mkdir()
+            seen: list[tuple[str, str, str]] = []
+
+            self._main(["--workspace", str(workspace.root), "projects", "create", "proj", "--title", "Project One", "--cwd", str(project)])
+            self._main(["--workspace", str(workspace.root), "agents", "create", "owner", "--project", "proj", "--adapter", "echo"])
+            task_out = self._main(["--workspace", str(workspace.root), "tasks", "create", "Plain text task", "--project", "proj"])
+            task_id = re.search(r"\((task-[^)]+)\)", task_out).group(1)
+
+            async def runner(workspace_arg: Workspace, request: RunRequest) -> RunServiceResult:
+                seen.append((request.task or "", request.prompt, request.agent or ""))
+                return RunServiceResult(
+                    session_id="session-plain",
+                    final_text=f"done: {request.prompt}",
+                    events=[],
+                    agent_id="owner",
+                    adapter="echo",
+                    task_id=request.task or "",
+                )
+
+            queue = TelegramJobQueue(workspace, sender=lambda chat_id, text: None, runner=runner)
+            handler = TelegramCommandHandler(workspace, job_queue=queue)
+
+            hint = asyncio.run(handler.handle_text("continue before selecting", chat_id=42))[0]
+            self.assertIn("No current task is selected", hint)
+            self.assertEqual(seen, [])
+
+            AgentRegistry(workspace).upsert(
+                agent_id="assistant",
+                title="AgentDeck Assistant",
+                role="manager",
+                adapter="echo",
+                project_dir=str(tmp),
+                replace=False,
+            )
+            AgentRegistry(workspace).set_role_template("assistant", DEFAULT_ASSISTANT_TEMPLATE)
+            assistant_reply = asyncio.run(handler.handle_text("help me choose a project", chat_id=42))[0]
+            self.assertIn("Assistant job started:", assistant_reply)
+            assistant_job = re.search(r"Assistant job started: (job-\S+)", assistant_reply).group(1)
+            queue.wait(assistant_job, timeout=2)
+            self.assertEqual(seen, [("", "help me choose a project", "assistant")])
+
+            unknown = asyncio.run(handler.handle_text("/definitely_unknown", chat_id=42))[0]
+            self.assertIn("Unknown command", unknown)
+            self.assertEqual(seen, [("", "help me choose a project", "assistant")])
+
+            asyncio.run(handler.handle_text(f"/use {task_id}", chat_id=42))
+            reply = asyncio.run(handler.handle_text("continue as plain text", chat_id=42))[0]
+            self.assertIn("Job started:", reply)
+            job_id = re.search(r"Job started: (job-\S+)", reply).group(1)
+            queue.wait(job_id, timeout=2)
+            self.assertEqual(seen, [("", "help me choose a project", "assistant"), (task_id, "continue as plain text", "")])
+
+    def test_context_and_handoffs_show_current_task_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            workspace.ensure()
+            task = TaskBoard(workspace).create(
+                title="Memory task",
+                description="Keep the executor aligned",
+                project_id="proj",
+                agent_id="owner",
+            )
+            TaskBoard(workspace).attach_session(task.task_id, "session-memory")
+            SessionStateStore(workspace).write(
+                SessionStateCard(
+                    session_id="session-memory",
+                    task_id=task.task_id,
+                    project_id="proj",
+                    agent_id="owner",
+                    current_state="State card exists",
+                    next_step="Show it on Telegram",
+                    decisions=["Use run_service context as the source of truth"],
+                )
+            )
+            ProgressJournal(workspace).append(
+                kind="handoff",
+                summary="Context injection is implemented",
+                task_id=task.task_id,
+                session_id="session-memory",
+                next_steps=["Add phone visibility"],
+            )
+            handler = TelegramCommandHandler(workspace)
+
+            asyncio.run(handler.handle_text(f"/use {task.task_id}", chat_id=42))
+            initial_context = asyncio.run(handler.handle_text("/context", chat_id=42))[0]
+            self.assertIn("AgentDeck context:", initial_context)
+            self.assertIn("State card exists", initial_context)
+            self.assertIn("Context injection is implemented", initial_context)
+
+            review = asyncio.run(handler.handle_text("/review Keep the next patch narrow", chat_id=42))[0]
+            self.assertIn("Manager review recorded: Memory task", review)
+
+            context = asyncio.run(handler.handle_text("/context", chat_id=42))[0]
+            self.assertIn("AgentDeck context:", context)
+            self.assertIn("Context injection is implemented", context)
+            self.assertIn("Recent manager reviews:", context)
+            self.assertIn("Keep the next patch narrow", context)
+
+            handoffs = asyncio.run(handler.handle_text("/handoffs", chat_id=42))[0]
+            self.assertIn("Handoffs: Memory task", handoffs)
+            self.assertIn("Context injection is implemented", handoffs)
+            self.assertIn("next: Add phone visibility", handoffs)
+            self.assertNotIn("Keep the next patch narrow", handoffs)
+
+            reviews = asyncio.run(handler.handle_text("/reviews", chat_id=42))[0]
+            self.assertIn("Manager reviews: Memory task", reviews)
+            self.assertIn("Keep the next patch narrow", reviews)
+
+            empty_memories = asyncio.run(handler.handle_text("/memories", chat_id=42))[0]
+            self.assertIn("No durable memories for task: Memory task", empty_memories)
+
+            compact = asyncio.run(handler.handle_text("/compact --pin Phone snapshot", chat_id=42))[0]
+            self.assertIn("Memory compacted:", compact)
+            self.assertIn("title: Phone snapshot", compact)
+            self.assertIn("pinned: yes", compact)
+            self.assertIn("owner: proj", compact)
+            path_match = re.search(r"path: (.+)", compact)
+            assert path_match is not None
+            memory_path = Path(path_match.group(1))
+            memory_text = memory_path.read_text(encoding="utf-8")
+            self.assertIn("source: telegram-compact", memory_text)
+            self.assertIn("pinned: true", memory_text)
+            self.assertIn("This memory was generated from structured AgentDeck state", memory_text)
+            self.assertIn("Keep the next patch narrow", memory_text)
+
+            memories = asyncio.run(handler.handle_text("/memories", chat_id=42))[0]
+            self.assertIn("Durable memories: Memory task", memories)
+            self.assertIn("Phone snapshot", memories)
+            self.assertIn("scope: project:proj", memories)
+            self.assertIn("pinned: yes", memories)
+
+            context_with_memory = asyncio.run(handler.handle_text("/context", chat_id=42))[0]
+            self.assertIn("Relevant durable memories:", context_with_memory)
+            self.assertIn("Phone snapshot [project:proj] pinned", context_with_memory)
+
+            disabled = asyncio.run(handler.handle_text("/memory disable 1", chat_id=42))[0]
+            self.assertIn("Memory disabled: Phone snapshot", disabled)
+            self.assertIn("It will no longer be injected into task context.", disabled)
+
+            context_without_memory = asyncio.run(handler.handle_text("/context", chat_id=42))[0]
+            self.assertNotIn("Phone snapshot [project:proj]", context_without_memory)
+
+            enabled = asyncio.run(handler.handle_text("/memory enable 1", chat_id=42))[0]
+            self.assertIn("Memory enabled: Phone snapshot", enabled)
+            self.assertIn("It can be retrieved into future task context again.", enabled)
+
+            context_after_enable = asyncio.run(handler.handle_text("/context", chat_id=42))[0]
+            self.assertIn("Phone snapshot [project:proj] pinned", context_after_enable)
+
+            missing = asyncio.run(handler.handle_text("/context missing-task", chat_id=42))[0]
+            self.assertIn("Task not found", missing)
+
+    def test_project_state_and_decisions_are_visible_from_telegram(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            project_dir = tmp / "project"
+            project_dir.mkdir()
+            self._main(["--workspace", str(workspace.root), "projects", "create", "proj", "--title", "Project One", "--cwd", str(project_dir)])
+            ProjectStateStore(workspace).update(
+                "proj",
+                goal="Coordinate two agents",
+                phase="memory",
+                current_focus="Expose project direction",
+                next_steps=["Use decisions in task context"],
+                constraints=["Keep raw transcripts out of memory"],
+            )
+            ProjectStateStore(workspace).add_decision(
+                "proj",
+                "Use project state as the manager-owned direction",
+                reason="Executors need stable guidance",
+            )
+
+            handler = TelegramCommandHandler(workspace)
+            asyncio.run(handler.handle_text("/use project proj", chat_id=42))
+
+            state = asyncio.run(handler.handle_text("/projectstate", chat_id=42))[0]
+            self.assertIn("Project state: Project One", state)
+            self.assertIn("goal: Coordinate two agents", state)
+            self.assertIn("constraints:", state)
+
+            decisions = asyncio.run(handler.handle_text("/decisions", chat_id=42))[0]
+            self.assertIn("Decisions: Project One", decisions)
+            self.assertIn("Use project state as the manager-owned direction", decisions)
+
+            recorded = asyncio.run(handler.handle_text("/decide Keep executor tasks small", chat_id=42))[0]
+            self.assertIn("Decision recorded", recorded)
+            self.assertIn("Keep executor tasks small", recorded)
 
     def test_phone_console_selects_project_agent_and_task_by_number(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -332,6 +529,20 @@ class TelegramInterfaceTests(unittest.TestCase):
             self.assertEqual(agent.adapter, "codex")
             self.assertEqual(agent.role, "developer")
             self.assertEqual(agent.project_dir, str(project_dir.resolve()))
+
+            template_reply = asyncio.run(
+                handler.handle_text("/agent template Keep executor changes narrow and verified", chat_id=42)
+            )[0]
+            self.assertIn("Agent template set: Developer Agent", template_reply)
+            templated = AgentRegistry(workspace).resolve("developer")
+            assert templated is not None
+            self.assertIn("Keep executor changes narrow", role_template_for_agent(templated))
+
+            clear_reply = asyncio.run(handler.handle_text("/agent template clear", chat_id=42))[0]
+            self.assertIn("Agent template cleared: Developer Agent", clear_reply)
+            cleared = AgentRegistry(workspace).resolve("developer")
+            assert cleared is not None
+            self.assertNotIn("role_template", cleared.metadata)
 
             task_reply = asyncio.run(handler.handle_text("/task new Implement phone flow", chat_id=42))[0]
             self.assertIn("Task created and selected", task_reply)
@@ -428,6 +639,50 @@ class TelegramInterfaceTests(unittest.TestCase):
 
             status = asyncio.run(handler.handle_text("/auto status", chat_id=42))[0]
             self.assertIn("approval: human", status)
+
+    def test_auto_task_mode_stops_when_agent_marks_task_done(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            workspace.ensure()
+            task = TaskBoard(workspace).create(title="Auto by task")
+            seen: list[RunRequest] = []
+            sent: list[tuple[int, str]] = []
+
+            async def runner(workspace_arg: Workspace, request: RunRequest) -> RunServiceResult:
+                seen.append(request)
+                return RunServiceResult(
+                    session_id="session-auto-task",
+                    final_text="The task is sufficiently complete.\nAGENTDECK_AUTO_TASK_DONE",
+                    events=[],
+                    agent_id="owner",
+                    adapter="echo",
+                    task_id=request.task or "",
+                )
+
+            old_delay = telegram_module.AUTO_CONTINUE_DELAY_SECONDS
+            telegram_module.AUTO_CONTINUE_DELAY_SECONDS = 0.01
+            try:
+                queue = TelegramJobQueue(workspace, sender=lambda chat_id, text: sent.append((chat_id, text)), runner=runner)
+                handler = TelegramCommandHandler(workspace, job_queue=queue)
+
+                asyncio.run(handler.handle_text(f"/use {task.task_id}", chat_id=42))
+                reply = asyncio.run(handler.handle_text("/auto task", chat_id=42))[0]
+                self.assertIn("mode: task", reply)
+                first_job = re.search(r"Job started: (job-\S+)", reply).group(1)
+                queue.wait(first_job, timeout=2)
+                time.sleep(0.05)
+
+                self.assertEqual(len(seen), 1)
+                self.assertIn("AGENTDECK_AUTO_TASK_DONE", seen[0].prompt)
+                self.assertTrue(any("Auto by task stopped: task judged complete." in text for _, text in sent))
+                self.assertTrue(all("AGENTDECK_AUTO_TASK_DONE" not in text for _, text in sent))
+                updated = TaskBoard(workspace).get(task.task_id)
+                assert updated is not None
+                self.assertEqual(updated.status, "review")
+                status = asyncio.run(handler.handle_text("/auto status", chat_id=42))[0]
+                self.assertIn("Auto mode: off", status)
+            finally:
+                telegram_module.AUTO_CONTINUE_DELAY_SECONDS = old_delay
 
     def test_recent_lists_allow_numeric_task_and_job_selection(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

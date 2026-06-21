@@ -51,6 +51,7 @@ class AgentRuntime:
         self,
         prompt: str,
         *,
+        display_prompt: str | None = None,
         session_id: str | None = None,
         title: str | None = None,
         cancellation: CancellationToken | None = None,
@@ -58,17 +59,19 @@ class AgentRuntime:
         self.workspace.ensure()
         sid = session_id or uuid.uuid4().hex[:12]
         events: list[AgentEvent] = []
+        user_prompt = prompt if display_prompt is None else display_prompt
 
         self.session_registry.upsert_start(
             session_id=sid,
             agent_id=self.agent_id,
             adapter=self.adapter.name,
             project_dir=self.project_dir,
-            prompt=prompt,
+            prompt=user_prompt,
             title=title,
         )
         start = AgentEvent(EventKind.SESSION_STARTED, self.agent_id, sid, payload={"adapter": self.adapter.name})
-        user = AgentEvent(EventKind.USER_MESSAGE, self.agent_id, sid, text=prompt)
+        user_payload = {"adapter_prompt_modified": prompt != user_prompt} if prompt != user_prompt else {}
+        user = AgentEvent(EventKind.USER_MESSAGE, self.agent_id, sid, text=user_prompt, payload=user_payload)
         for event in [start, user]:
             self.event_log.append(event)
             self.session_registry.update_from_event(event)

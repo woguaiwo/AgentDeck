@@ -59,6 +59,36 @@ class KimiPrintAdapterTests(unittest.TestCase):
             self.assertEqual(record.provider_session_id, "11111111-2222-3333-4444-555555555555")
             self.assertEqual(record.provider_session_kind, "kimi_session")
 
+
+    def test_kimi_print_adapter_handles_large_single_json_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            fake = tmp / "fake_kimi"
+            fake.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    import json
+
+                    print(json.dumps({{
+                        "role": "assistant",
+                        "content": [{{"type": "text", "text": "x" * 70000}}],
+                    }}), flush=True)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+
+            workspace = Workspace(tmp / ".agentdeck")
+            adapter = KimiPrintAdapter(kimi_bin=str(fake), cwd=tmp)
+            runtime = AgentRuntime(workspace, adapter, agent_id="kimi-test")
+
+            result = asyncio.run(runtime.run_prompt("hello"))
+
+            self.assertEqual(result.final_text, "x" * 70000)
+            self.assertTrue(any(event.kind == EventKind.ASSISTANT_FINAL for event in result.events))
+
     def test_resume_command_uses_kimi_session_flag(self) -> None:
         adapter = KimiPrintAdapter(
             cwd=Path("/tmp/project"),

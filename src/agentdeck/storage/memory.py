@@ -38,6 +38,23 @@ class MemoryEntry:
     memory_id: str
 
 
+@dataclass(frozen=True)
+class MemoryDocument:
+    path: Path
+    title: str
+    scope: MemoryScope
+    owner: str
+    memory_id: str
+    memory_type: str
+    source: str
+    updated_at: str
+    modified_at: float
+    pinned: bool
+    disabled: bool
+    content: str
+    metadata: dict[str, str]
+
+
 class MarkdownMemoryStore:
     """Plain-file memory store designed for human inspection and git sync."""
 
@@ -46,7 +63,7 @@ class MarkdownMemoryStore:
 
     def scope_dir(self, scope: MemoryScope, owner: str | None = None) -> Path:
         base = self.workspace.memory_dir / SCOPE_DIRS[scope]
-        if scope in {"team", "agent", "task"} and owner:
+        if scope in {"project", "team", "agent", "task"} and owner:
             base = base / _slug(owner)
         base.mkdir(parents=True, exist_ok=True)
         index = base / "MEMORY.md"
@@ -62,6 +79,8 @@ class MarkdownMemoryStore:
         scope: MemoryScope = "project",
         owner: str | None = None,
         memory_type: str = "project",
+        source: str = "manual",
+        pinned: bool = False,
         tags: list[str] | None = None,
     ) -> MemoryEntry:
         self.workspace.ensure()
@@ -85,12 +104,13 @@ class MarkdownMemoryStore:
             f"type: {memory_type}",
             f"scope: {scope}",
             f"owner: {owner or ''}",
-            f"source: manual",
+            f"source: {source}",
             f"signature: {signature}",
             f"created_at: {now}",
             f"updated_at: {now}",
             "ttl_days:",
             "disabled: false",
+            f"pinned: {_frontmatter_bool(pinned)}",
             "tags: [" + ", ".join(tags or []) + "]",
             "---",
             "",
@@ -100,8 +120,75 @@ class MarkdownMemoryStore:
         return MemoryEntry(path=path, title=title, scope=scope, memory_id=memory_id)
 
     def list(self, *, scope: MemoryScope = "project", owner: str | None = None) -> list[Path]:
-        directory = self.scope_dir(scope, owner)
+        directory = self.workspace.memory_dir / SCOPE_DIRS[scope]
+        if scope in {"project", "team", "agent", "task"} and owner:
+            directory = directory / _slug(owner)
+        if not directory.exists():
+            return []
         return sorted(path for path in directory.glob("*.md") if path.name != "MEMORY.md")
+
+    def list_documents(
+        self,
+        *,
+        scope: MemoryScope = "project",
+        owner: str | None = None,
+        limit: int = 10,
+        include_disabled: bool = False,
+    ) -> list[MemoryDocument]:
+        documents: list[MemoryDocument] = []
+        for path in self.list(scope=scope, owner=owner):
+            document = _read_memory_document(
+                path,
+                fallback_scope=scope,
+                fallback_owner=owner or "",
+                include_disabled=include_disabled,
+            )
+            if document is None:
+                continue
+            documents.append(document)
+        documents.sort(key=lambda item: (not item.pinned, -item.modified_at))
+        return documents[: max(limit, 0)]
+
+    def find_document(self, ref: str, *, scope: MemoryScope | None = None, owner: str | None = None) -> MemoryDocument | None:
+        clean = ref.strip()
+        if not clean:
+            return None
+        direct = Path(clean).expanduser()
+        if direct.exists() and direct.is_file():
+            return _read_memory_document(direct, fallback_scope=scope or "project", fallback_owner=owner or "", include_disabled=True)
+
+        lowered = clean.lower()
+        for path in self._candidate_paths(scope=scope, owner=owner):
+            document = _read_memory_document(path, fallback_scope=scope or "project", fallback_owner=owner or "", include_disabled=True)
+            if document is None:
+                continue
+            if clean in {document.memory_id, path.name, str(path)}:
+                return document
+            if lowered in {document.title.lower(), path.stem.lower()}:
+                return document
+        return None
+
+    def set_disabled(
+        self,
+        ref: str,
+        *,
+        disabled: bool,
+        scope: MemoryScope | None = None,
+        owner: str | None = None,
+    ) -> MemoryDocument:
+        document = self.find_document(ref, scope=scope, owner=owner)
+        if document is None:
+            raise ValueError(f"memory not found: {ref}")
+        _set_frontmatter_bool(document.path, "disabled", disabled)
+        updated = _read_memory_document(
+            document.path,
+            fallback_scope=document.scope,
+            fallback_owner=document.owner,
+            include_disabled=True,
+        )
+        if updated is None:
+            raise ValueError(f"memory is unreadable after update: {document.path}")
+        return updated
 
     def _update_index(self, directory: Path, title: str, filename: str) -> None:
         index = directory / "MEMORY.md"
@@ -109,6 +196,13 @@ class MarkdownMemoryStore:
         if filename not in text:
             text = text.rstrip() + f"\n- [{title}]({filename})\n"
             index.write_text(text, encoding="utf-8")
+
+    def _candidate_paths(self, *, scope: MemoryScope | None, owner: str | None) -> list[Path]:
+        if scope is not None:
+            return self.list(scope=scope, owner=owner)
+        if not self.workspace.memory_dir.exists():
+            return []
+        return sorted(path for path in self.workspace.memory_dir.rglob("*.md") if path.name != "MEMORY.md")
 
 
 def _slug(value: str) -> str:
@@ -130,3 +224,97 @@ def _next_path(directory: Path, slug: str) -> Path:
 def _contains_secret(text: str) -> bool:
     return any(pattern.search(text) for pattern in SECRET_PATTERNS)
 
+
+def _read_memory_document(
+    path: Path,
+    *,
+    fallback_scope: MemoryScope,
+    fallback_owner: str,
+    include_disabled: bool = False,
+) -> MemoryDocument | None:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    metadata, body = _split_frontmatter(text)
+    disabled = _metadata_bool(metadata.get("disabled"))
+    if disabled and not include_disabled:
+        return None
+    body = body.strip()
+    if not body:
+        return None
+    return MemoryDocument(
+        path=path,
+        title=metadata.get("name") or path.stem.replace("_", " "),
+        scope=_metadata_scope(metadata.get("scope"), fallback_scope),
+        owner=metadata.get("owner") or fallback_owner,
+        memory_id=metadata.get("id") or path.stem,
+        memory_type=metadata.get("type") or "memory",
+        source=metadata.get("source") or "",
+        updated_at=metadata.get("updated_at") or "",
+        modified_at=_mtime(path),
+        pinned=_metadata_bool(metadata.get("pinned")),
+        disabled=disabled,
+        content=body,
+        metadata=metadata,
+    )
+
+
+def _split_frontmatter(text: str) -> tuple[dict[str, str], str]:
+    if not text.startswith("---"):
+        return {}, text
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}, text
+    metadata: dict[str, str] = {}
+    for line in parts[1].splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        clean_key = key.strip()
+        if clean_key:
+            metadata[clean_key] = value.strip()
+    return metadata, parts[2].lstrip()
+
+
+def _metadata_scope(value: str | None, fallback: MemoryScope) -> MemoryScope:
+    if value in SCOPE_DIRS:
+        return value  # type: ignore[return-value]
+    return fallback
+
+
+def _metadata_bool(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"true", "yes", "1"}
+
+
+def _frontmatter_bool(value: bool) -> str:
+    return "true" if value else "false"
+
+
+def _set_frontmatter_bool(path: Path, key: str, value: bool) -> None:
+    text = path.read_text(encoding="utf-8")
+    replacement = f"{key}: {_frontmatter_bool(value)}"
+    if not text.startswith("---"):
+        path.write_text(f"---\n{replacement}\n---\n\n{text.lstrip()}", encoding="utf-8")
+        return
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        path.write_text(f"---\n{replacement}\n---\n\n{text.lstrip()}", encoding="utf-8")
+        return
+    lines = parts[1].splitlines()
+    found = False
+    for index, line in enumerate(lines):
+        if line.split(":", 1)[0].strip() == key:
+            lines[index] = replacement
+            found = True
+            break
+    if not found:
+        lines.append(replacement)
+    path.write_text("---\n" + "\n".join(lines) + "\n---" + parts[2], encoding="utf-8")
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0

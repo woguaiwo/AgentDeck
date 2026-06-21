@@ -8,7 +8,7 @@ from pathlib import Path
 
 from agentdeck.cli import main
 from agentdeck.core.config import Workspace
-from agentdeck.storage.agents import AgentRegistry
+from agentdeck.storage.agents import AgentRegistry, role_template_for_agent
 from agentdeck.storage.sessions import SessionRegistry
 
 
@@ -34,6 +34,7 @@ class AgentRegistryTests(unittest.TestCase):
             self.assertEqual(record.team_id, "motion-x")
             self.assertEqual(registry.resolve("Motion-X Owner").agent_id, "motion-x-owner")
             self.assertEqual(registry.list(team_id="motion-x")[0].title, "Motion-X Owner")
+            self.assertIn("Coordinate the current task", role_template_for_agent(record))
 
     def test_cli_agents_create_list_show_and_run_resume_latest(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -85,6 +86,27 @@ class AgentRegistryTests(unittest.TestCase):
 
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
+                code = main(
+                    [
+                        "--workspace",
+                        str(workspace.root),
+                        "agents",
+                        "template",
+                        "motionx",
+                        "--prompt",
+                        "Act as the project manager.",
+                        "--prompt",
+                        "Review executor handoffs before changing direction.",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertIn("agent template set: Motion-X Owner", stdout.getvalue())
+            templated = AgentRegistry(workspace).get("motionx")
+            assert templated is not None
+            self.assertIn("Review executor handoffs", role_template_for_agent(templated))
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
                 code = main(["--workspace", str(workspace.root), "run", "first", "--agent", "motionx"])
             self.assertEqual(code, 0)
             first_match = re.search(r"session_id: (\S+)", stdout.getvalue())
@@ -99,9 +121,47 @@ class AgentRegistryTests(unittest.TestCase):
 
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
+                code = main(["--workspace", str(workspace.root), "agents", "template", "motionx", "--clear"])
+            self.assertEqual(code, 0)
+            cleared = AgentRegistry(workspace).get("motionx")
+            assert cleared is not None
+            self.assertNotIn("role_template", cleared.metadata)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
                 code = main(["--workspace", str(workspace.root), "run", "second", "--agent", "motionx"])
             self.assertEqual(code, 0)
             self.assertIn(f"session_id: {first_session}", stdout.getvalue())
+
+    def test_cli_assistant_setup_creates_default_router_agent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(
+                    [
+                        "--workspace",
+                        str(workspace.root),
+                        "assistant",
+                        "setup",
+                        "--adapter",
+                        "echo",
+                        "--cwd",
+                        tmpdir,
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertIn("assistant: AgentDeck Assistant (assistant)", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--workspace", str(workspace.root), "run", "help route me", "--agent", "assistant"])
+            self.assertEqual(code, 0)
+            run_output = stdout.getvalue()
+            self.assertIn("Agent role guidance:", run_output)
+            self.assertIn("You are the user's AgentDeck assistant", run_output)
+            self.assertIn("help route me", run_output)
 
 
 if __name__ == "__main__":

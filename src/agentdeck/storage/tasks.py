@@ -211,7 +211,7 @@ class TaskBoard:
 
 
 def _append_note(record: TaskRecord, text: str, *, kind: str) -> None:
-    clean = _clean_text(text)
+    clean = _clean_note_text(text)
     if not clean:
         return
     record.notes.append(
@@ -251,3 +251,12 @@ def _maybe_normalize_id(value: str) -> str:
 
 def _clean_text(value: str) -> str:
     return " ".join(value.strip().split())
+
+
+def _clean_note_text(value: str) -> str:
+    lines = []
+    for line in str(value).strip().splitlines():
+        clean = " ".join(line.strip().split())
+        if clean:
+            lines.append(clean)
+    return "\n".join(lines)

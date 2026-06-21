@@ -17,11 +17,21 @@ from agentdeck.adapters.capabilities import adapter_requires_provider_session
 from agentdeck.core.cancel import CancellationToken
 from agentdeck.core.config import Workspace
 from agentdeck.core.events import EventKind
-from agentdeck.core.run_service import RunConfigurationError, RunRequest, run_agent_prompt
+from agentdeck.core.run_service import (
+    RunConfigurationError,
+    RunRequest,
+    build_agentdeck_context,
+    collect_relevant_memories,
+    run_agent_prompt,
+)
 from agentdeck.storage.approvals import ApprovalRecord, ApprovalRegistry
-from agentdeck.storage.agents import AgentRecord, AgentRegistry
+from agentdeck.storage.agents import ASSISTANT_AGENT_ID, AgentRecord, AgentRegistry
 from agentdeck.storage.jobs import JobRecord, JobRegistry
+from agentdeck.storage.memory import MemoryDocument, MarkdownMemoryStore
+from agentdeck.storage.progress import ProgressJournal, format_review
 from agentdeck.storage.projects import ProjectRecord, ProjectRegistry
+from agentdeck.storage.project_state import ProjectStateStore
+from agentdeck.storage.session_state import SessionStateStore
 from agentdeck.storage.sessions import SessionRecord, SessionRegistry
 from agentdeck.storage.tasks import TaskBoard, TaskRecord
 
@@ -34,6 +44,12 @@ DEFAULT_AUTO_PROMPT = (
     "请继续推进当前任务。要求：主动完成下一步；如果取得阶段性进展、"
     "做出重要决定或遇到阻塞，请用简短要点记录到项目日志或任务备注里；"
     "如果需要用户决策、权限或外部信息，请停止并明确说明。"
+)
+AUTO_TASK_DONE_MARKER = "AGENTDECK_AUTO_TASK_DONE"
+DEFAULT_AUTO_TASK_PROMPT = (
+    "请自动推进当前任务。每一轮主动完成下一步，并记录重要进展、决定、证据或阻塞。"
+    "如果你判断当前 task 的范围和细节已经基本充分完成，请在回复最后单独一行输出 "
+    f"{AUTO_TASK_DONE_MARKER}，并给出简短完成摘要；否则不要输出这个标记，继续说明下一步。"
 )
 
 
@@ -139,6 +155,7 @@ class TelegramChatStateStore:
         turns_started: int = 0,
         last_job_id: str = "",
         approval_mode: str = DEFAULT_AUTO_APPROVAL_MODE,
+        mode: str = "loop",
     ) -> None:
         with self._lock:
             data = self._read()
@@ -151,6 +168,7 @@ class TelegramChatStateStore:
                 "turns_started": turns_started,
                 "last_job_id": last_job_id,
                 "approval_mode": _normalize_auto_approval_mode(approval_mode),
+                "mode": _normalize_auto_mode(mode),
             }
             data[str(chat_id)] = chat
             self._write(data)
@@ -219,6 +237,14 @@ class TelegramChatStateStore:
             data[str(chat_id)] = chat
             self._write(data)
 
+    def set_recent_memories(self, chat_id: int, memory_paths: list[str]) -> None:
+        with self._lock:
+            data = self._read()
+            chat = dict(data.get(str(chat_id)) or {})
+            chat["recent_memory_paths"] = memory_paths
+            data[str(chat_id)] = chat
+            self._write(data)
+
     def set_recent_tasks(self, chat_id: int, task_ids: list[str]) -> None:
         with self._lock:
             data = self._read()
@@ -282,6 +308,14 @@ class TelegramChatStateStore:
             if not isinstance(approval_ids, list) or index < 1 or index > len(approval_ids):
                 return ""
             return str(approval_ids[index - 1])
+
+    def recent_memory_path(self, chat_id: int, index: int) -> str:
+        with self._lock:
+            data = self._read()
+            memory_paths = data.get(str(chat_id), {}).get("recent_memory_paths") or []
+            if not isinstance(memory_paths, list) or index < 1 or index > len(memory_paths):
+                return ""
+            return str(memory_paths[index - 1])
 
     def _read(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():
@@ -396,6 +430,7 @@ class TelegramJobQueue:
                     RunRequest(
                         prompt=job.prompt,
                         task=job.task_id or None,
+                        agent=str(metadata.get("agent_id") or "") or None,
                         session=str(metadata.get("session_id") or "") or None,
                         approval_mode=str(metadata.get("approval_mode") or "") or None,
                         cancellation=cancellation,
@@ -508,6 +543,24 @@ class TelegramJobQueue:
             self.chat_state.disable_auto(job.chat_id)
             self._send(job.chat_id, f"Auto mode stopped: {_one_line(job.error, 180)}")
             return
+        if _auto_mode(state) == "task" and _auto_task_completed(job.final_text):
+            self.chat_state.disable_auto(job.chat_id)
+            TaskBoard(self.workspace).set_status(
+                job.task_id,
+                "review",
+                note="Auto by task stopped after the agent reported task completion.",
+            )
+            self._send(
+                job.chat_id,
+                "\n".join(
+                    [
+                        "Auto by task stopped: task judged complete.",
+                        "status: review",
+                        "Use /tasks or /context to inspect before marking done.",
+                    ]
+                ),
+            )
+            return
         if _auto_expired(state):
             self.chat_state.disable_auto(job.chat_id)
             self._send(job.chat_id, "Auto mode ended: timer expired.")
@@ -517,6 +570,7 @@ class TelegramJobQueue:
             "auto": True,
             "auto_parent_job_id": job.job_id,
             "approval_mode": _auto_approval_mode(state),
+            "auto_mode": _auto_mode(state),
         }
         session_id = _safe_session_id_for_resume(self.workspace, job.session_id)
         if session_id:
@@ -576,12 +630,21 @@ class TelegramCommandHandler:
             return []
         command, rest = _split_command(clean)
 
+        if rest and not command.startswith("/") and self._should_route_bare_text_to_assistant(chat_id):
+            return [await self._plain_text(clean, chat_id=chat_id)]
+
         if command in {"/start", "/help", "help"}:
             return [_help_text()]
         if command in {"/projects", "projects"}:
             return [self._projects(chat_id=chat_id)]
         if command in {"/project", "project"}:
             return [self._project(rest, chat_id=chat_id)]
+        if command in {"/projectstate", "projectstate"}:
+            return [self._project_state(rest, chat_id=chat_id)]
+        if command in {"/decisions", "decisions"}:
+            return [self._project_decisions(rest, chat_id=chat_id)]
+        if command in {"/decide", "decide"}:
+            return [self._decide(rest, chat_id=chat_id)]
         if command in {"/tasks", "tasks"}:
             return [self._tasks(rest, chat_id=chat_id)]
         if command in {"/task", "task"}:
@@ -599,6 +662,27 @@ class TelegramCommandHandler:
             return [self._status(chat_id=chat_id)]
         if command in {"/list", "list", "/recent", "recent"}:
             return [self._recent(chat_id=chat_id)]
+        if command in {"/context", "context"}:
+            return [self._context(rest, chat_id=chat_id)]
+        if command in {"/memories", "memories"}:
+            return [self._memories(rest, chat_id=chat_id)]
+        if command in {"/memory", "memory"}:
+            subcommand, subrest = _split_once(rest)
+            if subcommand.lower() in {"disable", "off", "forget"}:
+                return [self._set_memory_disabled(subrest, disabled=True, chat_id=chat_id)]
+            if subcommand.lower() in {"enable", "on"}:
+                return [self._set_memory_disabled(subrest, disabled=False, chat_id=chat_id)]
+            return [self._memories(rest, chat_id=chat_id)]
+        if command in {"/forget", "forget"}:
+            return [self._set_memory_disabled(rest, disabled=True, chat_id=chat_id)]
+        if command in {"/compact", "compact"}:
+            return [self._compact(rest, chat_id=chat_id)]
+        if command in {"/handoffs", "handoffs"}:
+            return [self._handoffs(rest, chat_id=chat_id)]
+        if command in {"/review", "review"}:
+            return [self._review(rest, chat_id=chat_id)]
+        if command in {"/reviews", "reviews"}:
+            return [self._reviews(rest, chat_id=chat_id)]
         if command in {"/sessions", "sessions"}:
             return [self._sessions(rest, chat_id=chat_id)]
         if command in {"/session", "session"}:
@@ -631,7 +715,58 @@ class TelegramCommandHandler:
             return [self._cancel(rest, chat_id=chat_id)]
         if command in {"/run", "run"}:
             return [await self._run(rest, chat_id=chat_id)]
+        if not command.startswith("/"):
+            return [await self._plain_text(clean, chat_id=chat_id)]
         return [f"Unknown command: {command}\n\n{_help_text()}"]
+
+    def _should_route_bare_text_to_assistant(self, chat_id: int | None) -> bool:
+        if chat_id is None:
+            return False
+        current_task_id = self.chat_state.current_task(chat_id)
+        if current_task_id and self._resolve_task(current_task_id) is not None:
+            return False
+        return AgentRegistry(self.workspace).resolve(ASSISTANT_AGENT_ID) is not None
+
+    async def _plain_text(self, text: str, *, chat_id: int | None) -> str:
+        if chat_id is None:
+            return "Plain text messages require a Telegram chat. Use /run <message>."
+        current_task_id = self.chat_state.current_task(chat_id)
+        task = self._resolve_task(current_task_id) if current_task_id else None
+        if task is None:
+            assistant = AgentRegistry(self.workspace).resolve(ASSISTANT_AGENT_ID)
+            if assistant is not None:
+                return await self._run_assistant(text, assistant=assistant, chat_id=chat_id)
+            return self._plain_text_setup_hint()
+        return await self._run(text, chat_id=chat_id)
+
+    async def _run_assistant(self, prompt: str, *, assistant: AgentRecord, chat_id: int) -> str:
+        metadata = {"assistant": True, "agent_id": assistant.agent_id}
+        if self.job_queue is not None:
+            job = self.job_queue.start(chat_id=chat_id, task_id="", prompt=prompt, metadata=metadata)
+            return "\n".join(
+                [
+                    f"Assistant job started: {job.job_id}",
+                    f"agent: {assistant.title}",
+                    "status: queued",
+                    "Use /job to view the latest job",
+                ]
+            )
+        try:
+            result = await self.runner(self.workspace, RunRequest(prompt=prompt, agent=assistant.agent_id))
+        except RunConfigurationError as exc:
+            return str(exc)
+        lines = [result.final_text or "Assistant run finished without a final text response.", ""]
+        lines.append(f"session: {result.session_id}")
+        return "\n".join(lines)
+
+    def _plain_text_setup_hint(self) -> str:
+        return "\n".join(
+            [
+                "No current task is selected, so this message was not sent to an agent.",
+                "Use /tasks and /use task <ref>, or create one with /task new <title>.",
+                "Or configure a default assistant with: agentdeck assistant setup --adapter <echo|codex|kimi>",
+            ]
+        )
 
     def _projects(self, *, chat_id: int | None = None) -> str:
         records = ProjectRegistry(self.workspace).list()
@@ -709,6 +844,71 @@ class TelegramCommandHandler:
                 f"cwd: {project.project_dir}",
                 f"default agent: {project.default_agent_id}",
                 "Next: /agent new owner codex owner, or /task new <title>",
+            ]
+        )
+
+    def _project_state(self, rest: str, *, chat_id: int | None) -> str:
+        project, error = self._resolve_project_or_current(rest, chat_id=chat_id, usage="Usage: /projectstate [project]")
+        if error:
+            return error
+        assert project is not None
+        state = ProjectStateStore(self.workspace).get(project.project_id)
+        if state is None:
+            return f"No project state for: {project.title}\nUse CLI: agentdeck projects update-state {project.project_id} ..."
+        lines = [f"Project state: {project.title}"]
+        if state.goal:
+            lines.append(f"goal: {_one_line(state.goal, 240)}")
+        if state.phase:
+            lines.append(f"phase: {_one_line(state.phase, 120)}")
+        if state.current_focus:
+            lines.append(f"focus: {_one_line(state.current_focus, 220)}")
+        _append_compact_list(lines, "next", state.next_steps, max_items=4)
+        _append_compact_list(lines, "constraints", state.constraints, max_items=4)
+        _append_compact_list(lines, "blockers", state.blockers, max_items=3)
+        _append_compact_list(lines, "artifacts", state.active_artifacts, max_items=4)
+        lines.append("")
+        lines.append("Use /decisions to see project decisions.")
+        return "\n".join(lines)
+
+    def _project_decisions(self, rest: str, *, chat_id: int | None) -> str:
+        project, error = self._resolve_project_or_current(rest, chat_id=chat_id, usage="Usage: /decisions [project]")
+        if error:
+            return error
+        assert project is not None
+        decisions = ProjectStateStore(self.workspace).decisions(project.project_id, limit=5)
+        if not decisions:
+            return f"No decisions for project: {project.title}"
+        lines = [f"Decisions: {project.title}"]
+        for index, decision in enumerate(decisions, 1):
+            lines.append(f"{index}. {_one_line(decision.decision, 220)}")
+            if decision.reason:
+                lines.append(f"   reason: {_one_line(decision.reason, 220)}")
+            if decision.impact:
+                lines.append(f"   impact: {_one_line(decision.impact, 220)}")
+        return "\n".join(lines)
+
+    def _decide(self, rest: str, *, chat_id: int | None) -> str:
+        decision_text = rest.strip()
+        if not decision_text:
+            return "Usage: /decide <decision text>"
+        project, error = self._resolve_project_or_current("", chat_id=chat_id, usage="Usage: /decide <decision text>")
+        if error:
+            return error
+        assert project is not None
+        try:
+            decision = ProjectStateStore(self.workspace).add_decision(
+                project.project_id,
+                decision_text,
+                made_by="telegram",
+            )
+        except ValueError as exc:
+            return str(exc)
+        return "\n".join(
+            [
+                "Decision recorded:",
+                _one_line(decision.decision, 320),
+                f"project: {project.title}",
+                "Use /decisions to review.",
             ]
         )
 
@@ -790,7 +990,7 @@ class TelegramCommandHandler:
         if record.project_id:
             lines.append(f"project: {record.project_id}")
         lines.append(f"agent: {record.agent_id}")
-        lines.append("Now you can send /run <message>")
+        lines.append("Now you can send a plain message, or /run <message>.")
         return "\n".join(lines)
 
     def _use(self, rest: str, *, chat_id: int | None) -> str:
@@ -823,7 +1023,7 @@ class TelegramCommandHandler:
                 f"id: {task.task_id}",
                 f"project: {task.project_id or '-'}",
                 f"agent: {task.agent_id}",
-                "Now you can send /run <message>",
+                "Now you can send a plain message, or /run <message>.",
             ]
         )
 
@@ -951,7 +1151,8 @@ class TelegramCommandHandler:
         lines.append("Next:")
         lines.append("- /projects, /agents, /tasks")
         lines.append("- /use project <list #>, /use agent <list #>, /use task <list #>")
-        lines.append("- /run <message>, /auto start, /approvals")
+        lines.append("- /projectstate, /decisions, /context, /memories, /compact, /handoffs, /reviews")
+        lines.append("- send plain text, /run <message>, /auto start")
         return "\n".join(lines)
 
     def _recent(self, *, chat_id: int | None) -> str:
@@ -1034,6 +1235,227 @@ class TelegramCommandHandler:
         lines.append("Use /use project <list #>, /use agent <list #>, /use task <list #>, /run <list #> <message>, /job <list #>, or /resume <list #> <message>.")
         return "\n".join(lines)
 
+    def _context(self, rest: str, *, chat_id: int | None) -> str:
+        task, error = self._resolve_task_or_current(rest, chat_id=chat_id, usage="Usage: /context [task]")
+        if error:
+            return error
+        assert task is not None
+        context = build_agentdeck_context(
+            self.workspace,
+            task=task,
+            session_id=task.session_id,
+            max_chars=3400,
+        )
+        if not context:
+            return f"No AgentDeck context for task: {task.title}"
+        return context
+
+    def _memories(self, rest: str, *, chat_id: int | None) -> str:
+        task, error = self._resolve_task_or_current(rest, chat_id=chat_id, usage="Usage: /memories [task]")
+        if error:
+            return error
+        assert task is not None
+        memories = collect_relevant_memories(self.workspace, task)
+        if chat_id is not None:
+            self.chat_state.set_recent_memories(chat_id, [str(memory.path) for memory in memories])
+        if not memories:
+            return "\n".join(
+                [
+                    f"No durable memories for task: {task.title}",
+                    "Use /compact [--pin] [title] to save the current structured task context.",
+                ]
+            )
+        lines = [f"Durable memories: {task.title}"]
+        for index, memory in enumerate(memories, 1):
+            lines.extend(_format_memory_document(index, memory))
+        lines.append("")
+        lines.append("Use /compact [--pin] [title] to save a fresh task context snapshot.")
+        return "\n".join(lines)
+
+    def _set_memory_disabled(self, rest: str, *, disabled: bool, chat_id: int | None) -> str:
+        ref = self._resolve_memory_ref(rest, chat_id=chat_id)
+        if not ref:
+            action = "disable" if disabled else "enable"
+            return f"Usage: /memory {action} <memory #, id, title, or path>\nRun /memories first to use a list number."
+        try:
+            document = MarkdownMemoryStore(self.workspace).set_disabled(ref, disabled=disabled)
+        except ValueError as exc:
+            return str(exc)
+        state = "disabled" if disabled else "enabled"
+        lines = [
+            f"Memory {state}: {document.title}",
+            f"id: {document.memory_id}",
+            f"scope: {document.scope}{':' + document.owner if document.owner else ''}",
+        ]
+        if document.pinned:
+            lines.append("pinned: yes")
+        if disabled:
+            lines.append("It will no longer be injected into task context.")
+        else:
+            lines.append("It can be retrieved into future task context again.")
+        return "\n".join(lines)
+
+    def _resolve_memory_ref(self, rest: str, *, chat_id: int | None) -> str:
+        ref = rest.strip()
+        if chat_id is not None and ref.isdigit():
+            mapped = self.chat_state.recent_memory_path(chat_id, int(ref))
+            if mapped:
+                return mapped
+        return ref
+
+    def _compact(self, rest: str, *, chat_id: int | None) -> str:
+        task, error = self._resolve_task_or_current("", chat_id=chat_id, usage="Usage: /compact [--pin] [title]")
+        if error:
+            return error
+        assert task is not None
+        title, pinned = _parse_compact_options(rest, default_title=f"{task.title} context snapshot")
+        context = build_agentdeck_context(
+            self.workspace,
+            task=task,
+            session_id=task.session_id,
+            max_chars=6000,
+            include_memories=False,
+        )
+        if not context:
+            return f"No task context to compact: {task.title}"
+        owner = task.project_id
+        content = "\n".join(
+            [
+                f"# {title}",
+                "",
+                "This memory was generated from structured AgentDeck state, not a raw chat transcript.",
+                "",
+                context,
+            ]
+        )
+        try:
+            entry = MarkdownMemoryStore(self.workspace).add(
+                title,
+                content,
+                scope="project",
+                owner=owner,
+                memory_type="task-context",
+                source="telegram-compact",
+                pinned=pinned,
+                tags=["agentdeck", "task-context", "telegram"],
+            )
+        except ValueError as exc:
+            return str(exc)
+        lines = [
+            "Memory compacted:",
+            f"title: {title}",
+            f"id: {entry.memory_id}",
+            f"scope: project",
+        ]
+        if pinned:
+            lines.append("pinned: yes")
+        if owner:
+            lines.append(f"owner: {owner}")
+        lines.append(f"path: {entry.path}")
+        lines.append("")
+        lines.append("Use /memories to inspect what will be retrieved into future runs.")
+        return "\n".join(lines)
+
+    def _handoffs(self, rest: str, *, chat_id: int | None) -> str:
+        task, error = self._resolve_task_or_current(rest, chat_id=chat_id, usage="Usage: /handoffs [task]")
+        if error:
+            return error
+        assert task is not None
+        entries = ProgressJournal(self.workspace).list(kind="handoff", task_id=task.task_id, limit=5)
+        if not entries:
+            return f"No handoffs for task: {task.title}"
+        lines = [f"Handoffs: {task.title}"]
+        for index, entry in enumerate(entries, 1):
+            lines.append(f"{index}. {_one_line(entry.summary, 220)}")
+            if entry.next_steps:
+                lines.append(f"   next: {_one_line(entry.next_steps[0], 220)}")
+            if entry.blockers:
+                lines.append(f"   blocker: {_one_line(entry.blockers[0], 220)}")
+            if entry.decisions:
+                lines.append(f"   decision: {_one_line(entry.decisions[0], 220)}")
+        lines.append("")
+        lines.append("Use /context to see what will be injected into the next run.")
+        return "\n".join(lines)
+
+    def _review(self, rest: str, *, chat_id: int | None) -> str:
+        summary = rest.strip()
+        if not summary:
+            return "Usage: /review <manager review summary>"
+        task, error = self._resolve_task_or_current("", chat_id=chat_id, usage="Usage: /review <manager review summary>")
+        if error:
+            return error
+        assert task is not None
+        reviewer = "manager"
+        if chat_id is not None:
+            reviewer = self.chat_state.current_agent(chat_id) or reviewer
+        try:
+            entry = ProgressJournal(self.workspace).append(
+                kind="manager-review",
+                summary=summary,
+                project_id=task.project_id,
+                task_id=task.task_id,
+                session_id=task.session_id,
+                agent_id=reviewer,
+                metadata={"status": "noted", "reviewer": reviewer},
+            )
+        except ValueError as exc:
+            return str(exc)
+        TaskBoard(self.workspace).add_note(task.task_id, format_review(entry), kind="manager-review")
+        if task.session_id:
+            SessionStateStore(self.workspace).upsert_from_progress(entry, objective=task.description or task.title)
+        return "\n".join(
+            [
+                f"Manager review recorded: {task.title}",
+                f"id: {entry.entry_id}",
+                "",
+                "Use /reviews to inspect or /context to see the next-run context.",
+            ]
+        )
+
+    def _reviews(self, rest: str, *, chat_id: int | None) -> str:
+        task, error = self._resolve_task_or_current(rest, chat_id=chat_id, usage="Usage: /reviews [task]")
+        if error:
+            return error
+        assert task is not None
+        entries = ProgressJournal(self.workspace).list(kind="manager-review", task_id=task.task_id, limit=5)
+        if not entries:
+            return f"No manager reviews for task: {task.title}"
+        lines = [f"Manager reviews: {task.title}"]
+        for index, entry in enumerate(entries, 1):
+            status = str(entry.metadata.get("status") or "").strip()
+            prefix = f"{status}: " if status else ""
+            lines.append(f"{index}. {prefix}{_one_line(entry.summary, 220)}")
+            if entry.next_steps:
+                lines.append(f"   next: {_one_line(entry.next_steps[0], 220)}")
+            if entry.blockers:
+                lines.append(f"   blocker: {_one_line(entry.blockers[0], 220)}")
+            if entry.decisions:
+                lines.append(f"   decision: {_one_line(entry.decisions[0], 220)}")
+        lines.append("")
+        lines.append("Use /context to see what will be injected into the next run.")
+        return "\n".join(lines)
+
+    def _resolve_task_or_current(
+        self,
+        rest: str,
+        *,
+        chat_id: int | None,
+        usage: str,
+    ) -> tuple[TaskRecord | None, str]:
+        task_ref = rest.strip()
+        if task_ref:
+            task = self._resolve_task(task_ref, chat_id=chat_id)
+            if task is None:
+                return None, f"Task not found: {task_ref}"
+            return task, ""
+        if chat_id is None:
+            return None, f"{usage}; Telegram chat required when no task is given."
+        current_task_id = self.chat_state.current_task(chat_id)
+        task = self._resolve_task(current_task_id) if current_task_id else None
+        if task is None:
+            return None, "No current task. Use /tasks and /use task <ref>, or pass a task id."
+        return task, ""
+
     def _default_project(self, *, chat_id: int | None) -> ProjectRecord | None:
         if chat_id is not None:
             current_project_id = self.chat_state.current_project(chat_id)
@@ -1080,6 +1502,24 @@ class TelegramCommandHandler:
         if len(matches) == 1:
             return matches[0]
         return None
+
+    def _resolve_project_or_current(
+        self,
+        rest: str,
+        *,
+        chat_id: int | None,
+        usage: str,
+    ) -> tuple[ProjectRecord | None, str]:
+        project_ref = rest.strip()
+        if project_ref:
+            project = self._resolve_project(project_ref, chat_id=chat_id)
+            if project is None:
+                return None, f"Project not found: {project_ref}"
+            return project, ""
+        project = self._default_project(chat_id=chat_id)
+        if project is None:
+            return None, f"No current project. Use /projects and /use project <ref>. {usage}"
+        return project, ""
 
     def _resolve_agent(self, value: str, *, chat_id: int | None = None) -> AgentRecord | None:
         clean = value.strip()
@@ -1272,6 +1712,8 @@ class TelegramCommandHandler:
             if chat_id is None:
                 return "This command requires a Telegram chat."
             return self._use_agent(tail, chat_id=chat_id)
+        if lowered in {"template", "role-template"}:
+            return self._agent_template(tail, chat_id=chat_id)
         agent_ref = rest.strip()
         if not agent_ref:
             if chat_id is not None:
@@ -1295,8 +1737,50 @@ class TelegramCommandHandler:
             f"resume: {agent.resume_policy}",
         ]
         lines.append("")
-        lines.append("Use /agent use <id or list #> to select it.")
+        lines.append("Use /agent use <id or list #> to select it, or /agent template <prompt> to customize guidance.")
         return "\n".join(lines)
+
+    def _agent_template(self, rest: str, *, chat_id: int | None) -> str:
+        clean = rest.strip()
+        if not clean:
+            return "Usage: /agent template <prompt>, /agent template <agent> <prompt>, or /agent template clear [agent]"
+        first, tail = _split_once(clean)
+        registry = AgentRegistry(self.workspace)
+        if first.lower() == "clear":
+            agent_ref = tail.strip()
+            if not agent_ref and chat_id is not None:
+                agent_ref = self.chat_state.current_agent(chat_id)
+            if not agent_ref:
+                return "No current agent. Use /agents and /use agent <ref>, or pass an agent id."
+            try:
+                agent = registry.set_role_template(agent_ref, "")
+            except ValueError as exc:
+                return str(exc)
+            return f"Agent template cleared: {agent.title}"
+
+        agent = self._resolve_agent(first, chat_id=chat_id) if tail else None
+        if agent is not None:
+            prompt = tail
+        else:
+            prompt = clean
+            if chat_id is None:
+                return "Telegram chat required when no agent is given."
+            current_agent = self.chat_state.current_agent(chat_id)
+            agent = self._resolve_agent(current_agent) if current_agent else None
+            if agent is None:
+                return "No current agent. Use /agents and /use agent <ref>, or pass an agent id."
+        try:
+            updated = registry.set_role_template(agent.agent_id, prompt)
+        except ValueError as exc:
+            return str(exc)
+        return "\n".join(
+            [
+                f"Agent template set: {updated.title}",
+                str(updated.metadata.get("role_template") or ""),
+                "",
+                "Future task runs for this agent will include this guidance.",
+            ]
+        )
 
     def _new_agent(self, rest: str, *, chat_id: int | None) -> str:
         agent_id, tail = _split_once(rest.strip())
@@ -1465,15 +1949,18 @@ class TelegramCommandHandler:
                 turns_started=int(state.get("turns_started") or 0),
                 last_job_id=str(state.get("last_job_id") or ""),
                 approval_mode=_auto_approval_mode(state),
+                mode=_auto_mode(state),
             )
             return f"Auto prompt updated:\n{prompt}"
+        if action in {"task", "by-task", "bytask"}:
+            return self._auto_start(tail, chat_id=chat_id, approval_mode=approval_mode, mode="task")
         if action == "start" or action == "on":
-            return self._auto_start(tail, chat_id=chat_id, approval_mode=approval_mode)
+            return self._auto_start(tail, chat_id=chat_id, approval_mode=approval_mode, mode="loop")
         if _looks_like_float(action):
-            return self._auto_start(clean, chat_id=chat_id, approval_mode=approval_mode)
-        return "Usage: /auto start [hours], /auto <hours>, /auto -h start, /auto status, /auto prompt <message>, or /auto end"
+            return self._auto_start(clean, chat_id=chat_id, approval_mode=approval_mode, mode="loop")
+        return "Usage: /auto start [hours], /auto task [hours], /auto <hours>, /auto -h start, /auto status, /auto prompt <message>, or /auto end"
 
-    def _auto_start(self, rest: str, *, chat_id: int, approval_mode: str) -> str:
+    def _auto_start(self, rest: str, *, chat_id: int, approval_mode: str, mode: str) -> str:
         task_id = self.chat_state.current_task(chat_id)
         task = self._resolve_task(task_id) if task_id else None
         if task is None:
@@ -1489,7 +1976,11 @@ class TelegramCommandHandler:
                     return "Auto duration must be positive hours, or omit it for no timer."
                 until = time.time() + hours * 3600.0
         state = self.chat_state.auto_state(chat_id)
-        prompt = prompt_override.strip() or str(state.get("prompt") or DEFAULT_AUTO_PROMPT)
+        normalized_mode = _normalize_auto_mode(mode)
+        default_prompt = DEFAULT_AUTO_TASK_PROMPT if normalized_mode == "task" else DEFAULT_AUTO_PROMPT
+        prompt = prompt_override.strip() or str(state.get("prompt") or default_prompt)
+        if normalized_mode == "task" and not prompt_override.strip():
+            prompt = DEFAULT_AUTO_TASK_PROMPT
         normalized_approval_mode = _normalize_auto_approval_mode(approval_mode)
         self.chat_state.set_auto_state(
             chat_id,
@@ -1500,12 +1991,14 @@ class TelegramCommandHandler:
             turns_started=0,
             last_job_id="",
             approval_mode=normalized_approval_mode,
+            mode=normalized_mode,
         )
         lines = [
             "Auto mode enabled.",
             f"task: {task.title}",
             f"timer: {_format_auto_until(until)}",
             f"approval: {_format_auto_approval_mode(normalized_approval_mode)}",
+            f"mode: {normalized_mode}",
         ]
         if self.job_queue is None:
             lines.append("Jobs are not enabled for this interface.")
@@ -1517,7 +2010,7 @@ class TelegramCommandHandler:
             lines.append("Auto will continue after the active job finishes.")
             return "\n".join(lines)
 
-        metadata = {"auto": True, "approval_mode": normalized_approval_mode}
+        metadata = {"auto": True, "approval_mode": normalized_approval_mode, "auto_mode": normalized_mode}
         session_id = self._safe_session_id_for_resume(task.session_id)
         if session_id:
             metadata["session_id"] = session_id
@@ -1537,6 +2030,7 @@ class TelegramCommandHandler:
             f"task: {task.title if task is not None else str(state.get('task_id') or '-')}",
             f"timer: {_format_auto_until(float(state.get('until') or 0.0))}",
             f"approval: {_format_auto_approval_mode(_auto_approval_mode(state))}",
+            f"mode: {_auto_mode(state)}",
             f"turns started: {int(state.get('turns_started') or 0)}",
         ]
         if state.get("last_job_id"):
@@ -1829,6 +2323,17 @@ def _auto_approval_mode(state: dict[str, Any]) -> str:
     return _normalize_auto_approval_mode(str(state.get("approval_mode") or DEFAULT_AUTO_APPROVAL_MODE))
 
 
+def _normalize_auto_mode(value: str) -> str:
+    clean = (value or "").strip().lower().replace("_", "-")
+    if clean in {"task", "by-task", "bytask", "until-task-done"}:
+        return "task"
+    return "loop"
+
+
+def _auto_mode(state: dict[str, Any]) -> str:
+    return _normalize_auto_mode(str(state.get("mode") or state.get("auto_mode") or "loop"))
+
+
 def _format_auto_approval_mode(value: str) -> str:
     return "human" if _normalize_auto_approval_mode(value) == HUMAN_AUTO_APPROVAL_MODE else "auto"
 
@@ -1892,10 +2397,57 @@ def _format_job_completion(job: JobRecord, approval_requested: bool) -> str:
         lines.append(f"note: {_one_line(job.error, 180)}")
     lines.append("")
     if job.status == "cancelled":
-        lines.append(job.final_text or "Run cancelled.")
+        lines.append(_strip_auto_task_marker(job.final_text) or "Run cancelled.")
     else:
-        lines.append(job.final_text or "Run finished without a final text response.")
+        lines.append(_strip_auto_task_marker(job.final_text) or "Run finished without a final text response.")
     return "\n".join(lines)
+
+
+def _auto_task_completed(text: str) -> bool:
+    return AUTO_TASK_DONE_MARKER in text
+
+
+def _strip_auto_task_marker(text: str) -> str:
+    lines = [line for line in text.splitlines() if line.strip() != AUTO_TASK_DONE_MARKER]
+    return "\n".join(lines).strip()
+
+
+def _format_memory_document(index: int, memory: MemoryDocument) -> list[str]:
+    owner = f":{memory.owner}" if memory.owner else ""
+    pin = "  pinned: yes" if memory.pinned else ""
+    lines = [
+        f"{index}. {_one_line(memory.title, 180)}",
+        f"   scope: {memory.scope}{owner}  type: {memory.memory_type}{pin}",
+    ]
+    excerpt = _memory_excerpt(memory.content, max_chars=300)
+    if excerpt:
+        lines.append(f"   note: {excerpt}")
+    return lines
+
+
+def _parse_compact_options(rest: str, *, default_title: str) -> tuple[str, bool]:
+    pinned = False
+    title_tokens: list[str] = []
+    for token in rest.split():
+        lowered = token.lower()
+        if lowered in {"--pin", "--pinned"}:
+            pinned = True
+            continue
+        title_tokens.append(token)
+    title = " ".join(title_tokens).strip() or default_title
+    return title, pinned
+
+
+def _memory_excerpt(value: str, *, max_chars: int) -> str:
+    parts: list[str] = []
+    for line in value.splitlines():
+        clean = line.strip()
+        if not clean or clean == "---":
+            continue
+        if clean.startswith("# "):
+            continue
+        parts.append(clean)
+    return _one_line(" ".join(parts), max_chars)
 
 
 def _one_line(value: str, max_chars: int) -> str:
@@ -1903,6 +2455,15 @@ def _one_line(value: str, max_chars: int) -> str:
     if len(clean) <= max_chars:
         return clean
     return clean[: max_chars - 1].rstrip() + "..."
+
+
+def _append_compact_list(lines: list[str], title: str, values: list[str], *, max_items: int) -> None:
+    clean_values = [_one_line(value, 220) for value in values if _one_line(value, 220)]
+    if not clean_values:
+        return
+    lines.append(f"{title}:")
+    for value in clean_values[:max_items]:
+        lines.append(f"- {value}")
 
 
 def _help_text() -> str:
@@ -1913,10 +2474,15 @@ def _help_text() -> str:
             "/projects",
             "/project <project_id or list #>",
             "/project new <project_id> <cwd> [title]",
+            "/projectstate [project]",
+            "/decisions [project]",
+            "/decide <decision text>",
             "/use project <project_id or list #>",
             "/agents [project]",
             "/agent <agent_id or list #>",
             "/agent new <agent_id> [adapter] [role] [title]",
+            "/agent template <prompt>",
+            "/agent template clear [agent]",
             "/use agent <agent_id or list #>",
             "/tasks [project]",
             "/task <task_id>",
@@ -1926,14 +2492,25 @@ def _help_text() -> str:
             "/use task <task_id or list #>",
             "/current",
             "/list",
+            "/context [task]",
+            "/memories [task]",
+            "/memory disable <memory #, id, title, or path>",
+            "/memory enable <memory #, id, title, or path>",
+            "/compact [--pin] [title]",
+            "/handoffs [task]",
+            "/review <manager review summary>",
+            "/reviews [task]",
             "/sessions [agent]",
             "/session <session_id or list #>",
             "/resume <session_id or list #> <message>",
             "/auto start [hours]",
+            "/auto task [hours]",
             "/auto -h start [hours]",
             "/auto <hours>",
             "/auto status",
+            "/auto prompt <message>",
             "/auto end",
+            "plain text message  (after /use, or to assistant before /use)",
             "/run <task_id> <message>",
             "/run <message>  (after /use)",
             "/approvals [pending|approved|rejected]",

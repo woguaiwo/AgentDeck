@@ -23,6 +23,9 @@ from agentdeck.core.config import Workspace
 from agentdeck.core.events import AgentEvent, EventKind
 
 
+SUBPROCESS_STREAM_LIMIT = 8 * 1024 * 1024
+
+
 _RESUME_RE = re.compile(r"\bTo resume this session:\s+kimi\s+-r\s+([0-9a-fA-F-]+)")
 
 
@@ -73,6 +76,7 @@ class KimiPrintAdapter:
                 stdin=subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=SUBPROCESS_STREAM_LIMIT,
             )
             cancel_task = asyncio.create_task(_terminate_on_cancel(process, cancellation))
 

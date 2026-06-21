@@ -16,8 +16,12 @@ from agentdeck.core.config import Workspace
 from agentdeck.core.events import AgentEvent, EventKind
 from agentdeck.core.runtime import AgentRuntime
 from agentdeck.storage.approvals import ApprovalRecord, ApprovalRegistry
-from agentdeck.storage.agents import AgentRecord, AgentRegistry
+from agentdeck.storage.agents import AgentRecord, AgentRegistry, role_template_for_agent
+from agentdeck.storage.memory import MemoryDocument, MemoryScope, MarkdownMemoryStore
+from agentdeck.storage.progress import ProgressEntry, ProgressJournal
 from agentdeck.storage.projects import ProjectRecord, ProjectRegistry
+from agentdeck.storage.project_state import DecisionRecord, ProjectStateCard, ProjectStateStore
+from agentdeck.storage.session_state import SessionStateCard, SessionStateStore
 from agentdeck.storage.sessions import SessionRecord, SessionRegistry
 from agentdeck.storage.tasks import TaskBoard, TaskRecord
 
@@ -118,8 +122,17 @@ async def run_agent_prompt(workspace: Workspace, request: RunRequest) -> RunServ
     project_dir = Path(request.cwd or ".").expanduser().resolve()
     adapter = _build_adapter(request)
 
+    active_task = task
     if task is not None:
-        task_board.set_status(task.task_id, "doing")
+        active_task = task_board.set_status(task.task_id, "doing") or task
+
+    adapter_prompt = _inject_agentdeck_context(
+        workspace,
+        request.prompt,
+        task=active_task,
+        agent=saved_agent,
+        session_id=session_id or (active_task.session_id if active_task is not None else ""),
+    )
 
     runtime = AgentRuntime(
         workspace,
@@ -127,12 +140,13 @@ async def run_agent_prompt(workspace: Workspace, request: RunRequest) -> RunServ
         agent_id=request.agent or "default",
         project_dir=project_dir,
         project_id=request.project or "",
-        task_id=task.task_id if task is not None else "",
+        task_id=active_task.task_id if active_task is not None else "",
         session_registry=session_registry,
         approval_registry=approval_registry,
     )
     result = await runtime.run_prompt(
-        request.prompt,
+        adapter_prompt,
+        display_prompt=request.prompt,
         session_id=session_id,
         title=request.title,
         cancellation=request.cancellation,
@@ -140,21 +154,21 @@ async def run_agent_prompt(workspace: Workspace, request: RunRequest) -> RunServ
 
     approval_requested = any(event.kind == EventKind.APPROVAL_REQUESTED for event in result.events)
     pending_approvals: list[ApprovalRecord] = []
-    if task is not None:
-        refreshed = task_board.resolve(task.task_id)
+    if active_task is not None:
+        refreshed = task_board.resolve(active_task.task_id)
         if refreshed is not None and refreshed.session_id != result.session_id:
             task_board.attach_session(refreshed.task_id, result.session_id)
         task_board.add_note(
-            task.task_id,
+            active_task.task_id,
             f"Ran prompt with agent {request.agent}; session_id: {result.session_id}",
             kind="run",
         )
         if approval_requested:
-            pending_approvals = approval_registry.list(status="pending", task_id=task.task_id)
+            pending_approvals = approval_registry.list(status="pending", task_id=active_task.task_id)
             approval_text = f"Approval required for session {result.session_id}"
             if pending_approvals:
                 approval_text += f"; approval_id: {pending_approvals[0].approval_id}"
-            task_board.set_status(task.task_id, "blocked", note=approval_text)
+            task_board.set_status(active_task.task_id, "blocked", note=approval_text)
 
     return RunServiceResult(
         session_id=result.session_id,
@@ -163,7 +177,7 @@ async def run_agent_prompt(workspace: Workspace, request: RunRequest) -> RunServ
         agent_id=request.agent or "default",
         adapter=request.adapter,
         project_id=request.project or "",
-        task_id=task.task_id if task is not None else "",
+        task_id=active_task.task_id if active_task is not None else "",
         approval_requested=approval_requested,
         pending_approvals=pending_approvals,
     )
@@ -196,6 +210,262 @@ def _build_adapter(request: RunRequest) -> AgentAdapter:
             extra_args=tuple(request.extra_args or ()),
         )
     raise RunConfigurationError(f"unsupported adapter: {adapter_name}")
+
+
+def _inject_agentdeck_context(
+    workspace: Workspace,
+    prompt: str,
+    *,
+    task: TaskRecord | None,
+    agent: AgentRecord | None = None,
+    session_id: str = "",
+) -> str:
+    context = build_agentdeck_context(workspace, task=task, agent=agent, session_id=session_id)
+    if not context:
+        return prompt
+    return f"{prompt.rstrip()}\n\n---\n{context}"
+
+
+def build_agentdeck_context(
+    workspace: Workspace,
+    *,
+    task: TaskRecord | None,
+    agent: AgentRecord | None = None,
+    session_id: str = "",
+    max_chars: int = 5000,
+    include_memories: bool = True,
+) -> str:
+    state_id = session_id or (task.session_id if task is not None else "")
+    project_id = task.project_id if task is not None else ""
+    project_state = ProjectStateStore(workspace).get(project_id) if project_id else None
+    project_decisions = ProjectStateStore(workspace).decisions(project_id, limit=5) if project_id else []
+    state = SessionStateStore(workspace).get(state_id) if state_id else None
+    active_agent = agent or (AgentRegistry(workspace).resolve(task.agent_id) if task is not None and task.agent_id else None)
+    agent_role_template = role_template_for_agent(active_agent) if active_agent is not None else ""
+    memories = collect_relevant_memories(workspace, task) if include_memories else []
+    handoffs = ProgressJournal(workspace).list(
+        kind="handoff",
+        task_id=task.task_id if task is not None else None,
+        session_id=None if task is not None else (state_id or None),
+        limit=3,
+    )
+    reviews = ProgressJournal(workspace).list(
+        kind="manager-review",
+        task_id=task.task_id if task is not None else None,
+        session_id=None if task is not None else (state_id or None),
+        limit=3,
+    )
+
+    if (
+        task is None
+        and project_state is None
+        and not project_decisions
+        and state is None
+        and not agent_role_template
+        and not memories
+        and not handoffs
+        and not reviews
+    ):
+        return ""
+
+    lines = [
+        "AgentDeck context:",
+        "Use this as compact project/task state. The user request is above this block.",
+    ]
+    if project_state is not None:
+        _append_project_state_context(lines, project_state)
+    if project_decisions:
+        _append_project_decisions_context(lines, project_decisions)
+    if task is not None:
+        _append_task_context(lines, task)
+    if active_agent is not None and agent_role_template:
+        _append_agent_role_context(lines, active_agent, agent_role_template)
+    if state is not None:
+        _append_state_context(lines, state)
+    if memories:
+        _append_memory_context(lines, memories)
+    if handoffs:
+        _append_handoff_context(lines, handoffs)
+    if reviews:
+        _append_review_context(lines, reviews)
+    return _limit_text("\n".join(lines), max_chars=max_chars)
+
+
+def collect_relevant_memories(workspace: Workspace, task: TaskRecord | None) -> list[MemoryDocument]:
+    if task is None:
+        return []
+    store = MarkdownMemoryStore(workspace)
+    targets: list[tuple[MemoryScope, str | None, int]] = [("project", None, 2)]
+    if task.project_id:
+        targets.append(("project", task.project_id, 3))
+    if task.team_id:
+        targets.append(("team", task.team_id, 2))
+    if task.agent_id:
+        targets.append(("agent", task.agent_id, 2))
+    targets.append(("task", task.task_id, 3))
+
+    memories: list[MemoryDocument] = []
+    seen: set[Path] = set()
+    for scope, owner, limit in targets:
+        for document in store.list_documents(scope=scope, owner=owner, limit=limit):
+            resolved = document.path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            memories.append(document)
+    memories.sort(key=lambda item: (not item.pinned, _memory_relevance_rank(item, task), -item.modified_at))
+    return memories[:6]
+
+
+def _memory_relevance_rank(memory: MemoryDocument, task: TaskRecord) -> int:
+    if memory.scope == "task" and memory.owner == task.task_id:
+        return 0
+    if memory.scope == "project" and memory.owner == task.project_id:
+        return 1
+    if memory.scope == "team" and memory.owner == task.team_id:
+        return 2
+    if memory.scope == "agent" and memory.owner == task.agent_id:
+        return 3
+    if memory.scope == "project" and not memory.owner:
+        return 4
+    return 5
+
+
+def _append_project_state_context(lines: list[str], state: ProjectStateCard) -> None:
+    lines.append("")
+    lines.append("Project state:")
+    _append_optional_line(lines, "goal", state.goal, max_chars=360)
+    _append_optional_line(lines, "phase", state.phase, max_chars=160)
+    _append_optional_line(lines, "current focus", state.current_focus, max_chars=300)
+    _append_list(lines, "next steps", state.next_steps, max_items=5)
+    _append_list(lines, "constraints", state.constraints, max_items=5)
+    _append_list(lines, "blockers", state.blockers, max_items=4)
+    _append_list(lines, "active artifacts", state.active_artifacts, max_items=5)
+
+
+def _append_project_decisions_context(lines: list[str], decisions: list[DecisionRecord]) -> None:
+    lines.append("")
+    lines.append("Project decisions:")
+    for decision in decisions[:5]:
+        lines.append(f"- {_one_line(decision.decision, 240)}")
+        if decision.reason:
+            lines.append(f"  reason: {_one_line(decision.reason, 220)}")
+        if decision.impact:
+            lines.append(f"  impact: {_one_line(decision.impact, 220)}")
+
+
+def _append_task_context(lines: list[str], task: TaskRecord) -> None:
+    lines.append("")
+    lines.append("Task:")
+    lines.append(f"- title: {_one_line(task.title, 160)}")
+    lines.append(f"- id: {task.task_id}")
+    lines.append(f"- status: {task.status}  priority: {task.priority}")
+    if task.project_id:
+        lines.append(f"- project: {task.project_id}")
+    if task.agent_id:
+        lines.append(f"- owner agent: {task.agent_id}")
+    if task.description:
+        lines.append(f"- objective: {_one_line(task.description, 360)}")
+
+
+def _append_agent_role_context(lines: list[str], agent: AgentRecord, template: str) -> None:
+    lines.append("")
+    lines.append("Agent role guidance:")
+    lines.append(f"- agent: {_one_line(agent.title, 160)} ({agent.agent_id})")
+    lines.append(f"- role: {agent.role}")
+    _append_list(lines, "guidance", template.splitlines(), max_items=6)
+
+
+def _append_state_context(lines: list[str], state: SessionStateCard) -> None:
+    lines.append("")
+    lines.append("Session state card:")
+    _append_optional_line(lines, "objective", state.objective, max_chars=360)
+    _append_optional_line(lines, "current state", state.current_state, max_chars=360)
+    _append_optional_line(lines, "next step", state.next_step, max_chars=240)
+    _append_list(lines, "blockers", state.blockers, max_items=4)
+    _append_list(lines, "verified work", state.verified_work, max_items=5)
+    _append_list(lines, "decisions", state.decisions, max_items=5)
+    _append_list(lines, "active artifacts", state.active_artifacts, max_items=5)
+
+
+def _append_memory_context(lines: list[str], memories: list[MemoryDocument]) -> None:
+    lines.append("")
+    lines.append("Relevant durable memories:")
+    for memory in memories:
+        owner = f":{memory.owner}" if memory.owner else ""
+        pin = " pinned" if memory.pinned else ""
+        lines.append(f"- {memory.title} [{memory.scope}{owner}]{pin}")
+        excerpt = _memory_excerpt(memory.content, max_chars=520)
+        if excerpt:
+            lines.append(f"  {excerpt}")
+
+
+def _append_handoff_context(lines: list[str], handoffs: list[ProgressEntry]) -> None:
+    lines.append("")
+    lines.append("Recent handoffs:")
+    for entry in handoffs:
+        lines.append(f"- {entry.summary}")
+        if entry.next_steps:
+            lines.append(f"  next: {_one_line(entry.next_steps[0], 240)}")
+        if entry.blockers:
+            lines.append(f"  blocker: {_one_line(entry.blockers[0], 240)}")
+        if entry.decisions:
+            lines.append(f"  decision: {_one_line(entry.decisions[0], 240)}")
+
+
+def _append_review_context(lines: list[str], reviews: list[ProgressEntry]) -> None:
+    lines.append("")
+    lines.append("Recent manager reviews:")
+    for entry in reviews:
+        status = str(entry.metadata.get("status") or "").strip()
+        prefix = f"{status}: " if status else ""
+        lines.append(f"- {prefix}{_one_line(entry.summary, 240)}")
+        if entry.next_steps:
+            lines.append(f"  next: {_one_line(entry.next_steps[0], 240)}")
+        if entry.blockers:
+            lines.append(f"  blocker: {_one_line(entry.blockers[0], 240)}")
+        if entry.decisions:
+            lines.append(f"  decision: {_one_line(entry.decisions[0], 240)}")
+
+
+def _append_optional_line(lines: list[str], label: str, value: str, *, max_chars: int) -> None:
+    clean = _one_line(value, max_chars)
+    if clean:
+        lines.append(f"- {label}: {clean}")
+
+
+def _append_list(lines: list[str], label: str, values: list[str], *, max_items: int) -> None:
+    clean_values = [_one_line(value, 220) for value in values if _one_line(value, 220)]
+    if not clean_values:
+        return
+    lines.append(f"- {label}:")
+    for value in clean_values[-max_items:]:
+        lines.append(f"  - {value}")
+
+
+def _one_line(value: str, max_chars: int) -> str:
+    clean = " ".join(str(value).strip().split())
+    if len(clean) <= max_chars:
+        return clean
+    return clean[: max_chars - 1].rstrip() + "..."
+
+
+def _memory_excerpt(value: str, *, max_chars: int) -> str:
+    lines = []
+    for line in value.splitlines():
+        clean = line.strip()
+        if not clean or clean == "---":
+            continue
+        if clean.startswith("# "):
+            continue
+        lines.append(clean)
+    return _one_line(" ".join(lines), max_chars)
+
+
+def _limit_text(value: str, *, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    return value[: max_chars - 1].rstrip() + "..."
 
 
 def _session_resume_problem(session: SessionRecord, request: RunRequest) -> str:
