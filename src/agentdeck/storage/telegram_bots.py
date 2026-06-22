@@ -1,12 +1,13 @@
 """Local Telegram bot registry.
 
-Bot tokens are workspace-local operational config. They should not be committed.
+Bot tokens are platform workspace-local operational config. They should not be committed.
 """
 
 from __future__ import annotations
 
 import json
 import re
+import socket
 import tomllib
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -26,6 +27,14 @@ class TelegramBotRecord:
     allowed_chat_ids: list[int] = field(default_factory=list)
     source: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def server_id(self) -> str:
+        return str(self.metadata.get("server_id") or "")
+
+    @property
+    def assistant_agent_id(self) -> str:
+        return str(self.metadata.get("assistant_agent_id") or "")
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TelegramBotRecord":
@@ -58,18 +67,28 @@ class TelegramBotRegistry:
         title: str = "",
         allowed_chat_ids: list[int] | None = None,
         source: str = "",
+        metadata: dict[str, Any] | None = None,
+        assistant_agent_id: str = "",
+        server_id: str = "",
     ) -> TelegramBotRecord:
         clean_id = _normalize_bot_id(bot_id)
         clean_token = _normalize_token(token)
         if not clean_token:
             raise ValueError(f"missing Telegram token for bot: {bot_id}")
         records = self._read()
+        existing = records.get(clean_id)
+        clean_metadata = dict(existing.metadata) if existing is not None else {}
+        clean_metadata.update(dict(metadata or {}))
+        clean_metadata["server_id"] = str(clean_metadata.get("server_id") or server_id or current_server_id())
+        if assistant_agent_id:
+            clean_metadata["assistant_agent_id"] = assistant_agent_id
         record = TelegramBotRecord(
             bot_id=clean_id,
             title=title.strip() or clean_id,
             token=clean_token,
             allowed_chat_ids=sorted(set(allowed_chat_ids or [])),
             source=source,
+            metadata=clean_metadata,
         )
         records[clean_id] = record
         self._write(records)
@@ -78,8 +97,25 @@ class TelegramBotRegistry:
     def get(self, bot_id: str) -> TelegramBotRecord | None:
         return self._read().get(_normalize_bot_id(bot_id))
 
-    def list(self) -> list[TelegramBotRecord]:
-        return sorted(self._read().values(), key=lambda item: item.bot_id)
+    def list(self, *, server_id: str | None = None) -> list[TelegramBotRecord]:
+        records = list(self._read().values())
+        if server_id:
+            records = [record for record in records if (record.server_id or server_id) == server_id]
+        return sorted(records, key=lambda item: item.bot_id)
+
+    def assign_assistant(self, bot_id: str, assistant_agent_id: str, *, server_id: str = "") -> TelegramBotRecord:
+        records = self._read()
+        clean_id = _normalize_bot_id(bot_id)
+        record = records.get(clean_id)
+        if record is None:
+            raise ValueError(f"telegram bot not found: {bot_id}")
+        metadata = dict(record.metadata)
+        metadata["server_id"] = metadata.get("server_id") or server_id or current_server_id()
+        metadata["assistant_agent_id"] = assistant_agent_id
+        record.metadata = metadata
+        records[clean_id] = record
+        self._write(records)
+        return record
 
     def import_file(self, path: str | Path) -> list[TelegramBotRecord]:
         source = Path(path).expanduser().resolve()
@@ -96,6 +132,7 @@ class TelegramBotRegistry:
                     token=record.token,
                     allowed_chat_ids=record.allowed_chat_ids,
                     source=record.source,
+                    metadata=record.metadata,
                 )
             )
         return imported
@@ -158,6 +195,10 @@ def _parse_toml_bots(text: str, *, source: str) -> list[TelegramBotRecord]:
                 token=token,
                 allowed_chat_ids=_int_list(value.get("allowed_chat_ids") or value.get("chat_ids") or value.get("chat_id")),
                 source=source,
+                metadata={
+                    "server_id": str(value.get("server_id") or current_server_id()),
+                    "assistant_agent_id": str(value.get("assistant_agent_id") or ""),
+                },
             )
         )
     return records
@@ -167,6 +208,7 @@ def _parse_loose_bots(text: str, *, source: str) -> list[TelegramBotRecord]:
     records: list[TelegramBotRecord] = []
     current_name = ""
     current_chats: list[int] = []
+    source_server = ""
     for line in text.splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
@@ -181,10 +223,15 @@ def _parse_loose_bots(text: str, *, source: str) -> list[TelegramBotRecord]:
         if sep:
             clean_key = key.strip().lower().replace("-", "_")
             clean_value = value.strip().strip("'\"")
-            if clean_key in {"name", "bot", "bot_id"}:
+            if clean_key == "server":
+                source_server = clean_value
+            elif clean_key in {"name", "bot", "bot_id"}:
                 current_name = clean_value
             elif clean_key in {"chat_id", "chat_ids", "allowed_chat_ids", "allowed_chats"}:
                 current_chats = _int_list(clean_value)
+            elif not clean_value and _looks_like_loose_bot_heading(key):
+                current_name = key.strip()
+                current_chats = []
         token_match = TOKEN_PATTERN.search(stripped)
         if not token_match:
             continue
@@ -197,9 +244,28 @@ def _parse_loose_bots(text: str, *, source: str) -> list[TelegramBotRecord]:
                 token=token,
                 allowed_chat_ids=current_chats,
                 source=source,
+                metadata={"server_id": current_server_id(), "source_server": source_server},
             )
         )
     return records
+
+
+def _looks_like_loose_bot_heading(value: str) -> bool:
+    clean = value.strip()
+    if not clean or " " in clean:
+        return False
+    lowered = clean.lower()
+    if lowered in {"agents", "token", "working", "folder", "tmux", "session"}:
+        return False
+    return bool(re.search(r"(bot|agent|team)", lowered))
+
+
+def current_server_id() -> str:
+    return socket.gethostname().strip() or "unknown-server"
+
+
+def assistant_agent_id_for_bot(bot_id: str) -> str:
+    return f"assistant-{_normalize_bot_id(bot_id)}"
 
 
 def _normalize_bot_id(value: str) -> str:

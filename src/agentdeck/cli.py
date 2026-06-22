@@ -13,9 +13,9 @@ import sys
 import time
 from pathlib import Path
 
-from agentdeck.core.config import Workspace
+from agentdeck.core.config import DEFAULT_PROJECT_LOCAL_CONFIG, Workspace, find_project_local_config, project_local_config_path
 from agentdeck.core.run_service import RunConfigurationError, RunRequest, build_agentdeck_context, run_agent_prompt
-from agentdeck.interfaces.telegram import TelegramBotApi, TelegramServer, config_from_env
+from agentdeck.interfaces.telegram import TelegramBotApi, TelegramMultiServer, TelegramServer, config_from_env
 from agentdeck.storage.approvals import APPROVAL_STATUSES, ApprovalRecord, ApprovalRegistry
 from agentdeck.storage.event_log import EventLog
 from agentdeck.storage.agents import ASSISTANT_AGENT_ID, DEFAULT_ASSISTANT_TEMPLATE, AgentRecord, AgentRegistry
@@ -26,16 +26,26 @@ from agentdeck.storage.project_state import ProjectStateStore
 from agentdeck.storage.session_state import SessionStateStore
 from agentdeck.storage.sessions import SessionRecord, SessionRegistry
 from agentdeck.storage.tasks import TASK_PRIORITIES, TASK_STATUSES, TaskBoard, TaskRecord
-from agentdeck.storage.telegram_bots import TelegramBotRegistry, redacted_token
+from agentdeck.storage.telegram_bots import (
+    TelegramBotRegistry,
+    assistant_agent_id_for_bot,
+    current_server_id,
+    redacted_token,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agentdeck", description="Remote control plane for AI agent teams")
-    parser.add_argument("--workspace", help="Override .agentdeck workspace path")
+    parser.add_argument("--workspace", help="Override the AgentDeck platform workspace path")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    init = sub.add_parser("init", help="Create a project-local AgentDeck workspace")
-    init.add_argument("path", nargs="?", default=".", help="Project directory")
+    init = sub.add_parser("init", help="Create or verify the AgentDeck platform workspace")
+    init.add_argument("path", nargs="?", default=".", help="Project directory used only with --project-config")
+    init.add_argument(
+        "--project-config",
+        action="store_true",
+        help="Also create an optional project-local .agentdeck.toml integration config",
+    )
 
     sub.add_parser("doctor", help="Print workspace diagnostics")
 
@@ -77,6 +87,14 @@ def build_parser() -> argparse.ArgumentParser:
     assistant_setup.add_argument("--replace", action="store_true")
     assistant_show = assistant_sub.add_parser("show", help="Show the default assistant agent")
     assistant_show.add_argument("--agent", default=ASSISTANT_AGENT_ID)
+    assistant_setup_bots = assistant_sub.add_parser("setup-bots", help="Create one assistant for each saved bot on this server")
+    assistant_setup_bots.add_argument("--server", default=current_server_id(), help="Server id to assign. Defaults to this host.")
+    assistant_setup_bots.add_argument("--all-servers", action="store_true", help="Assign assistants for all saved bots")
+    assistant_setup_bots.add_argument("--adapter", default="echo", choices=["echo", "codex", "codex-exec", "kimi", "kimi-print"])
+    assistant_setup_bots.add_argument("--cwd", default=".", help="Working directory for bot assistants")
+    assistant_setup_bots.add_argument("--model")
+    assistant_setup_bots.add_argument("--approval-mode", default="fail", choices=["fail", "record", "bypass"])
+    assistant_setup_bots.add_argument("--replace", action="store_true")
 
     memory = sub.add_parser("memory", help="Manage markdown memory")
     mem_sub = memory.add_subparsers(dest="memory_command", required=True)
@@ -276,8 +294,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     telegram = sub.add_parser("telegram", help="Run Telegram remote interface")
     telegram_sub = telegram.add_subparsers(dest="telegram_command", required=True)
-    telegram_serve = telegram_sub.add_parser("serve", help="Start Telegram long-polling bot")
-    telegram_serve.add_argument("--bot", help="Saved bot id from telegram bots registry")
+    telegram_serve = telegram_sub.add_parser("serve", help="Start Telegram long-polling service")
+    telegram_serve.add_argument("--bot", help="Only serve one saved bot id from telegram bots registry")
+    telegram_serve.add_argument("--assistant-agent", help="Assistant agent used before a task is selected")
     telegram_serve.add_argument("--token", help="Telegram bot token; defaults to AGENTDECK_TELEGRAM_TOKEN")
     telegram_serve.add_argument(
         "--allowed-chat-id",
@@ -287,8 +306,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     telegram_serve.add_argument("--poll-timeout", type=int, default=30)
     telegram_serve.add_argument("--once", action="store_true", help="Process one polling response and exit")
-    telegram_start = telegram_sub.add_parser("start", help="Start Telegram bot as a detached background process")
-    telegram_start.add_argument("--bot", help="Saved bot id from telegram bots registry")
+    telegram_start = telegram_sub.add_parser("start", help="Start Telegram service as a detached background process")
+    telegram_start.add_argument("--bot", help="Only serve one saved bot id from telegram bots registry")
+    telegram_start.add_argument("--assistant-agent", help="Assistant agent used before a task is selected")
     telegram_start.add_argument("--token", help="Telegram bot token; defaults to AGENTDECK_TELEGRAM_TOKEN")
     telegram_start.add_argument(
         "--allowed-chat-id",
@@ -307,6 +327,8 @@ def build_parser() -> argparse.ArgumentParser:
     telegram_bots_add.add_argument("--title", default="")
     telegram_bots_add.add_argument("--token", required=True)
     telegram_bots_add.add_argument("--allowed-chat-id", action="append", default=[])
+    telegram_bots_add.add_argument("--assistant-agent", default="")
+    telegram_bots_add.add_argument("--server", default=current_server_id())
     telegram_bots_import = telegram_bots_sub.add_parser("import", help="Import bot configs from TOML or loose text")
     telegram_bots_import.add_argument("path")
     telegram_bots_sub.add_parser("list", help="List saved Telegram bots")
@@ -355,9 +377,14 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(_normalize_argv(argv))
 
     if args.command == "init":
-        workspace = resolve_workspace(args, cwd=args.path)
+        workspace = resolve_workspace(args)
         workspace.ensure()
-        print(f"initialized: {workspace.root}")
+        print(f"initialized platform workspace: {workspace.root}")
+        if args.project_config:
+            config_path = project_local_config_path(args.path)
+            if not config_path.exists():
+                config_path.write_text(DEFAULT_PROJECT_LOCAL_CONFIG, encoding="utf-8")
+            print(f"project config: {config_path}")
         return 0
 
     workspace = resolve_workspace(args)
@@ -366,6 +393,9 @@ def main(argv: list[str] | None = None) -> int:
         workspace.ensure()
         for key, value in workspace.doctor().items():
             print(f"{key}: {value}")
+        local_config = find_project_local_config()
+        print(f"project_local_config: {local_config or ''}")
+        print(f"project_local_config_exists: {local_config is not None}")
         return 0
 
     if args.command == "run":
@@ -377,6 +407,8 @@ def main(argv: list[str] | None = None) -> int:
         registry = AgentRegistry(workspace)
         if args.assistant_command == "setup":
             return _setup_assistant(registry, args)
+        if args.assistant_command == "setup-bots":
+            return _setup_bot_assistants(workspace, registry, args)
         if args.assistant_command == "show":
             record = registry.resolve(args.agent)
             if record is None:
@@ -607,11 +639,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "telegram":
         workspace.ensure()
         if args.telegram_command == "serve":
-            config = _telegram_config_from_args(args, workspace)
-            if not config.token:
+            configs = _telegram_configs_from_args(args, workspace)
+            if not configs:
                 print("missing Telegram token; set AGENTDECK_TELEGRAM_TOKEN or pass --token", file=sys.stderr)
                 return 2
-            TelegramServer(workspace, TelegramBotApi(config.token), config).serve_forever(once=args.once)
+            if len(configs) == 1:
+                config = configs[0]
+                TelegramServer(workspace, TelegramBotApi(config.token), config).serve_forever(once=args.once)
+            else:
+                TelegramMultiServer(workspace, configs).serve_forever(once=args.once)
             return 0
         if args.telegram_command == "bots":
             return _telegram_bots(args, workspace)
@@ -627,14 +663,14 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _telegram_start(args: argparse.Namespace, workspace: Workspace) -> int:
-    config = _telegram_config_from_args(args, workspace)
-    if not config.token:
+    configs = _telegram_configs_from_args(args, workspace)
+    if not configs:
         print("missing Telegram token; set AGENTDECK_TELEGRAM_TOKEN or pass --token", file=sys.stderr)
         return 2
 
     pid = _read_pid(_telegram_pid_path(workspace))
     if pid and _pid_alive(pid):
-        print(f"telegram bot already running: pid={pid}")
+        print(f"telegram service already running: pid={pid}")
         print(f"log: {_telegram_log_path(workspace)}")
         return 0
 
@@ -643,9 +679,6 @@ def _telegram_start(args: argparse.Namespace, workspace: Workspace) -> int:
     log_path = _telegram_log_path(workspace)
     pid_path = _telegram_pid_path(workspace)
     env = os.environ.copy()
-    env["AGENTDECK_TELEGRAM_TOKEN"] = config.token
-    if config.allowed_chat_ids:
-        env["AGENTDECK_TELEGRAM_ALLOWED_CHATS"] = ",".join(str(chat_id) for chat_id in sorted(config.allowed_chat_ids))
     command = [
         sys.executable,
         "-m",
@@ -655,8 +688,19 @@ def _telegram_start(args: argparse.Namespace, workspace: Workspace) -> int:
         "telegram",
         "serve",
         "--poll-timeout",
-        str(config.poll_timeout),
+        str(args.poll_timeout),
     ]
+    if len(configs) == 1:
+        config = configs[0]
+        env["AGENTDECK_TELEGRAM_TOKEN"] = config.token
+        if config.bot_id:
+            env["AGENTDECK_TELEGRAM_BOT_ID"] = config.bot_id
+            command.extend(["--bot", config.bot_id])
+        if config.assistant_agent_id:
+            env["AGENTDECK_TELEGRAM_ASSISTANT_AGENT"] = config.assistant_agent_id
+            command.extend(["--assistant-agent", config.assistant_agent_id])
+        if config.allowed_chat_ids:
+            env["AGENTDECK_TELEGRAM_ALLOWED_CHATS"] = ",".join(str(chat_id) for chat_id in sorted(config.allowed_chat_ids))
     with log_path.open("ab") as log:
         process = subprocess.Popen(
             command,
@@ -668,15 +712,30 @@ def _telegram_start(args: argparse.Namespace, workspace: Workspace) -> int:
             start_new_session=True,
         )
     pid_path.write_text(str(process.pid), encoding="utf-8")
-    print(f"telegram bot started: pid={process.pid}")
+    bot_text = "all current-server bots" if len(configs) > 1 else (configs[0].bot_id or "single bot")
+    print(f"telegram service started: pid={process.pid}")
+    print(f"bots: {bot_text}")
     print(f"workspace: {workspace.root}")
     print(f"log: {log_path}")
     return 0
 
 
+def _telegram_configs_from_args(args: argparse.Namespace, workspace: Workspace):
+    bot_id = getattr(args, "bot", "") or ""
+    token = getattr(args, "token", None)
+    if bot_id:
+        config = _telegram_config_from_args(args, workspace)
+        return [config] if config.token else []
+    if not token and _has_current_server_bots(workspace):
+        return _telegram_configs_from_current_server_bots(args, workspace)
+    config = _telegram_config_from_args(args, workspace)
+    return [config] if config.token else []
+
+
 def _telegram_config_from_args(args: argparse.Namespace, workspace: Workspace):
     token = getattr(args, "token", None)
     allowed = list(getattr(args, "allowed_chat_id", []) or [])
+    assistant_agent_id = getattr(args, "assistant_agent", "") or ""
     bot_id = getattr(args, "bot", "") or ""
     if bot_id:
         bot = TelegramBotRegistry(workspace).get(bot_id)
@@ -684,9 +743,36 @@ def _telegram_config_from_args(args: argparse.Namespace, workspace: Workspace):
             print(f"telegram bot not found: {bot_id}", file=sys.stderr)
             return config_from_env(token="", allowed_chat_ids=[], poll_timeout=args.poll_timeout)
         token = token or bot.token
+        assistant_agent_id = assistant_agent_id or bot.assistant_agent_id
         if not allowed:
             allowed = [str(chat_id) for chat_id in bot.allowed_chat_ids]
-    return config_from_env(token=token, allowed_chat_ids=allowed, poll_timeout=args.poll_timeout)
+    return config_from_env(
+        token=token,
+        allowed_chat_ids=allowed,
+        poll_timeout=args.poll_timeout,
+        bot_id=bot_id,
+        assistant_agent_id=assistant_agent_id,
+    )
+
+
+def _telegram_configs_from_current_server_bots(args: argparse.Namespace, workspace: Workspace):
+    configs = []
+    for bot in TelegramBotRegistry(workspace).list(server_id=current_server_id()):
+        allowed = [str(chat_id) for chat_id in bot.allowed_chat_ids]
+        configs.append(
+            config_from_env(
+                token=bot.token,
+                allowed_chat_ids=allowed,
+                poll_timeout=args.poll_timeout,
+                bot_id=bot.bot_id,
+                assistant_agent_id=bot.assistant_agent_id or assistant_agent_id_for_bot(bot.bot_id),
+            )
+        )
+    return [config for config in configs if config.token]
+
+
+def _has_current_server_bots(workspace: Workspace) -> bool:
+    return bool(TelegramBotRegistry(workspace).list(server_id=current_server_id()))
 
 
 def _telegram_bots(args: argparse.Namespace, workspace: Workspace) -> int:
@@ -698,9 +784,14 @@ def _telegram_bots(args: argparse.Namespace, workspace: Workspace) -> int:
             token=args.token,
             allowed_chat_ids=[int(value) for value in args.allowed_chat_id if str(value).strip().lstrip("-").isdigit()],
             source="cli",
+            assistant_agent_id=args.assistant_agent,
+            server_id=args.server,
         )
         print(f"bot: {record.title} ({record.bot_id})")
         print(f"token: {redacted_token(record.token)}")
+        print(f"server_id: {record.server_id}")
+        if record.assistant_agent_id:
+            print(f"assistant_agent_id: {record.assistant_agent_id}")
         if record.allowed_chat_ids:
             print("allowed_chat_ids: " + ", ".join(str(value) for value in record.allowed_chat_ids))
         return 0
@@ -708,7 +799,8 @@ def _telegram_bots(args: argparse.Namespace, workspace: Workspace) -> int:
         records = registry.import_file(args.path)
         print(f"imported: {len(records)}")
         for record in records:
-            print(f"- {record.title} ({record.bot_id}) token={redacted_token(record.token)}")
+            assistant_text = f" assistant={record.assistant_agent_id}" if record.assistant_agent_id else ""
+            print(f"- {record.title} ({record.bot_id}) token={redacted_token(record.token)} server={record.server_id}{assistant_text}")
         return 0
     if args.telegram_bots_command == "list":
         records = registry.list()
@@ -717,7 +809,8 @@ def _telegram_bots(args: argparse.Namespace, workspace: Workspace) -> int:
             return 0
         for record in records:
             chats = ",".join(str(value) for value in record.allowed_chat_ids) or "-"
-            print(f"{record.bot_id}\t{record.title}\t{redacted_token(record.token)}\tchats={chats}")
+            assistant_text = record.assistant_agent_id or "-"
+            print(f"{record.bot_id}\t{record.title}\t{redacted_token(record.token)}\tchats={chats}\tserver={record.server_id or '-'}\tassistant={assistant_text}")
         return 0
     return 2
 
@@ -726,25 +819,25 @@ def _telegram_stop(args: argparse.Namespace, workspace: Workspace) -> int:
     pid_path = _telegram_pid_path(workspace)
     pid = _read_pid(pid_path)
     if not pid:
-        print("telegram bot is not running")
+        print("telegram service is not running")
         return 0
     if not _pid_alive(pid):
         _unlink_quietly(pid_path)
-        print(f"telegram bot is not running; removed stale pid {pid}")
+        print(f"telegram service is not running; removed stale pid {pid}")
         return 0
     os.kill(pid, signal.SIGTERM)
     for _ in range(50):
         if not _pid_alive(pid):
             _unlink_quietly(pid_path)
-            print(f"telegram bot stopped: pid={pid}")
+            print(f"telegram service stopped: pid={pid}")
             return 0
         time.sleep(0.1)
     if args.force:
         os.kill(pid, signal.SIGKILL)
         _unlink_quietly(pid_path)
-        print(f"telegram bot killed: pid={pid}")
+        print(f"telegram service killed: pid={pid}")
         return 0
-    print(f"telegram bot did not stop after SIGTERM: pid={pid}", file=sys.stderr)
+    print(f"telegram service did not stop after SIGTERM: pid={pid}", file=sys.stderr)
     print("rerun with: agentdeck telegram stop --force", file=sys.stderr)
     return 1
 
@@ -753,14 +846,14 @@ def _telegram_status(workspace: Workspace) -> int:
     pid = _read_pid(_telegram_pid_path(workspace))
     log_path = _telegram_log_path(workspace)
     if pid and _pid_alive(pid):
-        print(f"telegram bot: running pid={pid}")
+        print(f"telegram service: running pid={pid}")
         print(f"log: {log_path}")
         return 0
     if pid:
-        print(f"telegram bot: stopped stale_pid={pid}")
+        print(f"telegram service: stopped stale_pid={pid}")
         print(f"log: {log_path}")
         return 1
-    print("telegram bot: stopped")
+    print("telegram service: stopped")
     print(f"log: {log_path}")
     return 1
 
@@ -1033,6 +1126,40 @@ def _setup_assistant(registry: AgentRegistry, args: argparse.Namespace) -> int:
     print(f"assistant: {record.title} ({record.agent_id})")
     print(f"adapter: {record.adapter}")
     print(f"cwd: {record.project_dir}")
+    return 0
+
+
+def _setup_bot_assistants(workspace: Workspace, registry: AgentRegistry, args: argparse.Namespace) -> int:
+    bot_registry = TelegramBotRegistry(workspace)
+    server_id = "" if args.all_servers else args.server
+    bots = bot_registry.list(server_id=server_id or None)
+    if not bots:
+        target = "all servers" if args.all_servers else f"server {args.server}"
+        print(f"no telegram bots for {target}")
+        return 0
+    print(f"server: {args.server if not args.all_servers else 'all'}")
+    print(f"bots: {len(bots)}")
+    for bot in bots:
+        agent_id = bot.assistant_agent_id or assistant_agent_id_for_bot(bot.bot_id)
+        try:
+            record = registry.upsert(
+                agent_id=agent_id,
+                title=f"{bot.title} Assistant",
+                project_id="",
+                role="manager",
+                team_id="agentdeck",
+                adapter=args.adapter,
+                project_dir=args.cwd,
+                model=args.model or "",
+                approval_mode=args.approval_mode,
+                replace=args.replace,
+            )
+            record = registry.set_role_template(record.agent_id, DEFAULT_ASSISTANT_TEMPLATE)
+            bot_registry.assign_assistant(bot.bot_id, record.agent_id, server_id=bot.server_id or args.server)
+        except ValueError as exc:
+            print(f"{bot.bot_id}: {exc}", file=sys.stderr)
+            return 2
+        print(f"- {bot.title} ({bot.bot_id}) -> {record.agent_id}")
     return 0
 
 

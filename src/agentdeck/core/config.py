@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-DEFAULT_CONFIG = """# AgentDeck project configuration
+DEFAULT_CONFIG = """# AgentDeck platform configuration
 
 [project]
 name = ""
@@ -19,20 +19,36 @@ default_adapter = "echo"
 enabled = true
 """
 
+DEFAULT_PROJECT_LOCAL_CONFIG = """# AgentDeck project-local integration hints
+#
+# This file is optional. AgentDeck platform state lives in the main workspace;
+# keep only directory-specific adapter/TUI hints here.
+
+[project]
+id = ""
+
+[tui]
+profile = ""
+command = []
+"""
+
+PROJECT_LOCAL_CONFIG_NAMES = (".agentdeck.toml", "agentdeck.toml")
+
 
 @dataclass(frozen=True)
 class Workspace:
-    """A project-local AgentDeck workspace."""
+    """AgentDeck control-plane workspace."""
 
     root: Path
 
     @classmethod
     def from_cwd(cls, cwd: str | Path | None = None) -> "Workspace":
-        base = Path(cwd or os.getcwd()).expanduser().resolve()
+        """Resolve the platform workspace, not a caller-directory workspace."""
+
         override = os.environ.get("AGENTDECK_WORKSPACE")
         if override:
             return cls(Path(override).expanduser().resolve())
-        return cls(base / ".agentdeck")
+        return cls(default_workspace_root())
 
     @classmethod
     def global_home(cls) -> "Workspace":
@@ -134,3 +150,39 @@ class Workspace:
             "project_state": str(self.project_state_dir),
             "memory": str(self.memory_dir),
         }
+
+
+def default_workspace_root() -> Path:
+    """Return AgentDeck's platform workspace, independent of the caller cwd."""
+
+    source_root = _find_agentdeck_source_root()
+    if source_root is not None:
+        return source_root / ".agentdeck"
+    return Workspace.global_home().root
+
+
+def project_local_config_path(project_dir: str | Path) -> Path:
+    """Return the optional project-local AgentDeck integration config path."""
+
+    return Path(project_dir).expanduser().resolve() / PROJECT_LOCAL_CONFIG_NAMES[0]
+
+
+def find_project_local_config(cwd: str | Path | None = None) -> Path | None:
+    """Find an optional project-local config without treating it as a workspace."""
+
+    start = Path(cwd or os.getcwd()).expanduser().resolve()
+    candidates = (start, *start.parents)
+    for directory in candidates:
+        for name in PROJECT_LOCAL_CONFIG_NAMES:
+            path = directory / name
+            if path.exists():
+                return path
+    return None
+
+
+def _find_agentdeck_source_root() -> Path | None:
+    current = Path(__file__).resolve()
+    for parent in current.parents:
+        if (parent / "pyproject.toml").exists() and (parent / "src" / "agentdeck").is_dir():
+            return parent
+    return None

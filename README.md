@@ -1,85 +1,132 @@
 # AgentDeck
 
-AgentDeck is a remote control plane for AI agent teams.
+AgentDeck is an AI agent control plane for running coding agents as persistent,
+remotely managed project teams.
 
-It is the next-generation architecture inspired by TeleAgent: instead of treating
-AI CLIs as terminal screens to scrape, AgentDeck separates interfaces, runtime
-state, model adapters, memory, approvals, and task orchestration.
+It is inspired by TeleAgent, but it does not treat AI CLIs as terminal screens
+to scrape. AgentDeck separates the interface, runtime state, adapters, memory,
+approvals, tasks, and project orchestration into explicit system components.
 
-## Goals
+## Core Capabilities
 
-- Control multiple AI agents across projects from Telegram, CLI, and later a web UI.
-- Support multiple backends through adapters: Codex, Claude Code, Kimi Code, DeepSeek, and legacy TUI wrappers.
-- Keep shared memory explicit, scoped, searchable, and auditable.
-- Make long-running work visible through sessions, task cards, event logs, approvals, and handoff notes.
-- Allow cheap models to do routine work while stronger models plan, review, and arbitrate.
+AgentDeck is organized around five layers:
 
-## Current Status
+1. **AI Agent Harness**
+   - Provides adapter interfaces for coding agents.
+   - Currently supports Codex non-interactive runs with `codex exec --json` and
+     Kimi non-interactive runs with `kimi --print --output-format stream-json`.
+   - Keeps room for Claude Code, DeepSeek HTTP mode, and legacy TUI adapters.
 
-This repository starts with a minimal core:
+2. **Project Control Plane**
+   - Manages projects, agents, tasks, sessions, jobs, approvals, events, and
+     workspace state.
+   - Turns one-off terminal sessions into traceable project workflows.
 
-- Workspace initialization under `.agentdeck/`
-- Structured event model
-- Adapter protocol
-- Debug echo adapter
-- Codex non-interactive adapter using `codex exec --json`
-- Kimi non-interactive adapter using `kimi --print --output-format stream-json`
-- Project registry for managing multiple source projects from one workspace
-- Agent registry with project defaults, role, team, and resume policy
-- Task board with project, agent, session, status, priority, and notes
-- Session registry with human-readable titles and provider session ids
-- Approval registry for backend approval requests and explicit decisions
-- Telegram long-polling interface with persisted background run jobs
-- Markdown memory store with `user`, `project`, `team`, `agent`, and `task` scopes
-- JSONL event log
-- CLI smoke path
+3. **Multi-Agent Collaboration**
+   - Models project roles such as owner, manager, planner, developer, tester,
+     executor, and reviewer.
+   - Supports task boards, handoff notes, manager reviews, decision logs,
+     project state cards, and session state cards.
 
-The first real adapter targets should be:
+4. **Remote Interface And Navigation Assistant**
+   - Exposes a Telegram control surface today, with CLI and future TUI/Web
+     interfaces sharing the same state model.
+   - Lets each Telegram bot use its own assistant before a chat selects a task.
+   - Allows the assistant to execute a narrow whitelist of safe routing commands.
 
-1. `CodexExecAdapter` using `codex exec --json` / `codex exec resume`
-2. `KimiPrintAdapter` using `kimi --print --output-format stream-json`
-3. `ClaudePrintAdapter` using `claude --print --output-format stream-json`
-4. `DeepSeekHttpAdapter` using `deepseek serve --http`
-5. `LegacyTuiAdapter` as a fallback for existing TeleAgent behavior
+5. **Autonomous Progress Engine**
+   - Supports auto loop mode and auto-by-task mode.
+   - Can keep background jobs moving after SSH disconnects.
+   - Records progress and stops for explicit human input when needed.
+
+In short:
+
+```text
+AgentDeck =
+  AI Agent Harness
+  + Project Control Plane
+  + Multi-Agent Collaboration
+  + Remote Control Interface
+  + Autonomous Progress Engine
+```
+
+## Install
+
+From the downloaded AgentDeck repository:
+
+```bash
+cd /path/to/AgentDeck
+./install.sh
+```
+
+The installer performs an editable install with the current Python environment,
+initializes the default platform workspace, and verifies the `agentdeck` command
+when it is available on `PATH`.
+
+If your Python scripts directory is not on `PATH`, the installer prints the
+exact `export PATH=...` line. To let it append that line to your shell rc file:
+
+```bash
+./install.sh --shell-config
+```
+
+Useful variants:
+
+```bash
+./install.sh --run-tests
+./install.sh --python /path/to/python
+```
+
+After installation:
+
+```bash
+agentdeck doctor
+agentdeck telegram start
+agentdeck telegram status
+agentdeck telegram stop
+```
+
+For development without installing:
+
+```bash
+PYTHONPATH=src python -m agentdeck doctor
+PYTHONPATH=src python -m unittest discover -s tests
+```
+
+## Workspace Model
+
+AgentDeck is a platform-level control plane. By default, commands use the
+workspace inside the AgentDeck install/source directory:
+
+```text
+<AgentDeck>/.agentdeck/
+```
+
+That workspace stores projects, agents, tasks, sessions, Telegram bot configs,
+jobs, approvals, memory, handoffs, and decisions. The directory where you run
+`agentdeck` is treated as a project working directory only when you register it
+with `projects create --cwd ...` or pass it as an adapter `--cwd`.
+
+Use `--workspace /path/to/.agentdeck` or `AGENTDECK_WORKSPACE=/path/to/.agentdeck`
+only when you intentionally want a separate control-plane workspace. Project
+directories may optionally contain a lightweight `.agentdeck.toml` file for
+directory-specific integration hints such as future TUI profiles or special
+adapter commands; this file is not the main AgentDeck state store.
 
 ## Quick Start
 
 ```bash
-python -m agentdeck init
-python -m agentdeck doctor
-python -m agentdeck run "hello from AgentDeck"
-python -m agentdeck projects create motionx --title "Motion-X" --cwd "$PWD" --default-agent owner
-python -m agentdeck agents create owner --title "Motion-X Owner" --project motionx --adapter codex
-python -m agentdeck agents template owner --prompt "Act as manager: keep direction clear and review executor handoffs."
-python -m agentdeck tasks create "Summarize repository" --project motionx
-python -m agentdeck run --project motionx "Summarize this repository"
-python -m agentdeck run --task <task_id> "Continue"
-python -m agentdeck projects list
-python -m agentdeck agents list
-python -m agentdeck tasks list
-python -m agentdeck sessions list
-python -m agentdeck approvals list
-python -m agentdeck projects update-state motionx --goal "Ship the loader fix" --focus "Keep executor work aligned" --next "Run tests"
-python -m agentdeck projects decide motionx "Use task handoffs as executor reports" --reason "Managers need compact review points"
-python -m agentdeck projects decisions motionx
-python -m agentdeck tasks handoff <task_id> --summary "Made progress" --completed "Changed storage" --next "Wire prompt injection"
-python -m agentdeck tasks manager-review <task_id> --summary "Scope looks right" --next "Run regression tests"
-python -m agentdeck tasks context <task_id>
-python -m agentdeck tasks handoffs <task_id>
-python -m agentdeck tasks reviews <task_id>
-python -m agentdeck sessions state <session_id>
-python -m agentdeck assistant setup --adapter codex --cwd "$PWD"
-python -m agentdeck telegram bots import /path/to/bots.toml
-python -m agentdeck telegram bots list
-python -m agentdeck telegram start --bot minsys-bot3
-AGENTDECK_TELEGRAM_TOKEN="<bot-token>" python -m agentdeck telegram serve
-python -m agentdeck run --adapter codex --cwd "$PWD" "Summarize this repository"
-python -m agentdeck run --adapter kimi --cwd "$PWD" "Summarize this repository"
-python -m agentdeck run --adapter codex --cwd "$PWD" --resume-last "Continue"
-python -m agentdeck run --adapter codex --cwd "$PWD" --approval-mode record "Show me what approval is needed"
-python -m agentdeck memory add "Project rule" "Keep shared memory concise." --pin
-python -m agentdeck memory compact-task <task_id> --title "Loader fix snapshot" --pin
-python -m agentdeck memory list --scope project --owner motionx
+agentdeck init
+agentdeck doctor
+agentdeck projects create motionx --title "Motion-X" --cwd "$PWD" --default-agent owner
+agentdeck agents create owner --title "Motion-X Owner" --project motionx --adapter codex --cwd "$PWD"
+agentdeck tasks create "Summarize repository" --project motionx
+agentdeck run --project motionx "Summarize this repository"
+agentdeck run --task <task_id> "Continue"
+agentdeck projects list
+agentdeck tasks list
+agentdeck sessions list
+agentdeck approvals list
 ```
 
 ## Codex Approval Modes
@@ -99,10 +146,10 @@ approval loop is solved:
 When a backend requests approval, AgentDeck records it in the approval registry:
 
 ```bash
-python -m agentdeck approvals list
-python -m agentdeck approvals show <approval_id>
-python -m agentdeck approvals approve <approval_id> "approved by operator"
-python -m agentdeck approvals reject <approval_id> "too risky"
+agentdeck approvals list
+agentdeck approvals show <approval_id>
+agentdeck approvals approve <approval_id> "approved by operator"
+agentdeck approvals reject <approval_id> "too risky"
 ```
 
 Approving a request records the decision for audit and later remote interfaces.
@@ -116,17 +163,22 @@ dependency:
 ```bash
 export AGENTDECK_TELEGRAM_TOKEN="<bot-token>"
 export AGENTDECK_TELEGRAM_ALLOWED_CHATS="<chat-id>,<chat-id>"
-python -m agentdeck telegram serve
+agentdeck telegram serve
 ```
+
+When saved bots exist for the current server, `telegram serve` and
+`telegram start` serve all of them by default. Each bot uses its own assistant
+before a chat selects a task. Pass `--bot <bot_id>` only when you want to debug
+or run one bot.
 
 `telegram serve` is foreground mode for debugging. To keep the Telegram
 controller alive after disconnecting SSH, start it as a detached workspace
 daemon:
 
 ```bash
-python -m agentdeck telegram start
-python -m agentdeck telegram status
-python -m agentdeck telegram stop
+agentdeck telegram start
+agentdeck telegram status
+agentdeck telegram stop
 ```
 
 The daemon pid and log are stored under `.agentdeck/telegram/`. The daemon keeps
@@ -154,6 +206,7 @@ Supported commands:
 /newtask <task title>
 /use <task_id or exact task title>
 /use task <task_id or list #>
+/assistant
 /current
 /status
 /list
@@ -207,13 +260,26 @@ restarts while a job is still queued or running, that job is marked
 Create the default assistant with:
 
 ```bash
-python -m agentdeck assistant setup --adapter codex --cwd /data/lyxie/AgentDeck
-python -m agentdeck assistant show
+agentdeck assistant setup --adapter codex --cwd /data/lyxie/AgentDeck
+agentdeck assistant setup-bots --adapter codex --cwd /data/lyxie/AgentDeck
+agentdeck assistant show
 ```
 
 The assistant is just an AgentDeck agent with a manager-style routing prompt.
-It receives AgentDeck context and can suggest exact CLI or Telegram commands,
-but it does not execute arbitrary control commands by itself.
+It receives AgentDeck context and can suggest exact CLI or Telegram commands.
+When the assistant is confident, it may place safe Telegram control commands on
+their own final lines as `AGENTDECK_ACTION: /command ...`. AgentDeck strips
+those marker lines from the user-visible reply and executes only a small
+whitelist of routing commands, such as `/projects`, `/tasks`, `/status`,
+`/use project`, `/use agent`, `/use task`, `/project new`, `/agent new`, and
+`/task new`. It will not execute `/run`, `/auto`, approval, cancellation,
+shell, destructive, or secret-revealing commands from assistant output.
+
+Bot records are scoped to the server where they are imported or added. Use
+`assistant setup-bots` to create and bind one assistant per saved bot on the
+current server. Starting Telegram with `telegram start` serves all current
+server bots and uses each bot's assistant before a task is selected, falling
+back to the default `assistant` only when the bot has no assistant binding.
 
 For phone use, `/status` is the main control panel. It shows the current
 project, agent, task, latest job, auto mode, pending approvals, and recent
@@ -235,6 +301,10 @@ After selecting a task once with `/use task <list #>` or creating one with
 `/task new <title>`, you can send a plain text message to the current agent.
 `/run <message>` is still supported. `/job` shows the latest job in the chat,
 and `/cancel` cancels the latest queued or running job.
+Use `/assistant` or `/use assistant` to clear the current task and route plain
+text messages back to the assistant. Selecting a different project or agent with
+`/use project ...` or `/use agent ...` also clears the current task, so the next
+plain message goes through the assistant until you select or create a task.
 
 Auto mode is a task-level job loop. After selecting a task with `/use`, send
 `/auto start` to start one run immediately and then keep starting the next run
@@ -261,15 +331,16 @@ AgentDeck records the approval and starts a follow-up background job with
 is safely resumable; it is not an in-place continuation of a stopped provider
 process.
 
-Saved Telegram bot configs are workspace-local operational config:
+Saved Telegram bot configs are platform workspace-local operational config:
 
 ```bash
-python -m agentdeck telegram bots add minsys-bot3 \
+agentdeck telegram bots add minsys-bot3 \
   --token "<bot-token>" \
   --allowed-chat-id "<chat-id>"
-python -m agentdeck telegram bots import /data/lyxie/TeleAgent/Manager.txt
-python -m agentdeck telegram bots list
-python -m agentdeck telegram start --bot minsys-bot3
+agentdeck telegram bots import /data/lyxie/TeleAgent/Manager.txt
+agentdeck assistant setup-bots --adapter codex --cwd /data/lyxie/AgentDeck
+agentdeck telegram bots list
+agentdeck telegram start
 ```
 
 The registry is stored at `.agentdeck/telegram/bots.json`. Listing bots redacts
@@ -279,13 +350,6 @@ tokens; the file itself contains secrets and should not be committed.
 print jobs, AgentDeck requests adapter-level process termination and records the
 job as `cancelled` once the adapter stops. Adapters that do not support
 cancellation yet may still finish normally after `cancel_requested`.
-
-For development without installing:
-
-```bash
-PYTHONPATH=src python -m agentdeck doctor
-PYTHONPATH=src python -m pytest
-```
 
 ## Workspace Layout
 
@@ -345,12 +409,12 @@ handoffs, and manager reviews; it does not copy raw chat transcripts or
 recursively copy older durable memory snapshots:
 
 ```bash
-python -m agentdeck memory compact-task <task_id> \
+agentdeck memory compact-task <task_id> \
   --title "Loader fix context snapshot" \
   --pin
-python -m agentdeck memory list --scope project --owner <project_id>
-python -m agentdeck memory disable <memory_id_or_path>
-python -m agentdeck memory enable <memory_id_or_path>
+agentdeck memory list --scope project --owner <project_id>
+agentdeck memory disable <memory_id_or_path>
+agentdeck memory enable <memory_id_or_path>
 ```
 
 Telegram supports the same phone workflow with `/compact [--pin] [title]` for
@@ -367,13 +431,13 @@ recent list is still active.
 Project-level state is manager-owned direction for all agents in one project:
 
 ```bash
-python -m agentdeck projects update-state motionx \
+agentdeck projects update-state motionx \
   --goal "Ship a stable loader fix" \
   --phase "implementation" \
   --focus "Keep executor work scoped" \
   --next "Run regression tests" \
   --constraint "Do not share raw transcripts as memory"
-python -m agentdeck projects decide motionx \
+agentdeck projects decide motionx \
   "Use task handoffs as executor reports" \
   --reason "Managers need compact review points"
 ```
@@ -388,7 +452,7 @@ entry to `.agentdeck/journal/progress.jsonl`, and updates the attached session
 state card when the task has a session:
 
 ```bash
-python -m agentdeck tasks handoff <task_id> \
+agentdeck tasks handoff <task_id> \
   --summary "State card storage is in place" \
   --completed "Added session-state JSON files" \
   --verified "Ran focused tests" \
@@ -397,11 +461,11 @@ python -m agentdeck tasks handoff <task_id> \
   --artifact "src/agentdeck/storage/session_state.py"
 ```
 
-Use `python -m agentdeck sessions state <session_id>` to inspect the compact
+Use `agentdeck sessions state <session_id>` to inspect the compact
 state card used for resume and future auto-mode context. Use
-`python -m agentdeck tasks context <task_id>` to see the bounded context block
+`agentdeck tasks context <task_id>` to see the bounded context block
 that will be injected into the next task run, and
-`python -m agentdeck tasks handoffs <task_id>` to inspect recent handoff
+`agentdeck tasks handoffs <task_id>` to inspect recent handoff
 summaries.
 
 `tasks manager-review` records the manager side of the loop. Handoffs are
@@ -409,11 +473,11 @@ executor reports; manager reviews are compact direction, approval, or requested
 changes for the next execution run:
 
 ```bash
-python -m agentdeck tasks manager-review <task_id> \
+agentdeck tasks manager-review <task_id> \
   --summary "The storage shape is acceptable; keep the next patch narrow" \
   --status approved \
   --next "Add Telegram visibility for reviews"
-python -m agentdeck tasks reviews <task_id>
+agentdeck tasks reviews <task_id>
 ```
 
 When a run is attached to a task, AgentDeck appends a bounded context block to
@@ -438,9 +502,9 @@ default templates that are injected into task run context.
 Custom templates can override the default for one agent:
 
 ```bash
-python -m agentdeck agents template <agent_id> \
+agentdeck agents template <agent_id> \
   --prompt "Act as manager: keep goals, constraints, reviews, and decisions current."
-python -m agentdeck agents template <agent_id> --clear
+agentdeck agents template <agent_id> --clear
 ```
 
 Telegram supports `/agent template <prompt>` for the current agent and

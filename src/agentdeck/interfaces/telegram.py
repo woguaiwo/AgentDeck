@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import threading
 import time
 import urllib.parse
@@ -40,6 +41,8 @@ MAX_TELEGRAM_MESSAGE = 3900
 AUTO_CONTINUE_DELAY_SECONDS = 1.0
 DEFAULT_AUTO_APPROVAL_MODE = "bypass"
 HUMAN_AUTO_APPROVAL_MODE = "fail"
+ASSISTANT_ACTION_PREFIX = "AGENTDECK_ACTION:"
+MAX_ASSISTANT_ACTIONS = 3
 DEFAULT_AUTO_PROMPT = (
     "请继续推进当前任务。要求：主动完成下一步；如果取得阶段性进展、"
     "做出重要决定或遇到阻塞，请用简短要点记录到项目日志或任务备注里；"
@@ -58,6 +61,8 @@ class TelegramConfig:
     token: str
     allowed_chat_ids: set[int] = field(default_factory=set)
     poll_timeout: int = 30
+    bot_id: str = ""
+    assistant_agent_id: str = ""
 
 
 class TelegramBotApi:
@@ -91,8 +96,9 @@ class TelegramBotApi:
 class TelegramChatStateStore:
     """Persist small per-chat interface state."""
 
-    def __init__(self, workspace: Workspace) -> None:
+    def __init__(self, workspace: Workspace, *, scope: str = "") -> None:
         self.workspace = workspace
+        self.scope = scope.strip()
         self._lock = threading.Lock()
 
     @property
@@ -102,46 +108,49 @@ class TelegramChatStateStore:
     def current_task(self, chat_id: int) -> str:
         with self._lock:
             data = self._read()
-            return str(data.get(str(chat_id), {}).get("current_task_id") or "")
+            return str(data.get(self._chat_key(chat_id), {}).get("current_task_id") or "")
 
     def set_current_task(self, chat_id: int, task_id: str) -> None:
         with self._lock:
             data = self._read()
-            chat = dict(data.get(str(chat_id)) or {})
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
             chat["current_task_id"] = task_id
-            data[str(chat_id)] = chat
+            data[key] = chat
             self._write(data)
 
     def current_project(self, chat_id: int) -> str:
         with self._lock:
             data = self._read()
-            return str(data.get(str(chat_id), {}).get("current_project_id") or "")
+            return str(data.get(self._chat_key(chat_id), {}).get("current_project_id") or "")
 
     def set_current_project(self, chat_id: int, project_id: str) -> None:
         with self._lock:
             data = self._read()
-            chat = dict(data.get(str(chat_id)) or {})
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
             chat["current_project_id"] = project_id
-            data[str(chat_id)] = chat
+            data[key] = chat
             self._write(data)
 
     def current_agent(self, chat_id: int) -> str:
         with self._lock:
             data = self._read()
-            return str(data.get(str(chat_id), {}).get("current_agent_id") or "")
+            return str(data.get(self._chat_key(chat_id), {}).get("current_agent_id") or "")
 
     def set_current_agent(self, chat_id: int, agent_id: str) -> None:
         with self._lock:
             data = self._read()
-            chat = dict(data.get(str(chat_id)) or {})
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
             chat["current_agent_id"] = agent_id
-            data[str(chat_id)] = chat
+            data[key] = chat
             self._write(data)
 
     def auto_state(self, chat_id: int) -> dict[str, Any]:
         with self._lock:
             data = self._read()
-            state = data.get(str(chat_id), {}).get("auto") or {}
+            state = data.get(self._chat_key(chat_id), {}).get("auto") or {}
             return dict(state) if isinstance(state, dict) else {}
 
     def set_auto_state(
@@ -159,7 +168,8 @@ class TelegramChatStateStore:
     ) -> None:
         with self._lock:
             data = self._read()
-            chat = dict(data.get(str(chat_id)) or {})
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
             chat["auto"] = {
                 "enabled": enabled,
                 "task_id": task_id,
@@ -170,101 +180,111 @@ class TelegramChatStateStore:
                 "approval_mode": _normalize_auto_approval_mode(approval_mode),
                 "mode": _normalize_auto_mode(mode),
             }
-            data[str(chat_id)] = chat
+            data[key] = chat
             self._write(data)
 
     def disable_auto(self, chat_id: int) -> None:
         with self._lock:
             data = self._read()
-            chat = dict(data.get(str(chat_id)) or {})
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
             state = dict(chat.get("auto") or {})
             state["enabled"] = False
             chat["auto"] = state
-            data[str(chat_id)] = chat
+            data[key] = chat
             self._write(data)
 
     def mark_auto_job(self, chat_id: int, *, job_id: str, task_id: str) -> dict[str, Any]:
         with self._lock:
             data = self._read()
-            chat = dict(data.get(str(chat_id)) or {})
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
             state = dict(chat.get("auto") or {})
             state["last_job_id"] = job_id
             state["task_id"] = task_id or str(state.get("task_id") or "")
             state["turns_started"] = int(state.get("turns_started") or 0) + 1
             chat["auto"] = state
-            data[str(chat_id)] = chat
+            data[key] = chat
             self._write(data)
             return state
 
     def set_recent(self, chat_id: int, *, task_ids: list[str], job_ids: list[str]) -> None:
         with self._lock:
             data = self._read()
-            chat = dict(data.get(str(chat_id)) or {})
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
             chat["recent_task_ids"] = task_ids
             chat["recent_job_ids"] = job_ids
-            data[str(chat_id)] = chat
+            data[key] = chat
             self._write(data)
 
     def set_recent_projects(self, chat_id: int, project_ids: list[str]) -> None:
         with self._lock:
             data = self._read()
-            chat = dict(data.get(str(chat_id)) or {})
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
             chat["recent_project_ids"] = project_ids
-            data[str(chat_id)] = chat
+            data[key] = chat
             self._write(data)
 
     def set_recent_agents(self, chat_id: int, agent_ids: list[str]) -> None:
         with self._lock:
             data = self._read()
-            chat = dict(data.get(str(chat_id)) or {})
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
             chat["recent_agent_ids"] = agent_ids
-            data[str(chat_id)] = chat
+            data[key] = chat
             self._write(data)
 
     def set_recent_sessions(self, chat_id: int, session_ids: list[str]) -> None:
         with self._lock:
             data = self._read()
-            chat = dict(data.get(str(chat_id)) or {})
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
             chat["recent_session_ids"] = session_ids
-            data[str(chat_id)] = chat
+            data[key] = chat
             self._write(data)
 
     def set_recent_approvals(self, chat_id: int, approval_ids: list[str]) -> None:
         with self._lock:
             data = self._read()
-            chat = dict(data.get(str(chat_id)) or {})
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
             chat["recent_approval_ids"] = approval_ids
-            data[str(chat_id)] = chat
+            data[key] = chat
             self._write(data)
 
     def set_recent_memories(self, chat_id: int, memory_paths: list[str]) -> None:
         with self._lock:
             data = self._read()
-            chat = dict(data.get(str(chat_id)) or {})
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
             chat["recent_memory_paths"] = memory_paths
-            data[str(chat_id)] = chat
+            data[key] = chat
             self._write(data)
 
     def set_recent_tasks(self, chat_id: int, task_ids: list[str]) -> None:
         with self._lock:
             data = self._read()
-            chat = dict(data.get(str(chat_id)) or {})
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
             chat["recent_task_ids"] = task_ids
-            data[str(chat_id)] = chat
+            data[key] = chat
             self._write(data)
 
     def set_recent_jobs(self, chat_id: int, job_ids: list[str]) -> None:
         with self._lock:
             data = self._read()
-            chat = dict(data.get(str(chat_id)) or {})
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
             chat["recent_job_ids"] = job_ids
-            data[str(chat_id)] = chat
+            data[key] = chat
             self._write(data)
 
     def recent_task_id(self, chat_id: int, index: int) -> str:
         with self._lock:
             data = self._read()
-            task_ids = data.get(str(chat_id), {}).get("recent_task_ids") or []
+            task_ids = data.get(self._chat_key(chat_id), {}).get("recent_task_ids") or []
             if not isinstance(task_ids, list) or index < 1 or index > len(task_ids):
                 return ""
             return str(task_ids[index - 1])
@@ -272,7 +292,7 @@ class TelegramChatStateStore:
     def recent_project_id(self, chat_id: int, index: int) -> str:
         with self._lock:
             data = self._read()
-            project_ids = data.get(str(chat_id), {}).get("recent_project_ids") or []
+            project_ids = data.get(self._chat_key(chat_id), {}).get("recent_project_ids") or []
             if not isinstance(project_ids, list) or index < 1 or index > len(project_ids):
                 return ""
             return str(project_ids[index - 1])
@@ -280,7 +300,7 @@ class TelegramChatStateStore:
     def recent_agent_id(self, chat_id: int, index: int) -> str:
         with self._lock:
             data = self._read()
-            agent_ids = data.get(str(chat_id), {}).get("recent_agent_ids") or []
+            agent_ids = data.get(self._chat_key(chat_id), {}).get("recent_agent_ids") or []
             if not isinstance(agent_ids, list) or index < 1 or index > len(agent_ids):
                 return ""
             return str(agent_ids[index - 1])
@@ -288,7 +308,7 @@ class TelegramChatStateStore:
     def recent_job_id(self, chat_id: int, index: int) -> str:
         with self._lock:
             data = self._read()
-            job_ids = data.get(str(chat_id), {}).get("recent_job_ids") or []
+            job_ids = data.get(self._chat_key(chat_id), {}).get("recent_job_ids") or []
             if not isinstance(job_ids, list) or index < 1 or index > len(job_ids):
                 return ""
             return str(job_ids[index - 1])
@@ -296,7 +316,7 @@ class TelegramChatStateStore:
     def recent_session_id(self, chat_id: int, index: int) -> str:
         with self._lock:
             data = self._read()
-            session_ids = data.get(str(chat_id), {}).get("recent_session_ids") or []
+            session_ids = data.get(self._chat_key(chat_id), {}).get("recent_session_ids") or []
             if not isinstance(session_ids, list) or index < 1 or index > len(session_ids):
                 return ""
             return str(session_ids[index - 1])
@@ -304,7 +324,7 @@ class TelegramChatStateStore:
     def recent_approval_id(self, chat_id: int, index: int) -> str:
         with self._lock:
             data = self._read()
-            approval_ids = data.get(str(chat_id), {}).get("recent_approval_ids") or []
+            approval_ids = data.get(self._chat_key(chat_id), {}).get("recent_approval_ids") or []
             if not isinstance(approval_ids, list) or index < 1 or index > len(approval_ids):
                 return ""
             return str(approval_ids[index - 1])
@@ -312,10 +332,15 @@ class TelegramChatStateStore:
     def recent_memory_path(self, chat_id: int, index: int) -> str:
         with self._lock:
             data = self._read()
-            memory_paths = data.get(str(chat_id), {}).get("recent_memory_paths") or []
+            memory_paths = data.get(self._chat_key(chat_id), {}).get("recent_memory_paths") or []
             if not isinstance(memory_paths, list) or index < 1 or index > len(memory_paths):
                 return ""
             return str(memory_paths[index - 1])
+
+    def _chat_key(self, chat_id: int) -> str:
+        if not self.scope:
+            return str(chat_id)
+        return f"{self.scope}:{chat_id}"
 
     def _read(self) -> dict[str, dict[str, Any]]:
         if not self.path.exists():
@@ -348,19 +373,24 @@ class TelegramJobQueue:
         *,
         sender: Callable[[int, str], None],
         runner: Callable[[Workspace, RunRequest], Any] = run_agent_prompt,
+        state_scope: str = "",
     ) -> None:
         self.workspace = workspace
         self.sender = sender
         self.runner = runner
         self.registry = JobRegistry(workspace)
-        self.chat_state = TelegramChatStateStore(workspace)
+        self.chat_state = TelegramChatStateStore(workspace, scope=state_scope)
         self._lock = threading.Lock()
         self._threads: dict[str, threading.Thread] = {}
         self._cancellations: dict[str, CancellationToken] = {}
+        self._assistant_action_handler: Callable[[int, str], list[str]] | None = None
         self.registry.mark_unfinished_interrupted(
             interface="telegram",
             reason="AgentDeck restarted before this job finished.",
         )
+
+    def set_assistant_action_handler(self, handler: Callable[[int, str], list[str]] | None) -> None:
+        self._assistant_action_handler = handler
 
     def start(
         self,
@@ -468,7 +498,11 @@ class TelegramJobQueue:
                         else ""
                     ),
                 )
-            self._send(job.chat_id, _format_job_completion(finished or job, result.approval_requested))
+            finished_job = finished or job
+            self._send(job.chat_id, _format_job_completion(finished_job, result.approval_requested))
+            if _is_assistant_job(finished_job):
+                for reply in self._assistant_action_replies(finished_job.chat_id, finished_job.final_text):
+                    self._send(finished_job.chat_id, reply)
             self._continue_auto_if_needed(finished or job, result.approval_requested)
         finally:
             with self._lock:
@@ -522,6 +556,14 @@ class TelegramJobQueue:
             self.sender(chat_id, text)
         except Exception:
             pass
+
+    def _assistant_action_replies(self, chat_id: int, final_text: str) -> list[str]:
+        if self._assistant_action_handler is None or not chat_id:
+            return []
+        try:
+            return self._assistant_action_handler(chat_id, final_text)
+        except Exception as exc:
+            return [f"Assistant action handling failed: {_one_line(str(exc), 180)}"]
 
     def _continue_auto_if_needed(self, job: JobRecord, approval_requested: bool) -> None:
         if not job.chat_id or not job.task_id:
@@ -618,11 +660,19 @@ class TelegramCommandHandler:
         *,
         runner: Callable[[Workspace, RunRequest], Any] = run_agent_prompt,
         job_queue: TelegramJobQueue | None = None,
+        assistant_agent_id: str = ASSISTANT_AGENT_ID,
+        bot_id: str = "",
     ) -> None:
         self.workspace = workspace
         self.runner = runner
         self.job_queue = job_queue
-        self.chat_state = TelegramChatStateStore(workspace)
+        self.bot_id = bot_id.strip()
+        self.assistant_agent_id = assistant_agent_id or ASSISTANT_AGENT_ID
+        self.chat_state = TelegramChatStateStore(workspace, scope=self.bot_id)
+        if self.job_queue is not None:
+            self.job_queue.set_assistant_action_handler(
+                lambda chat_id, final_text: asyncio.run(self._execute_assistant_actions(chat_id, final_text))
+            )
 
     async def handle_text(self, text: str, *, chat_id: int | None = None) -> list[str]:
         clean = text.strip()
@@ -656,6 +706,8 @@ class TelegramCommandHandler:
             return [self._newtask(rest, chat_id=chat_id)]
         if command in {"/use", "use"}:
             return [self._use(rest, chat_id=chat_id)]
+        if command in {"/assistant", "assistant", "/home", "home"}:
+            return [self._assistant_mode(chat_id=chat_id)]
         if command in {"/current", "current"}:
             return [self._current(chat_id=chat_id)]
         if command in {"/status", "status"}:
@@ -725,7 +777,7 @@ class TelegramCommandHandler:
         current_task_id = self.chat_state.current_task(chat_id)
         if current_task_id and self._resolve_task(current_task_id) is not None:
             return False
-        return AgentRegistry(self.workspace).resolve(ASSISTANT_AGENT_ID) is not None
+        return self._assistant_agent() is not None
 
     async def _plain_text(self, text: str, *, chat_id: int | None) -> str:
         if chat_id is None:
@@ -733,11 +785,37 @@ class TelegramCommandHandler:
         current_task_id = self.chat_state.current_task(chat_id)
         task = self._resolve_task(current_task_id) if current_task_id else None
         if task is None:
-            assistant = AgentRegistry(self.workspace).resolve(ASSISTANT_AGENT_ID)
+            assistant = self._assistant_agent()
             if assistant is not None:
                 return await self._run_assistant(text, assistant=assistant, chat_id=chat_id)
             return self._plain_text_setup_hint()
         return await self._run(text, chat_id=chat_id)
+
+    def _assistant_agent(self) -> AgentRecord | None:
+        registry = AgentRegistry(self.workspace)
+        if self.assistant_agent_id:
+            assistant = registry.resolve(self.assistant_agent_id)
+            if assistant is not None:
+                return assistant
+        if self.assistant_agent_id != ASSISTANT_AGENT_ID:
+            return registry.resolve(ASSISTANT_AGENT_ID)
+        return None
+
+    def _assistant_mode(self, *, chat_id: int | None) -> str:
+        if chat_id is None:
+            return "This command requires a Telegram chat."
+        self.chat_state.set_current_task(chat_id, "")
+        assistant = self._assistant_agent()
+        lines = [
+            "Assistant mode enabled.",
+            "Current task cleared. Plain text messages will go to the assistant until you /use task <ref>.",
+        ]
+        if assistant is not None:
+            lines.append(f"assistant: {assistant.title} ({assistant.agent_id})")
+        else:
+            lines.append("assistant: not configured")
+            lines.append("Use CLI: agentdeck assistant setup --adapter <echo|codex|kimi>")
+        return "\n".join(lines)
 
     async def _run_assistant(self, prompt: str, *, assistant: AgentRecord, chat_id: int) -> str:
         metadata = {"assistant": True, "agent_id": assistant.agent_id}
@@ -755,9 +833,43 @@ class TelegramCommandHandler:
             result = await self.runner(self.workspace, RunRequest(prompt=prompt, agent=assistant.agent_id))
         except RunConfigurationError as exc:
             return str(exc)
-        lines = [result.final_text or "Assistant run finished without a final text response.", ""]
+        display_text = _strip_assistant_actions(result.final_text)
+        lines = [display_text or "Assistant run finished without a final text response.", ""]
+        action_replies = await self._execute_assistant_actions(chat_id, result.final_text)
+        lines.extend(action_replies)
+        if action_replies:
+            lines.append("")
         lines.append(f"session: {result.session_id}")
         return "\n".join(lines)
+
+    async def _execute_assistant_actions(self, chat_id: int, final_text: str) -> list[str]:
+        actions = _assistant_actions_from_text(final_text)
+        if not actions:
+            return []
+        replies: list[str] = []
+        for action in actions:
+            allowed, reason = _assistant_action_allowed(action)
+            if not allowed:
+                replies.append(
+                    "\n".join(
+                        [
+                            f"Assistant action blocked: {action}",
+                            f"reason: {reason}",
+                        ]
+                    )
+                )
+                continue
+            command_replies = await self.handle_text(action, chat_id=chat_id)
+            reply_text = "\n\n".join(command_replies).strip() or "No reply."
+            replies.append(
+                "\n".join(
+                    [
+                        f"Assistant action executed: {action}",
+                        reply_text,
+                    ]
+                )
+            )
+        return replies
 
     def _plain_text_setup_hint(self) -> str:
         return "\n".join(
@@ -1008,6 +1120,8 @@ class TelegramCommandHandler:
             task_ref = rest.strip()
         if not task_ref:
             return "Usage: /use <task>, /use project <project>, or /use agent <agent>"
+        if task_ref.lower() in {"assistant", "home"}:
+            return self._assistant_mode(chat_id=chat_id)
         task = self._resolve_task(task_ref, chat_id=chat_id)
         if task is None:
             return f"Task not found: {task_ref}"
@@ -1035,6 +1149,7 @@ class TelegramCommandHandler:
             return f"Project not found: {project_ref}"
         self.chat_state.set_current_project(chat_id, project.project_id)
         self.chat_state.set_current_agent(chat_id, project.default_agent_id)
+        self.chat_state.set_current_task(chat_id, "")
         return "\n".join(
             [
                 "Current project set:",
@@ -1054,6 +1169,7 @@ class TelegramCommandHandler:
         self.chat_state.set_current_agent(chat_id, agent.agent_id)
         if agent.project_id:
             self.chat_state.set_current_project(chat_id, agent.project_id)
+        self.chat_state.set_current_task(chat_id, "")
         return "\n".join(
             [
                 "Current agent set:",
@@ -2188,8 +2304,13 @@ class TelegramServer:
         self.workspace = workspace
         self.api = api
         self.config = config
-        self.job_queue = TelegramJobQueue(workspace, sender=api.send_message)
-        self.handler = TelegramCommandHandler(workspace, job_queue=self.job_queue)
+        self.job_queue = TelegramJobQueue(workspace, sender=api.send_message, state_scope=config.bot_id)
+        self.handler = TelegramCommandHandler(
+            workspace,
+            job_queue=self.job_queue,
+            assistant_agent_id=config.assistant_agent_id or ASSISTANT_AGENT_ID,
+            bot_id=config.bot_id,
+        )
 
     def serve_forever(self, *, once: bool = False) -> None:
         offset: int | None = None
@@ -2221,11 +2342,63 @@ class TelegramServer:
                 self.api.send_message(chat_id, reply)
 
 
-def config_from_env(token: str | None = None, allowed_chat_ids: list[str] | None = None, poll_timeout: int = 30) -> TelegramConfig:
+class TelegramMultiServer:
+    """Run one long-polling worker per saved Telegram bot in a single daemon."""
+
+    def __init__(
+        self,
+        workspace: Workspace,
+        configs: list[TelegramConfig],
+        *,
+        api_factory: Callable[[str], TelegramBotApi] = TelegramBotApi,
+    ) -> None:
+        self.workspace = workspace
+        self.configs = configs
+        self.api_factory = api_factory
+
+    def serve_forever(self, *, once: bool = False) -> None:
+        servers = [
+            TelegramServer(self.workspace, self.api_factory(config.token), config)
+            for config in self.configs
+            if config.token
+        ]
+        if not servers:
+            return
+        if len(servers) == 1:
+            servers[0].serve_forever(once=once)
+            return
+        threads = [
+            threading.Thread(target=server.serve_forever, kwargs={"once": once}, daemon=True)
+            for server in servers
+        ]
+        for thread in threads:
+            thread.start()
+        if once:
+            for thread in threads:
+                thread.join()
+            return
+        while True:
+            time.sleep(3600)
+
+
+def config_from_env(
+    token: str | None = None,
+    allowed_chat_ids: list[str] | None = None,
+    poll_timeout: int = 30,
+    *,
+    bot_id: str = "",
+    assistant_agent_id: str = "",
+) -> TelegramConfig:
     resolved_token = _normalize_bot_token(token or os.environ.get("AGENTDECK_TELEGRAM_TOKEN") or "")
     allowed = set(_parse_allowed_chat_ids(allowed_chat_ids or []))
     allowed.update(_parse_allowed_chat_ids((os.environ.get("AGENTDECK_TELEGRAM_ALLOWED_CHATS") or "").split(",")))
-    return TelegramConfig(token=resolved_token, allowed_chat_ids=allowed, poll_timeout=poll_timeout)
+    return TelegramConfig(
+        token=resolved_token,
+        allowed_chat_ids=allowed,
+        poll_timeout=poll_timeout,
+        bot_id=bot_id or os.environ.get("AGENTDECK_TELEGRAM_BOT_ID", ""),
+        assistant_agent_id=assistant_agent_id or os.environ.get("AGENTDECK_TELEGRAM_ASSISTANT_AGENT", ""),
+    )
 
 
 def split_message(text: str, *, limit: int = MAX_TELEGRAM_MESSAGE) -> list[str]:
@@ -2397,10 +2570,14 @@ def _format_job_completion(job: JobRecord, approval_requested: bool) -> str:
         lines.append(f"note: {_one_line(job.error, 180)}")
     lines.append("")
     if job.status == "cancelled":
-        lines.append(_strip_auto_task_marker(job.final_text) or "Run cancelled.")
+        lines.append(_clean_job_final_text(job.final_text) or "Run cancelled.")
     else:
-        lines.append(_strip_auto_task_marker(job.final_text) or "Run finished without a final text response.")
+        lines.append(_clean_job_final_text(job.final_text) or "Run finished without a final text response.")
     return "\n".join(lines)
+
+
+def _clean_job_final_text(text: str) -> str:
+    return _strip_assistant_actions(_strip_auto_task_marker(text))
 
 
 def _auto_task_completed(text: str) -> bool:
@@ -2410,6 +2587,77 @@ def _auto_task_completed(text: str) -> bool:
 def _strip_auto_task_marker(text: str) -> str:
     lines = [line for line in text.splitlines() if line.strip() != AUTO_TASK_DONE_MARKER]
     return "\n".join(lines).strip()
+
+
+def _is_assistant_job(job: JobRecord) -> bool:
+    metadata = job.metadata or {}
+    return bool(metadata.get("assistant")) or str(metadata.get("agent_id") or "") == ASSISTANT_AGENT_ID
+
+
+def _assistant_actions_from_text(text: str) -> list[str]:
+    actions: list[str] = []
+    seen: set[str] = set()
+    for line in text.splitlines():
+        match = re.match(rf"^\s*(?:[-*]\s*)?{re.escape(ASSISTANT_ACTION_PREFIX)}\s*(/.+?)\s*$", line)
+        if not match:
+            continue
+        action = " ".join(match.group(1).strip().split())
+        if action and action not in seen:
+            actions.append(action)
+            seen.add(action)
+        if len(actions) >= MAX_ASSISTANT_ACTIONS:
+            break
+    return actions
+
+
+def _strip_assistant_actions(text: str) -> str:
+    lines = [
+        line
+        for line in text.splitlines()
+        if not re.match(rf"^\s*(?:[-*]\s*)?{re.escape(ASSISTANT_ACTION_PREFIX)}\s*/.+?\s*$", line)
+    ]
+    return "\n".join(lines).strip()
+
+
+def _assistant_action_allowed(action: str) -> tuple[bool, str]:
+    clean = action.strip()
+    if not clean.startswith("/"):
+        return False, "assistant actions must be explicit Telegram slash commands"
+    command, rest = _split_command(clean)
+    subcommand, _ = _split_once(rest.strip())
+    lowered_sub = subcommand.lower()
+    read_only = {
+        "/projects",
+        "/agents",
+        "/tasks",
+        "/current",
+        "/status",
+        "/list",
+        "/recent",
+        "/projectstate",
+        "/decisions",
+        "/assistant",
+        "/home",
+    }
+    if command in read_only:
+        return True, ""
+    if command == "/use":
+        return (True, "") if rest.strip() else (False, "/use requires a project, agent, or task reference")
+    if command == "/project":
+        if not rest.strip() or lowered_sub in {"new", "create", "use", "select"}:
+            return True, ""
+        return True, ""
+    if command == "/task":
+        return (True, "") if rest.strip() else (False, "/task requires a task reference or new task title")
+    if command == "/newtask":
+        return (True, "") if rest.strip() else (False, "/newtask requires a title")
+    if command == "/agent":
+        if not rest.strip():
+            return True, ""
+        if lowered_sub in {"template"}:
+            return False, "/agent template is not in the assistant safe command whitelist"
+        return True, ""
+    return False, "command is not in the assistant safe command whitelist"
 
 
 def _format_memory_document(index: int, memory: MemoryDocument) -> list[str]:
@@ -2490,6 +2738,7 @@ def _help_text() -> str:
             "/newtask <task title>",
             "/use <task_id or exact task title>",
             "/use task <task_id or list #>",
+            "/assistant",
             "/current",
             "/list",
             "/context [task]",

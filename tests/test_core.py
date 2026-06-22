@@ -1,13 +1,49 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
-from agentdeck.core.config import Workspace
+from agentdeck.core.config import Workspace, default_workspace_root, find_project_local_config, project_local_config_path
 from agentdeck.storage.memory import MarkdownMemoryStore
-from agentdeck.storage.telegram_bots import TelegramBotRegistry, redacted_token
+from agentdeck.storage.telegram_bots import TelegramBotRegistry, current_server_id, redacted_token
 
 
 class CoreStorageTests(unittest.TestCase):
+    def test_default_workspace_is_platform_workspace_not_caller_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            old_workspace = os.environ.pop("AGENTDECK_WORKSPACE", None)
+            try:
+                workspace = Workspace.from_cwd(tmpdir)
+                self.assertEqual(workspace.root, default_workspace_root())
+                self.assertNotEqual(workspace.root, Path(tmpdir) / ".agentdeck")
+            finally:
+                if old_workspace is not None:
+                    os.environ["AGENTDECK_WORKSPACE"] = old_workspace
+
+    def test_workspace_env_override_still_wins(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            override = Path(tmpdir) / "custom-agentdeck"
+            old_workspace = os.environ.get("AGENTDECK_WORKSPACE")
+            os.environ["AGENTDECK_WORKSPACE"] = str(override)
+            try:
+                self.assertEqual(Workspace.from_cwd("/").root, override.resolve())
+            finally:
+                if old_workspace is None:
+                    os.environ.pop("AGENTDECK_WORKSPACE", None)
+                else:
+                    os.environ["AGENTDECK_WORKSPACE"] = old_workspace
+
+    def test_project_local_config_is_separate_from_workspace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            project = Path(tmpdir) / "project"
+            nested = project / "src"
+            nested.mkdir(parents=True)
+            config_path = project_local_config_path(project)
+            config_path.write_text("[project]\nid = \"demo\"\n", encoding="utf-8")
+
+            self.assertEqual(config_path.name, ".agentdeck.toml")
+            self.assertEqual(find_project_local_config(nested), config_path)
+
     def test_workspace_init_creates_expected_directories(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Workspace(Path(tmpdir) / ".agentdeck")
@@ -112,8 +148,36 @@ allowed_chat_ids = [42, 43]
             assert record is not None
             self.assertEqual(record.title, "Minsys Bot 3")
             self.assertEqual(record.allowed_chat_ids, [42, 43])
+            self.assertEqual(record.server_id, current_server_id())
             self.assertEqual(redacted_token(record.token), "123456...WXYZ")
             self.assertNotIn(record.token, redacted_token(record.token))
+
+    def test_telegram_bot_registry_imports_manager_style_headings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            source = tmp / "Manager.txt"
+            source.write_text(
+                """
+Server: Minsys
+    Agents:
+        minsys-bot3:
+            tmux session: TeleAgent
+            Working Folder: /data/lyxie/TeleAgent
+            Token: 123456:ABCDEFGHIJKLMNOPQRSTUVWXYZ
+""".strip(),
+                encoding="utf-8",
+            )
+
+            registry = TelegramBotRegistry(workspace)
+            imported = registry.import_file(source)
+            self.assertEqual(len(imported), 1)
+            record = registry.get("minsys-bot3")
+            assert record is not None
+            self.assertEqual(record.title, "minsys-bot3")
+            self.assertEqual(record.server_id, current_server_id())
+            self.assertEqual(record.metadata["source_server"], "Minsys")
+            self.assertIsNone(registry.get("bot-1"))
 
 
 if __name__ == "__main__":

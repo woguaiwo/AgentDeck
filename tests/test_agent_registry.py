@@ -10,6 +10,7 @@ from agentdeck.cli import main
 from agentdeck.core.config import Workspace
 from agentdeck.storage.agents import AgentRegistry, role_template_for_agent
 from agentdeck.storage.sessions import SessionRegistry
+from agentdeck.storage.telegram_bots import TelegramBotRegistry, assistant_agent_id_for_bot
 
 
 class AgentRegistryTests(unittest.TestCase):
@@ -162,6 +163,41 @@ class AgentRegistryTests(unittest.TestCase):
             self.assertIn("Agent role guidance:", run_output)
             self.assertIn("You are the user's AgentDeck assistant", run_output)
             self.assertIn("help route me", run_output)
+
+    def test_cli_assistant_setup_bots_creates_bot_specific_assistants(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            TelegramBotRegistry(workspace).upsert(
+                bot_id="minsys-bot3",
+                title="Minsys Bot 3",
+                token="123456:ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                allowed_chat_ids=[42],
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(
+                    [
+                        "--workspace",
+                        str(workspace.root),
+                        "assistant",
+                        "setup-bots",
+                        "--adapter",
+                        "echo",
+                        "--cwd",
+                        tmpdir,
+                    ]
+                )
+            self.assertEqual(code, 0)
+            assistant_id = assistant_agent_id_for_bot("minsys-bot3")
+            self.assertIn(f"minsys-bot3) -> {assistant_id}", stdout.getvalue())
+
+            bot = TelegramBotRegistry(workspace).get("minsys-bot3")
+            assert bot is not None
+            self.assertEqual(bot.assistant_agent_id, assistant_id)
+            assistant = AgentRegistry(workspace).resolve(assistant_id)
+            assert assistant is not None
+            self.assertIn("You are the user's AgentDeck assistant", role_template_for_agent(assistant))
 
 
 if __name__ == "__main__":
