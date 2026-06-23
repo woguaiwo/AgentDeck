@@ -29,7 +29,7 @@ AgentDeck is organized around five layers:
      project state cards, and session state cards.
 
 4. **Remote Interface And Navigation Assistant**
-   - Exposes a Telegram control surface today, with CLI and future TUI/Web
+   - Exposes Telegram and local Web control surfaces, with CLI and future TUI
      interfaces sharing the same state model.
    - Lets each Telegram bot use its own assistant before a chat selects a task.
    - Allows the assistant to execute a narrow whitelist of safe routing commands.
@@ -81,8 +81,10 @@ After installation:
 
 ```bash
 agentdeck doctor
+agentdeck web serve
 agentdeck telegram start
 agentdeck telegram status
+agentdeck telegram restart
 agentdeck telegram stop
 ```
 
@@ -129,6 +131,41 @@ agentdeck sessions list
 agentdeck approvals list
 ```
 
+## Import Existing Provider Sessions
+
+AgentDeck can adopt Codex/Kimi sessions that were created before AgentDeck
+managed the project. First scan local provider state by the original provider
+working directory:
+
+```bash
+agentdeck sessions scan --cwd /old/project/path
+agentdeck sessions scan --provider codex --cwd /old/project/path
+agentdeck sessions scan --provider kimi --cwd /old/project/path
+```
+
+Then bind the chosen provider session to an AgentDeck project, agent, and
+optional task:
+
+```bash
+agentdeck sessions import \
+  --provider codex \
+  --provider-session <codex_thread_id> \
+  --project <project_id> \
+  --agent <agent_id> \
+  --title "Imported Codex session"
+
+agentdeck sessions import \
+  --provider kimi \
+  --provider-session <kimi_session_id> \
+  --project <project_id> \
+  --task <task_id>
+```
+
+After import, `agentdeck run --session <provider_session_id> "Continue"` resumes
+the underlying provider session while recording the run in AgentDeck. If a
+project moved directories, scan with the old provider cwd and import with the
+new AgentDeck project or `--cwd`.
+
 ## Codex Approval Modes
 
 `CodexExecAdapter` is non-interactive, so AgentDeck cannot yet answer mid-run
@@ -154,6 +191,59 @@ agentdeck approvals reject <approval_id> "too risky"
 
 Approving a request records the decision for audit and later remote interfaces.
 It does not implicitly rerun with bypassed permissions.
+
+## Web Interface
+
+The Web interface is a local browser control console backed by the same
+workspace registries as CLI and Telegram. It has no external Python dependency:
+
+```bash
+agentdeck web serve
+```
+
+By default it listens on `127.0.0.1:8765`:
+
+```text
+http://127.0.0.1:8765
+```
+
+The Web console shows projects, tasks, agents, sessions, recent jobs, and
+pending approvals, plus JSON endpoints for future frontends:
+
+```text
+/
+/api/overview
+/api/health
+```
+
+It also exposes guarded form actions for common operator work:
+
+- Create a project.
+- Archive and restore project records while preserving child tasks, agents,
+  sessions, and memory links.
+- Globally rename Project, Task, Agent, and Session ids.
+- Run a prompt on a task or send a message to the AgentDeck assistant.
+- Start/stop Web auto mode for a task.
+- Approve/reject pending approval requests.
+- Cancel queued or running Web jobs.
+
+Global id rename updates AgentDeck registries and references across tasks,
+agents, sessions, jobs, approvals, progress journal, session state cards,
+project state, memory owner directories, and Telegram chat state.
+
+To reach it from a phone or another machine without buying a domain, expose the
+local port with a private network or temporary tunnel:
+
+```bash
+# Tailscale private access
+agentdeck web serve --host 0.0.0.0 --port 8765
+
+# Cloudflare Quick Tunnel for temporary public testing
+cloudflared tunnel --url http://127.0.0.1:8765
+```
+
+Keep the default `127.0.0.1` binding unless a tunnel or private network is
+handling access control.
 
 ## Telegram Interface
 
@@ -185,6 +275,10 @@ The daemon pid and log are stored under `.agentdeck/telegram/`. The daemon keeps
 receiving phone commands and running queued jobs after the launching SSH session
 disconnects. If the server itself restarts or the daemon crashes, start it
 again; unfinished Telegram jobs are marked `interrupted`.
+Use `agentdeck telegram restart` after updating AgentDeck to reload the daemon
+without changing the saved bot configuration. Restart refuses to run while
+Telegram jobs are queued or running; wait, cancel them, or use
+`agentdeck telegram restart --force-jobs` when interruption is acceptable.
 
 Supported commands:
 
@@ -206,9 +300,12 @@ Supported commands:
 /newtask <task title>
 /use <task_id or exact task title>
 /use task <task_id or list #>
+/use session <session_id or list #>
 /assistant
 /current
 /status
+/restart
+/restart force
 /list
 /context [task]
 /memories [task]
@@ -220,6 +317,7 @@ Supported commands:
 /reviews [task]
 /sessions [agent]
 /session <session_id or list #>
+/session use <session_id or list #>
 /resume <session_id or list #> <message>
 /auto start [hours]
 /auto task [hours]
@@ -237,6 +335,7 @@ Supported commands:
 /job <job_id>
 /job <list #>
 /job
+/job resume <job_id or list #> [message]
 /cancel <job_id>
 /cancel <list #>
 /cancel
@@ -248,20 +347,31 @@ Supported commands:
 
 `/run` starts a background job and returns immediately with a job id. After a
 task is selected, plain text messages are treated the same as `/run <message>`.
-If no task is selected and a default assistant exists, plain text messages are
-sent to that assistant so it can help route the user to the right project,
-agent, and task. If no assistant exists, the bot returns a setup hint instead
-of sending the text to an agent. The bot continues receiving Telegram messages
-while the backend agent runs, then sends the final result back to the chat when
-the job finishes. Job records are stored under `.agentdeck/jobs/`; if AgentDeck
-restarts while a job is still queued or running, that job is marked
-`interrupted`.
+After a session is selected with `/use session <list #>` or
+`/session use <list #>`, plain text messages resume that session even when the
+session has no linked task. The success reply and `/current` both show the
+selected session so phone users can see whether they are talking to the
+assistant or a project agent. If no task or session is selected and a default
+assistant exists, plain text messages are sent to that assistant so it can help
+route the user to the right project, agent, task, or session. If no assistant
+exists, the bot returns a setup hint instead of sending the text to an agent.
+The bot continues receiving Telegram messages while the backend agent runs, then
+sends the final result back to the chat when the job finishes. Job records are
+stored under `.agentdeck/jobs/`; if AgentDeck restarts while a job is still
+queued or running, that job is marked `interrupted`.
+
+Interrupted jobs can be restarted from Telegram with
+`/job resume <job_id or list #> [message]`, or simply `/job resume` for the
+latest interrupted job in the chat. If the interrupted job already had a saved
+session, AgentDeck resumes that session. If no safe session is available, it
+starts a new job from the task context and the original prompt.
 
 Create the default assistant with:
 
 ```bash
 agentdeck assistant setup --adapter codex --cwd /data/lyxie/AgentDeck
 agentdeck assistant setup-bots --adapter codex --cwd /data/lyxie/AgentDeck
+agentdeck assistant refresh
 agentdeck assistant show
 ```
 
@@ -271,9 +381,15 @@ When the assistant is confident, it may place safe Telegram control commands on
 their own final lines as `AGENTDECK_ACTION: /command ...`. AgentDeck strips
 those marker lines from the user-visible reply and executes only a small
 whitelist of routing commands, such as `/projects`, `/tasks`, `/status`,
-`/use project`, `/use agent`, `/use task`, `/project new`, `/agent new`, and
-`/task new`. It will not execute `/run`, `/auto`, approval, cancellation,
-shell, destructive, or secret-revealing commands from assistant output.
+`/use project`, `/use agent`, `/use task`, `/use session`, `/project new`,
+`/agent new`, `/task new`, and `/restart`. `/restart` refuses to reload while
+Telegram jobs are active, and assistant actions cannot force it. It will not
+execute `/run`, `/auto`, approval, cancellation, shell, destructive, or
+secret-revealing commands from assistant output. If an assistant claims that it
+switched project, task, agent, or session without emitting an executable
+`AGENTDECK_ACTION`, Telegram sends an extra warning telling the user to confirm
+with `/current`. Use `agentdeck assistant refresh` after upgrading AgentDeck to
+update saved assistant prompts to the latest routing rules.
 
 Bot records are scoped to the server where they are imported or added. Use
 `assistant setup-bots` to create and bind one assistant per saved bot on the
@@ -286,8 +402,9 @@ project, agent, task, latest job, auto mode, pending approvals, and recent
 sessions. `/projects`, `/agents`, `/tasks`, `/jobs`, `/sessions`, and
 `/approvals` store numbered lists for the current chat, so commands like
 `/use project <list #>`, `/use agent <list #>`, `/use task <list #>`,
-`/run <list #> <message>`, `/job <list #>`, `/cancel <list #>`, and
-`/resume <list #> <message>` avoid copying long ids.
+`/use session <list #>`, `/run <list #> <message>`, `/job <list #>`,
+`/job resume <list #>`, `/cancel <list #>`, and `/resume <list #> <message>`
+avoid copying long ids.
 
 Projects, agents, and tasks can also be created from Telegram:
 
@@ -299,12 +416,16 @@ Projects, agents, and tasks can also be created from Telegram:
 
 After selecting a task once with `/use task <list #>` or creating one with
 `/task new <title>`, you can send a plain text message to the current agent.
-`/run <message>` is still supported. `/job` shows the latest job in the chat,
-and `/cancel` cancels the latest queued or running job.
+After selecting a session with `/use session <list #>`, plain text messages
+resume that session. `/sessions` shows the linked task title under each session
+when AgentDeck can find one, so a renamed task and an older session title remain
+distinguishable. `/run <message>` is still supported. `/job` shows the latest job
+in the chat, and `/cancel` cancels the latest queued or running job.
 Use `/assistant` or `/use assistant` to clear the current task and route plain
 text messages back to the assistant. Selecting a different project or agent with
-`/use project ...` or `/use agent ...` also clears the current task, so the next
-plain message goes through the assistant until you select or create a task.
+`/use project ...` or `/use agent ...` also clears the current task/session, so
+the next plain message goes through the assistant until you select or create a
+task or select a session.
 
 Auto mode is a task-level job loop. After selecting a task with `/use`, send
 `/auto start` to start one run immediately and then keep starting the next run

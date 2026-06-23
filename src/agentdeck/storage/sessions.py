@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -160,6 +161,69 @@ class SessionRegistry:
         self._write(records)
         return record
 
+    def import_provider_session(
+        self,
+        *,
+        provider_session_id: str,
+        provider_session_kind: str,
+        agent_id: str,
+        adapter: str,
+        project_dir: str | Path,
+        title: str = "",
+        session_id: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SessionRecord:
+        """Register an existing provider session as an AgentDeck session."""
+        provider_session_id = provider_session_id.strip()
+        if not provider_session_id:
+            raise ValueError("provider_session_id is required")
+
+        records = self._read()
+        record = records.get(session_id or "")
+        if record is None:
+            for candidate in records.values():
+                if candidate.adapter == adapter and candidate.provider_session_id == provider_session_id:
+                    record = candidate
+                    break
+
+        now = time.time()
+        clean_title = _clean_title(title)
+        if record is None:
+            record = SessionRecord(
+                session_id=session_id or _import_session_id(adapter, provider_session_id),
+                agent_id=agent_id,
+                adapter=adapter,
+                project_dir=str(Path(project_dir).expanduser().resolve()),
+                title=clean_title or provider_session_id,
+                status="idle",
+                created_at=now,
+                updated_at=now,
+                provider_session_id=provider_session_id,
+                provider_session_kind=provider_session_kind,
+            )
+        else:
+            record.agent_id = agent_id
+            record.adapter = adapter
+            record.project_dir = str(Path(project_dir).expanduser().resolve())
+            record.status = "idle"
+            record.updated_at = now
+            record.provider_session_id = provider_session_id
+            record.provider_session_kind = provider_session_kind
+            if clean_title:
+                record.title = clean_title
+
+        if clean_title:
+            record.metadata["title_source"] = "manual"
+        elif not record.title:
+            record.title = provider_session_id
+            record.metadata["title_source"] = "provider"
+        record.metadata["imported"] = True
+        if metadata:
+            record.metadata.update(metadata)
+        records[record.session_id] = record
+        self._write(records)
+        return record
+
     def resolve(self, value: str) -> SessionRecord | None:
         records = self._read()
         if value in records:
@@ -261,3 +325,8 @@ def _title_from_prompt(prompt: str, *, max_chars: int = 72) -> str:
 
 def _clean_title(value: str) -> str:
     return " ".join(value.strip().split())
+
+
+def _import_session_id(adapter: str, provider_session_id: str) -> str:
+    seed = f"agentdeck:provider-session:{adapter}:{provider_session_id}"
+    return uuid.uuid5(uuid.NAMESPACE_URL, seed).hex[:12]

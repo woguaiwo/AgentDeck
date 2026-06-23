@@ -194,6 +194,146 @@ class SessionRegistryTests(unittest.TestCase):
             self.assertIn("thread-123", args)
             self.assertEqual(args[-1], "next")
 
+    def test_cli_sessions_import_registers_external_codex_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            workspace.ensure()
+            project = tmp / "project"
+            project.mkdir()
+            args_path = tmp / "codex_args.txt"
+            fake = tmp / "fake_codex"
+            fake.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    import sys
+                    from pathlib import Path
+
+                    args = sys.argv[1:]
+                    Path({str(args_path)!r}).write_text("\\n".join(args), encoding="utf-8")
+                    for i, arg in enumerate(args):
+                        if arg in {{"--output-last-message", "-o"}} and i + 1 < len(args):
+                            Path(args[i + 1]).write_text("imported final", encoding="utf-8")
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(
+                    [
+                        "--workspace",
+                        str(workspace.root),
+                        "sessions",
+                        "import",
+                        "--provider",
+                        "codex",
+                        "--provider-session",
+                        "thread-imported",
+                        "--cwd",
+                        str(project),
+                        "--agent",
+                        "agent-a",
+                        "--title",
+                        "Imported thread",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertIn("imported: Imported thread", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(
+                    [
+                        "--workspace",
+                        str(workspace.root),
+                        "run",
+                        "continue",
+                        "--session",
+                        "thread-imported",
+                        "--codex-bin",
+                        str(fake),
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            self.assertIn("imported final", stdout.getvalue())
+            args = args_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(args[:2], ["exec", "resume"])
+            self.assertIn("thread-imported", args)
+
+    def test_cli_sessions_scan_finds_codex_and_kimi_sessions_by_cwd(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            workspace.ensure()
+            home = tmp / "home"
+            project = tmp / "project"
+            project.mkdir()
+
+            codex_dir = home / ".codex"
+            rollout = codex_dir / "sessions" / "2026" / "06" / "22" / "rollout.jsonl"
+            rollout.parent.mkdir(parents=True)
+            (codex_dir / "session_index.jsonl").parent.mkdir(parents=True, exist_ok=True)
+            (codex_dir / "session_index.jsonl").write_text(
+                json.dumps(
+                    {
+                        "id": "codex-thread-1",
+                        "thread_name": "Codex old work",
+                        "updated_at": "2026-06-22T00:00:00Z",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            rollout.write_text(
+                json.dumps(
+                    {
+                        "timestamp": "2026-06-21T00:00:00Z",
+                        "type": "session_meta",
+                        "payload": {"id": "codex-thread-1", "cwd": str(project)},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            kimi_dir = home / ".kimi"
+            kimi_dir.mkdir(parents=True)
+            kimi_dir.joinpath("kimi.json").write_text(
+                json.dumps({"work_dirs": [{"path": str(project), "last_session_id": "kimi-session-1"}]}),
+                encoding="utf-8",
+            )
+            import hashlib
+
+            kimi_session = kimi_dir / "sessions" / hashlib.md5(str(project).encode("utf-8")).hexdigest() / "kimi-session-1"
+            kimi_session.mkdir(parents=True)
+            kimi_session.joinpath("state.json").write_text(json.dumps({"custom_title": "Kimi old work"}), encoding="utf-8")
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(
+                    [
+                        "--workspace",
+                        str(workspace.root),
+                        "sessions",
+                        "scan",
+                        "--home",
+                        str(home),
+                        "--cwd",
+                        str(project),
+                        "--json",
+                    ]
+                )
+
+            self.assertEqual(code, 0)
+            found = json.loads(stdout.getvalue())
+            ids = {item["provider_session_id"] for item in found}
+            self.assertEqual(ids, {"codex-thread-1", "kimi-session-1"})
+
     def test_cli_run_session_refuses_codex_session_without_provider_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)

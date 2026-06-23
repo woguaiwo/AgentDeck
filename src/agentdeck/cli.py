@@ -19,8 +19,10 @@ from agentdeck.interfaces.telegram import TelegramBotApi, TelegramMultiServer, T
 from agentdeck.storage.approvals import APPROVAL_STATUSES, ApprovalRecord, ApprovalRegistry
 from agentdeck.storage.event_log import EventLog
 from agentdeck.storage.agents import ASSISTANT_AGENT_ID, DEFAULT_ASSISTANT_TEMPLATE, AgentRecord, AgentRegistry
+from agentdeck.storage.jobs import JobRecord, JobRegistry
 from agentdeck.storage.memory import MarkdownMemoryStore
 from agentdeck.storage.progress import ProgressJournal, format_handoff, format_review
+from agentdeck.storage.provider_sessions import ProviderSessionCandidate, scan_provider_sessions
 from agentdeck.storage.projects import ProjectRecord, ProjectRegistry
 from agentdeck.storage.project_state import ProjectStateStore
 from agentdeck.storage.session_state import SessionStateStore
@@ -95,6 +97,10 @@ def build_parser() -> argparse.ArgumentParser:
     assistant_setup_bots.add_argument("--model")
     assistant_setup_bots.add_argument("--approval-mode", default="fail", choices=["fail", "record", "bypass"])
     assistant_setup_bots.add_argument("--replace", action="store_true")
+    assistant_refresh = assistant_sub.add_parser("refresh", help="Refresh saved assistant routing templates")
+    assistant_refresh.add_argument("--agent", action="append", default=[], help="Assistant agent id to refresh. Repeatable.")
+    assistant_refresh.add_argument("--server", default=current_server_id(), help="Server id for bot assistants. Defaults to this host.")
+    assistant_refresh.add_argument("--all-servers", action="store_true", help="Refresh bot assistants for all saved bots")
 
     memory = sub.add_parser("memory", help="Manage markdown memory")
     mem_sub = memory.add_subparsers(dest="memory_command", required=True)
@@ -153,6 +159,23 @@ def build_parser() -> argparse.ArgumentParser:
     sess_rename = sess_sub.add_parser("rename", help="Rename one session")
     sess_rename.add_argument("session")
     sess_rename.add_argument("title")
+    sess_scan = sess_sub.add_parser("scan", help="Find provider sessions that can be imported")
+    sess_scan.add_argument("--provider", choices=["codex", "kimi"])
+    sess_scan.add_argument("--cwd", help="Only show sessions whose provider cwd matches this directory")
+    sess_scan.add_argument("--home", help="Home directory containing .codex/.kimi")
+    sess_scan.add_argument("--limit", type=int, default=20)
+    sess_scan.add_argument("--json", action="store_true", help="Print raw JSON")
+    sess_import = sess_sub.add_parser("import", help="Bind an existing provider session to AgentDeck")
+    sess_import.add_argument("--provider", required=True, choices=["codex", "kimi"])
+    sess_import.add_argument("--provider-session", required=True, help="Codex thread id or Kimi session id")
+    sess_import.add_argument("--project", help="Project id or title")
+    sess_import.add_argument("--task", help="Optional task id or title to attach to the imported session")
+    sess_import.add_argument("--agent", help="Agent id")
+    sess_import.add_argument("--adapter", choices=["codex", "codex-exec", "kimi", "kimi-print"])
+    sess_import.add_argument("--cwd", help="Provider working directory")
+    sess_import.add_argument("--title", help="Human-readable title")
+    sess_import.add_argument("--session-id", help="Explicit AgentDeck session id")
+    sess_import.add_argument("--kind", help="Provider session kind override")
 
     agents = sub.add_parser("agents", help="Manage project agents")
     agent_sub = agents.add_subparsers(dest="agents_command", required=True)
@@ -319,6 +342,19 @@ def build_parser() -> argparse.ArgumentParser:
     telegram_start.add_argument("--poll-timeout", type=int, default=30)
     telegram_stop = telegram_sub.add_parser("stop", help="Stop detached Telegram bot")
     telegram_stop.add_argument("--force", action="store_true", help="Send SIGKILL if SIGTERM does not stop the bot")
+    telegram_restart = telegram_sub.add_parser("restart", help="Restart detached Telegram bot service")
+    telegram_restart.add_argument("--bot", help="Only serve one saved bot id from telegram bots registry")
+    telegram_restart.add_argument("--assistant-agent", help="Assistant agent used before a task is selected")
+    telegram_restart.add_argument("--token", help="Telegram bot token; defaults to AGENTDECK_TELEGRAM_TOKEN")
+    telegram_restart.add_argument(
+        "--allowed-chat-id",
+        action="append",
+        default=[],
+        help="Allowed Telegram chat id. Can be repeated. Defaults to AGENTDECK_TELEGRAM_ALLOWED_CHATS.",
+    )
+    telegram_restart.add_argument("--poll-timeout", type=int, default=30)
+    telegram_restart.add_argument("--force", action="store_true", help="Send SIGKILL if SIGTERM does not stop the old bot")
+    telegram_restart.add_argument("--force-jobs", action="store_true", help="Restart even when Telegram jobs are queued or running")
     telegram_sub.add_parser("status", help="Show detached Telegram bot status")
     telegram_bots = telegram_sub.add_parser("bots", help="Manage saved Telegram bot configs")
     telegram_bots_sub = telegram_bots.add_subparsers(dest="telegram_bots_command", required=True)
@@ -332,6 +368,12 @@ def build_parser() -> argparse.ArgumentParser:
     telegram_bots_import = telegram_bots_sub.add_parser("import", help="Import bot configs from TOML or loose text")
     telegram_bots_import.add_argument("path")
     telegram_bots_sub.add_parser("list", help="List saved Telegram bots")
+
+    web = sub.add_parser("web", help="Run local browser control console")
+    web_sub = web.add_subparsers(dest="web_command", required=True)
+    web_serve = web_sub.add_parser("serve", help="Start local web dashboard")
+    web_serve.add_argument("--host", default="127.0.0.1")
+    web_serve.add_argument("--port", type=int, default=8765)
 
     return parser
 
@@ -409,6 +451,8 @@ def main(argv: list[str] | None = None) -> int:
             return _setup_assistant(registry, args)
         if args.assistant_command == "setup-bots":
             return _setup_bot_assistants(workspace, registry, args)
+        if args.assistant_command == "refresh":
+            return _refresh_assistant_templates(workspace, registry, args)
         if args.assistant_command == "show":
             record = registry.resolve(args.agent)
             if record is None:
@@ -493,6 +537,46 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"session not found: {args.session}", file=sys.stderr)
                 return 2
             print(f"renamed: {record.title} ({record.session_id})")
+            return 0
+        if args.sessions_command == "scan":
+            candidates = scan_provider_sessions(provider=args.provider, project_dir=args.cwd, home=args.home)
+            if args.limit and args.limit > 0:
+                candidates = candidates[: args.limit]
+            if args.json:
+                print(json.dumps([item.to_dict() for item in candidates], ensure_ascii=False, indent=2, sort_keys=True))
+            else:
+                _print_provider_sessions(candidates)
+            return 0
+        if args.sessions_command == "import":
+            project = ProjectRegistry(workspace).resolve(args.project) if args.project else None
+            if args.project and project is None:
+                print(f"project not found: {args.project}", file=sys.stderr)
+                return 2
+            project_dir = args.cwd or (project.project_dir if project is not None else ".")
+            agent_id = args.agent or (project.default_agent_id if project is not None else "default")
+            adapter = args.adapter or ("codex" if args.provider == "codex" else "kimi")
+            kind = args.kind or ("codex_thread" if args.provider == "codex" else "kimi_session")
+            try:
+                record = registry.import_provider_session(
+                    provider_session_id=args.provider_session,
+                    provider_session_kind=kind,
+                    agent_id=agent_id,
+                    adapter=adapter,
+                    project_dir=project_dir,
+                    title=args.title or "",
+                    session_id=args.session_id,
+                    metadata={"provider": args.provider, "imported_by": "cli"},
+                )
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            if args.task:
+                task = TaskBoard(workspace).attach_session(args.task, record.session_id)
+                if task is None:
+                    print(f"task not found: {args.task}", file=sys.stderr)
+                    return 2
+            print(f"imported: {record.title} ({record.session_id})")
+            print(f"provider_session_id: {record.provider_session_id}")
             return 0
 
     if args.command == "agents":
@@ -655,8 +739,21 @@ def main(argv: list[str] | None = None) -> int:
             return _telegram_start(args, workspace)
         if args.telegram_command == "stop":
             return _telegram_stop(args, workspace)
+        if args.telegram_command == "restart":
+            return _telegram_restart(args, workspace)
         if args.telegram_command == "status":
             return _telegram_status(workspace)
+
+    if args.command == "web":
+        workspace.ensure()
+        if args.web_command == "serve":
+            from agentdeck.interfaces.web import serve_web
+
+            try:
+                serve_web(workspace, host=args.host, port=args.port)
+            except KeyboardInterrupt:
+                print("web service stopped")
+            return 0
 
     parser.error(f"unknown command: {args.command}")
     return 2
@@ -842,6 +939,39 @@ def _telegram_stop(args: argparse.Namespace, workspace: Workspace) -> int:
     return 1
 
 
+def _telegram_restart(args: argparse.Namespace, workspace: Workspace) -> int:
+    pid_path = _telegram_pid_path(workspace)
+    pid = _read_pid(pid_path)
+    if pid and _pid_alive(pid):
+        active_jobs = _active_telegram_jobs(workspace)
+        if active_jobs and not bool(getattr(args, "force_jobs", False)):
+            print("telegram restart blocked: active Telegram jobs exist", file=sys.stderr)
+            for job in active_jobs[:5]:
+                task = f" task={job.task_id}" if job.task_id else ""
+                print(f"- {job.job_id} status={job.status}{task}", file=sys.stderr)
+            if len(active_jobs) > 5:
+                print(f"- ... {len(active_jobs) - 5} more", file=sys.stderr)
+            print("wait for them to finish, cancel them, or rerun with: agentdeck telegram restart --force-jobs", file=sys.stderr)
+            return 2
+        stop_code = _telegram_stop(argparse.Namespace(force=bool(getattr(args, "force", False))), workspace)
+        if stop_code != 0:
+            return stop_code
+    elif pid:
+        _unlink_quietly(pid_path)
+        print(f"removed stale telegram pid: {pid}")
+    else:
+        print("telegram service is not running; starting it")
+    return _telegram_start(args, workspace)
+
+
+def _active_telegram_jobs(workspace: Workspace) -> list[JobRecord]:
+    registry = JobRegistry(workspace)
+    records: list[JobRecord] = []
+    for status in {"queued", "running", "cancel_requested"}:
+        records.extend(registry.list(interface="telegram", status=status))
+    return sorted(records, key=lambda item: item.updated_at, reverse=True)
+
+
 def _telegram_status(workspace: Workspace) -> int:
     pid = _read_pid(_telegram_pid_path(workspace))
     log_path = _telegram_log_path(workspace)
@@ -934,6 +1064,25 @@ def _print_sessions(records: list[SessionRecord]) -> None:
                     record.agent_id,
                     record.adapter,
                     record.status,
+                    _format_timestamp(record.updated_at),
+                    record.project_dir,
+                ]
+            )
+        )
+
+
+def _print_provider_sessions(records: list[ProviderSessionCandidate]) -> None:
+    if not records:
+        print("no provider sessions")
+        return
+    print("title\tprovider\tprovider_session_id\tupdated_at\tproject_dir")
+    for record in records:
+        print(
+            "\t".join(
+                [
+                    record.title,
+                    record.provider,
+                    record.provider_session_id,
                     _format_timestamp(record.updated_at),
                     record.project_dir,
                 ]
@@ -1142,24 +1291,56 @@ def _setup_bot_assistants(workspace: Workspace, registry: AgentRegistry, args: a
     for bot in bots:
         agent_id = bot.assistant_agent_id or assistant_agent_id_for_bot(bot.bot_id)
         try:
-            record = registry.upsert(
-                agent_id=agent_id,
-                title=f"{bot.title} Assistant",
-                project_id="",
-                role="manager",
-                team_id="agentdeck",
-                adapter=args.adapter,
-                project_dir=args.cwd,
-                model=args.model or "",
-                approval_mode=args.approval_mode,
-                replace=args.replace,
-            )
+            existing = registry.resolve(agent_id)
+            if existing is not None and not args.replace:
+                record = existing
+            else:
+                record = registry.upsert(
+                    agent_id=agent_id,
+                    title=f"{bot.title} Assistant",
+                    project_id="",
+                    role="manager",
+                    team_id="agentdeck",
+                    adapter=args.adapter,
+                    project_dir=args.cwd,
+                    model=args.model or "",
+                    approval_mode=args.approval_mode,
+                    replace=args.replace,
+                )
             record = registry.set_role_template(record.agent_id, DEFAULT_ASSISTANT_TEMPLATE)
             bot_registry.assign_assistant(bot.bot_id, record.agent_id, server_id=bot.server_id or args.server)
         except ValueError as exc:
             print(f"{bot.bot_id}: {exc}", file=sys.stderr)
             return 2
         print(f"- {bot.title} ({bot.bot_id}) -> {record.agent_id}")
+    return 0
+
+
+def _refresh_assistant_templates(workspace: Workspace, registry: AgentRegistry, args: argparse.Namespace) -> int:
+    agent_ids = list(dict.fromkeys(args.agent or []))
+    if not agent_ids and registry.resolve(ASSISTANT_AGENT_ID) is not None:
+        agent_ids.append(ASSISTANT_AGENT_ID)
+
+    bot_registry = TelegramBotRegistry(workspace)
+    server_id = None if args.all_servers else args.server
+    for bot in bot_registry.list(server_id=server_id):
+        agent_ids.append(bot.assistant_agent_id or assistant_agent_id_for_bot(bot.bot_id))
+
+    agent_ids = list(dict.fromkeys(agent_ids))
+    if not agent_ids:
+        print("no assistant agents found")
+        return 0
+
+    refreshed = 0
+    for agent_id in agent_ids:
+        record = registry.resolve(agent_id)
+        if record is None:
+            print(f"- {agent_id}: missing")
+            continue
+        registry.set_role_template(record.agent_id, DEFAULT_ASSISTANT_TEMPLATE)
+        refreshed += 1
+        print(f"- refreshed {record.title} ({record.agent_id})")
+    print(f"refreshed: {refreshed}")
     return 0
 
 

@@ -173,6 +173,14 @@ class AgentRegistryTests(unittest.TestCase):
                 token="123456:ABCDEFGHIJKLMNOPQRSTUVWXYZ",
                 allowed_chat_ids=[42],
             )
+            stale_assistant_id = assistant_agent_id_for_bot("minsys-bot3")
+            AgentRegistry(workspace).upsert(
+                agent_id=stale_assistant_id,
+                title="Minsys Bot 3 Assistant",
+                adapter="echo",
+                project_dir=tmpdir,
+            )
+            AgentRegistry(workspace).set_role_template(stale_assistant_id, "Old assistant prompt without session routing.")
 
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
@@ -198,6 +206,33 @@ class AgentRegistryTests(unittest.TestCase):
             assistant = AgentRegistry(workspace).resolve(assistant_id)
             assert assistant is not None
             self.assertIn("You are the user's AgentDeck assistant", role_template_for_agent(assistant))
+            self.assertIn("/use session", role_template_for_agent(assistant))
+            self.assertIn("do not merely describe or claim", role_template_for_agent(assistant))
+
+    def test_cli_assistant_refresh_updates_saved_assistant_templates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            assistant_id = assistant_agent_id_for_bot("minsys-bot3")
+            TelegramBotRegistry(workspace).upsert(
+                bot_id="minsys-bot3",
+                title="Minsys Bot 3",
+                token="123456:ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                allowed_chat_ids=[42],
+                assistant_agent_id=assistant_id,
+            )
+            registry = AgentRegistry(workspace)
+            registry.upsert(agent_id=assistant_id, title="Minsys Bot 3 Assistant", adapter="echo", project_dir=tmpdir)
+            registry.set_role_template(assistant_id, "Old assistant prompt.")
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--workspace", str(workspace.root), "assistant", "refresh"])
+
+            self.assertEqual(code, 0)
+            self.assertIn(f"refreshed Minsys Bot 3 Assistant ({assistant_id})", stdout.getvalue())
+            refreshed = AgentRegistry(workspace).resolve(assistant_id)
+            assert refreshed is not None
+            self.assertIn("/use session", role_template_for_agent(refreshed))
 
 
 if __name__ == "__main__":

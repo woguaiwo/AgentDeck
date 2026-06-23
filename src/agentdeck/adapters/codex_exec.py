@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import subprocess
 import tempfile
 from dataclasses import dataclass, field
@@ -125,8 +126,8 @@ class CodexExecAdapter:
 
             assert process.stderr is not None
             stderr = _filter_stderr((await process.stderr.read()).decode("utf-8", errors="replace"))
-            return_code = await process.wait()
-            cancelled = await cancel_task
+            return_code = await _wait_for_process_exit(process)
+            cancelled = await _finish_cancel_task(cancel_task)
 
             if cancelled:
                 yield AgentEvent(
@@ -360,6 +361,67 @@ def _read_last_message(path: Path) -> str:
         return path.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
+
+
+async def _wait_for_process_exit(process: asyncio.subprocess.Process) -> int:
+    if process.returncode is not None:
+        return process.returncode
+    try:
+        return await asyncio.wait_for(process.wait(), timeout=1.0)
+    except asyncio.TimeoutError:
+        reaped = _reap_returncode(process)
+        if reaped is not None:
+            return reaped
+
+    try:
+        process.terminate()
+    except ProcessLookupError:
+        reaped = _reap_returncode(process)
+        return reaped if reaped is not None else 0
+
+    try:
+        return await asyncio.wait_for(process.wait(), timeout=2.0)
+    except asyncio.TimeoutError:
+        reaped = _reap_returncode(process)
+        if reaped is not None:
+            return reaped
+        try:
+            process.kill()
+        except ProcessLookupError:
+            return process.returncode if process.returncode is not None else 0
+        try:
+            return await asyncio.wait_for(process.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            reaped = _reap_returncode(process)
+            return reaped if reaped is not None else -9
+
+
+async def _finish_cancel_task(task: asyncio.Task[bool]) -> bool:
+    if task.done():
+        return await task
+    task.cancel()
+    try:
+        return await task
+    except asyncio.CancelledError:
+        return False
+
+
+def _reap_returncode(process: asyncio.subprocess.Process) -> int | None:
+    if process.returncode is not None:
+        return process.returncode
+    try:
+        pid, status = os.waitpid(process.pid, os.WNOHANG)
+    except (AttributeError, ChildProcessError, OSError):
+        return process.returncode
+    if pid == 0:
+        return process.returncode
+    if hasattr(os, "waitstatus_to_exitcode"):
+        return os.waitstatus_to_exitcode(status)
+    if os.WIFEXITED(status):
+        return os.WEXITSTATUS(status)
+    if os.WIFSIGNALED(status):
+        return -os.WTERMSIG(status)
+    return 1
 
 
 async def _terminate_on_cancel(process: asyncio.subprocess.Process, cancellation: CancellationToken | None) -> bool:

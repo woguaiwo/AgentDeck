@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import mimetypes
 import os
 import re
+import shlex
+import sys
 import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -30,6 +34,7 @@ from agentdeck.storage.agents import ASSISTANT_AGENT_ID, AgentRecord, AgentRegis
 from agentdeck.storage.jobs import JobRecord, JobRegistry
 from agentdeck.storage.memory import MemoryDocument, MarkdownMemoryStore
 from agentdeck.storage.progress import ProgressJournal, format_review
+from agentdeck.storage.provider_sessions import ProviderSessionCandidate, scan_provider_sessions
 from agentdeck.storage.projects import ProjectRecord, ProjectRegistry
 from agentdeck.storage.project_state import ProjectStateStore
 from agentdeck.storage.session_state import SessionStateStore
@@ -54,6 +59,9 @@ DEFAULT_AUTO_TASK_PROMPT = (
     "如果你判断当前 task 的范围和细节已经基本充分完成，请在回复最后单独一行输出 "
     f"{AUTO_TASK_DONE_MARKER}，并给出简短完成摘要；否则不要输出这个标记，继续说明下一步。"
 )
+ACTIVE_JOB_STATUSES = {"queued", "running", "cancel_requested"}
+_RESTART_LOCK = threading.Lock()
+_RESTART_SCHEDULED = False
 
 
 @dataclass
@@ -83,10 +91,37 @@ class TelegramBotApi:
         for chunk in split_message(text):
             self._request("sendMessage", {"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True})
 
+    def send_video(self, chat_id: int, path: str | Path, caption: str = "") -> None:
+        video_path = Path(path).expanduser()
+        fields: dict[str, str | int | bool] = {"chat_id": chat_id, "supports_streaming": True}
+        clean_caption = caption.strip()
+        if clean_caption:
+            fields["caption"] = clean_caption[:1000]
+        self._request_multipart("sendVideo", fields, {"video": video_path})
+
     def _request(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
         body = urllib.parse.urlencode(payload).encode("utf-8")
         request = urllib.request.Request(f"{self.base_url}/{method}", data=body)
         with urllib.request.urlopen(request, timeout=max(35, int(payload.get("timeout") or 0) + 5)) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        if not data.get("ok"):
+            raise RuntimeError(f"Telegram API error: {data}")
+        return data
+
+    def _request_multipart(
+        self,
+        method: str,
+        fields: dict[str, str | int | bool],
+        files: dict[str, Path],
+    ) -> dict[str, Any]:
+        boundary = f"agentdeck-{uuid.uuid4().hex}"
+        body = _build_multipart_body(boundary, fields, files)
+        request = urllib.request.Request(
+            f"{self.base_url}/{method}",
+            data=body,
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+        with urllib.request.urlopen(request, timeout=120) as response:
             data = json.loads(response.read().decode("utf-8"))
         if not data.get("ok"):
             raise RuntimeError(f"Telegram API error: {data}")
@@ -116,6 +151,20 @@ class TelegramChatStateStore:
             key = self._chat_key(chat_id)
             chat = dict(data.get(key) or {})
             chat["current_task_id"] = task_id
+            data[key] = chat
+            self._write(data)
+
+    def current_session(self, chat_id: int) -> str:
+        with self._lock:
+            data = self._read()
+            return str(data.get(self._chat_key(chat_id), {}).get("current_session_id") or "")
+
+    def set_current_session(self, chat_id: int, session_id: str) -> None:
+        with self._lock:
+            data = self._read()
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
+            chat["current_session_id"] = session_id
             data[key] = chat
             self._write(data)
 
@@ -245,6 +294,15 @@ class TelegramChatStateStore:
             data[key] = chat
             self._write(data)
 
+    def set_recent_provider_sessions(self, chat_id: int, sessions: list[ProviderSessionCandidate]) -> None:
+        with self._lock:
+            data = self._read()
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
+            chat["recent_provider_sessions"] = [session.to_dict() for session in sessions]
+            data[key] = chat
+            self._write(data)
+
     def set_recent_approvals(self, chat_id: int, approval_ids: list[str]) -> None:
         with self._lock:
             data = self._read()
@@ -321,6 +379,30 @@ class TelegramChatStateStore:
                 return ""
             return str(session_ids[index - 1])
 
+    def recent_provider_session(self, chat_id: int, index: int) -> ProviderSessionCandidate | None:
+        with self._lock:
+            data = self._read()
+            sessions = data.get(self._chat_key(chat_id), {}).get("recent_provider_sessions") or []
+            if not isinstance(sessions, list) or index < 1 or index > len(sessions):
+                return None
+            item = sessions[index - 1]
+            if not isinstance(item, dict):
+                return None
+            try:
+                return ProviderSessionCandidate(
+                    provider=str(item["provider"]),
+                    adapter=str(item["adapter"]),
+                    provider_session_id=str(item["provider_session_id"]),
+                    provider_session_kind=str(item["provider_session_kind"]),
+                    project_dir=str(item["project_dir"]),
+                    title=str(item.get("title") or ""),
+                    updated_at=float(item.get("updated_at") or 0.0),
+                    source_path=str(item.get("source_path") or ""),
+                    metadata=dict(item.get("metadata") or {}),
+                )
+            except (KeyError, TypeError, ValueError):
+                return None
+
     def recent_approval_id(self, chat_id: int, index: int) -> str:
         with self._lock:
             data = self._read()
@@ -364,6 +446,105 @@ class TelegramChatStateStore:
         tmp.replace(self.path)
 
 
+class TelegramCommandAuditLog:
+    """Append-only audit log for received Telegram commands."""
+
+    def __init__(self, workspace: Workspace, *, bot_id: str = "") -> None:
+        self.workspace = workspace
+        self.bot_id = bot_id.strip()
+        self._lock = threading.Lock()
+
+    @property
+    def path(self) -> Path:
+        return self.workspace.root / "telegram" / "commands.jsonl"
+
+    def append(
+        self,
+        *,
+        chat_id: int,
+        text: str,
+        outcome: str,
+        detail: str = "",
+        reply_count: int = 0,
+    ) -> None:
+        clean = text.strip()
+        command, _ = _split_command(clean)
+        record = {
+            "created_at": time.time(),
+            "bot_id": self.bot_id,
+            "chat_id": chat_id,
+            "command": command or "text",
+            "text_preview": _one_line(clean, 180),
+            "outcome": outcome,
+            "detail": _one_line(detail, 240),
+            "reply_count": reply_count,
+        }
+        try:
+            with self._lock:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                with self.path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+        except OSError:
+            pass
+
+
+class TelegramRestartNoticeStore:
+    """Persist restart completion notices that the new daemon should send."""
+
+    def __init__(self, workspace: Workspace) -> None:
+        self.workspace = workspace
+        self._lock = threading.Lock()
+
+    @property
+    def path(self) -> Path:
+        return self.workspace.root / "telegram" / "restart-pending.json"
+
+    def add(self, *, bot_id: str, chat_id: int) -> None:
+        record = {
+            "bot_id": bot_id.strip(),
+            "chat_id": chat_id,
+            "created_at": time.time(),
+        }
+        with self._lock:
+            records = self._read()
+            records.append(record)
+            self._write(records)
+
+    def pop_for_bot(self, bot_id: str) -> list[dict[str, Any]]:
+        clean_bot_id = bot_id.strip()
+        with self._lock:
+            records = self._read()
+            matched = [record for record in records if str(record.get("bot_id") or "") == clean_bot_id]
+            remaining = [record for record in records if str(record.get("bot_id") or "") != clean_bot_id]
+            self._write(remaining)
+        return matched
+
+    def _read(self) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return []
+        records = data.get("notices", data) if isinstance(data, dict) else data
+        if not isinstance(records, list):
+            return []
+        return [dict(record) for record in records if isinstance(record, dict)]
+
+    def _write(self, records: list[dict[str, Any]]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if not records:
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+            return
+        payload = {"version": 1, "notices": records}
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(self.path)
+
+
 class TelegramJobQueue:
     """Background runner for Telegram-triggered jobs."""
 
@@ -379,6 +560,7 @@ class TelegramJobQueue:
         self.sender = sender
         self.runner = runner
         self.registry = JobRegistry(workspace)
+        self.state_scope = state_scope.strip()
         self.chat_state = TelegramChatStateStore(workspace, scope=state_scope)
         self._lock = threading.Lock()
         self._threads: dict[str, threading.Thread] = {}
@@ -401,12 +583,15 @@ class TelegramJobQueue:
         metadata: dict[str, Any] | None = None,
     ) -> JobRecord:
         with self._lock:
+            clean_metadata = dict(metadata or {})
+            if self.state_scope:
+                clean_metadata.setdefault("bot_id", self.state_scope)
             job = self.registry.create(
                 interface="telegram",
                 chat_id=chat_id,
                 task_id=task_id,
                 prompt=prompt,
-                metadata=metadata,
+                metadata=clean_metadata,
             )
             self._cancellations[job.job_id] = CancellationToken()
             thread = threading.Thread(target=self._run_job, args=(job.job_id,), daemon=True)
@@ -420,14 +605,22 @@ class TelegramJobQueue:
 
     def list(self, *, chat_id: int | None = None, limit: int = 10) -> list[JobRecord]:
         with self._lock:
-            return self.registry.list(interface="telegram", chat_id=chat_id, limit=limit)
+            records = self.registry.list(interface="telegram", chat_id=chat_id)
+        records = [record for record in records if self._record_matches_scope(record)]
+        return records[:limit]
 
     def latest_for_chat(self, chat_id: int, *, statuses: set[str] | None = None) -> JobRecord | None:
         with self._lock:
             records = self.registry.list(interface="telegram", chat_id=chat_id)
+        records = [record for record in records if self._record_matches_scope(record)]
         if statuses:
             records = [record for record in records if record.status in statuses]
         return records[0] if records else None
+
+    def _record_matches_scope(self, record: JobRecord) -> bool:
+        if not self.state_scope:
+            return True
+        return str((record.metadata or {}).get("bot_id") or "") == self.state_scope
 
     def wait(self, job_id: str, *, timeout: float | None = None) -> JobRecord | None:
         with self._lock:
@@ -499,6 +692,8 @@ class TelegramJobQueue:
                     ),
                 )
             finished_job = finished or job
+            if result.session_id and not _is_assistant_job(finished_job):
+                self.chat_state.set_current_session(job.chat_id, result.session_id)
             self._send(job.chat_id, _format_job_completion(finished_job, result.approval_requested))
             if _is_assistant_job(finished_job):
                 for reply in self._assistant_action_replies(finished_job.chat_id, finished_job.final_text):
@@ -561,9 +756,13 @@ class TelegramJobQueue:
         if self._assistant_action_handler is None or not chat_id:
             return []
         try:
-            return self._assistant_action_handler(chat_id, final_text)
+            replies = self._assistant_action_handler(chat_id, final_text)
         except Exception as exc:
             return [f"Assistant action handling failed: {_one_line(str(exc), 180)}"]
+        if replies:
+            return replies
+        warning = _assistant_unverified_state_change_warning(final_text)
+        return [warning] if warning else []
 
     def _continue_auto_if_needed(self, job: JobRecord, approval_requested: bool) -> None:
         if not job.chat_id or not job.task_id:
@@ -660,14 +859,18 @@ class TelegramCommandHandler:
         *,
         runner: Callable[[Workspace, RunRequest], Any] = run_agent_prompt,
         job_queue: TelegramJobQueue | None = None,
+        video_sender: Callable[[int, Path, str], None] | None = None,
         assistant_agent_id: str = ASSISTANT_AGENT_ID,
         bot_id: str = "",
+        restart_callback: Callable[[], bool | None] | None = None,
     ) -> None:
         self.workspace = workspace
         self.runner = runner
         self.job_queue = job_queue
+        self.video_sender = video_sender
         self.bot_id = bot_id.strip()
         self.assistant_agent_id = assistant_agent_id or ASSISTANT_AGENT_ID
+        self.restart_callback = restart_callback
         self.chat_state = TelegramChatStateStore(workspace, scope=self.bot_id)
         if self.job_queue is not None:
             self.job_queue.set_assistant_action_handler(
@@ -679,6 +882,10 @@ class TelegramCommandHandler:
         if not clean:
             return []
         command, rest = _split_command(clean)
+
+        restart_intent = _natural_restart_intent(clean)
+        if restart_intent is not None and not command.startswith("/"):
+            return [self._restart(restart_intent, chat_id=chat_id)]
 
         if rest and not command.startswith("/") and self._should_route_bare_text_to_assistant(chat_id):
             return [await self._plain_text(clean, chat_id=chat_id)]
@@ -712,6 +919,15 @@ class TelegramCommandHandler:
             return [self._current(chat_id=chat_id)]
         if command in {"/status", "status"}:
             return [self._status(chat_id=chat_id)]
+        if command in {"/restart", "restart", "/reload", "reload"}:
+            return [self._restart(rest, chat_id=chat_id)]
+        if command in {"/video", "video"}:
+            return [self._video(rest, chat_id=chat_id)]
+        if command in {"/send", "send"}:
+            send_kind, send_tail = _split_once(rest)
+            if send_kind.lower() == "video":
+                return [self._video(send_tail, chat_id=chat_id)]
+            return ["Usage: /send video <path> [caption]"]
         if command in {"/list", "list", "/recent", "recent"}:
             return [self._recent(chat_id=chat_id)]
         if command in {"/context", "context"}:
@@ -740,6 +956,9 @@ class TelegramCommandHandler:
         if command in {"/session", "session"}:
             return [self._session(rest, chat_id=chat_id)]
         if command in {"/resume", "resume"}:
+            resume_kind, resume_tail = _split_once(rest)
+            if resume_kind.lower() == "job":
+                return [await self._resume_job(resume_tail, chat_id=chat_id)]
             return [await self._resume(rest, chat_id=chat_id)]
         if command in {"/auto", "auto"}:
             return [self._auto(rest, chat_id=chat_id)]
@@ -762,6 +981,9 @@ class TelegramCommandHandler:
         if command in {"/jobs", "jobs"}:
             return [self._jobs(chat_id=chat_id)]
         if command in {"/job", "job"}:
+            job_kind, job_tail = _split_once(rest)
+            if job_kind.lower() in {"resume", "rerun", "continue"}:
+                return [await self._resume_job(job_tail, chat_id=chat_id)]
             return [self._job(rest, chat_id=chat_id)]
         if command in {"/cancel", "cancel"}:
             return [self._cancel(rest, chat_id=chat_id)]
@@ -777,6 +999,9 @@ class TelegramCommandHandler:
         current_task_id = self.chat_state.current_task(chat_id)
         if current_task_id and self._resolve_task(current_task_id) is not None:
             return False
+        current_session_id = self.chat_state.current_session(chat_id)
+        if current_session_id and SessionRegistry(self.workspace).resolve(current_session_id) is not None:
+            return False
         return self._assistant_agent() is not None
 
     async def _plain_text(self, text: str, *, chat_id: int | None) -> str:
@@ -785,6 +1010,10 @@ class TelegramCommandHandler:
         current_task_id = self.chat_state.current_task(chat_id)
         task = self._resolve_task(current_task_id) if current_task_id else None
         if task is None:
+            current_session_id = self.chat_state.current_session(chat_id)
+            session = SessionRegistry(self.workspace).resolve(current_session_id) if current_session_id else None
+            if session is not None:
+                return await self._run_session_prompt(session, text, chat_id=chat_id)
             assistant = self._assistant_agent()
             if assistant is not None:
                 return await self._run_assistant(text, assistant=assistant, chat_id=chat_id)
@@ -805,10 +1034,11 @@ class TelegramCommandHandler:
         if chat_id is None:
             return "This command requires a Telegram chat."
         self.chat_state.set_current_task(chat_id, "")
+        self.chat_state.set_current_session(chat_id, "")
         assistant = self._assistant_agent()
         lines = [
             "Assistant mode enabled.",
-            "Current task cleared. Plain text messages will go to the assistant until you /use task <ref>.",
+            "Current task/session cleared. Plain text messages will go to the assistant until you /use task <ref> or /use session <ref>.",
         ]
         if assistant is not None:
             lines.append(f"assistant: {assistant.title} ({assistant.agent_id})")
@@ -879,6 +1109,95 @@ class TelegramCommandHandler:
                 "Or configure a default assistant with: agentdeck assistant setup --adapter <echo|codex|kimi>",
             ]
         )
+
+    def _restart(self, rest: str = "", *, chat_id: int | None = None) -> str:
+        if self.restart_callback is None:
+            return "\n".join(
+                [
+                    "Restart is not available in this foreground handler.",
+                    "If AgentDeck is running as a daemon, use CLI: agentdeck telegram restart",
+                ]
+            )
+        mode = rest.strip().lower()
+        force = mode in {"force", "--force", "now"}
+        if mode and not force:
+            return "Usage: /restart or /restart force"
+        active_jobs = self._active_restart_jobs()
+        if active_jobs and not force:
+            lines = ["Restart not started: active Telegram jobs exist."]
+            for job in active_jobs[:5]:
+                task = f" task: {job.task_id}" if job.task_id else ""
+                lines.append(f"- {job.job_id}  status: {job.status}{task}")
+            if len(active_jobs) > 5:
+                lines.append(f"- ... {len(active_jobs) - 5} more")
+            lines.append("Wait for them to finish, use /cancel <job>, or send /restart force to interrupt them.")
+            return "\n".join(lines)
+        scheduled = self.restart_callback()
+        if scheduled is False:
+            return "AgentDeck restart is already scheduled."
+        if chat_id is not None:
+            TelegramRestartNoticeStore(self.workspace).add(bot_id=self.bot_id, chat_id=chat_id)
+        lines = [
+            "AgentDeck restart requested.",
+            "The Telegram service will reload shortly and keep the same workspace.",
+            "A completion notice will be sent after the new daemon starts.",
+        ]
+        if active_jobs:
+            lines.append("Forced restart: active jobs will be interrupted and marked interrupted.")
+        return "\n".join(lines)
+
+    def _active_restart_jobs(self) -> list[JobRecord]:
+        registry = self.job_queue.registry if self.job_queue is not None else JobRegistry(self.workspace)
+        records: list[JobRecord] = []
+        for status in ACTIVE_JOB_STATUSES:
+            records.extend(registry.list(interface="telegram", status=status))
+        return sorted(records, key=lambda item: item.updated_at, reverse=True)
+
+    def _video(self, rest: str, *, chat_id: int | None) -> str:
+        if chat_id is None:
+            return "This command requires a Telegram chat."
+        if self.video_sender is None:
+            return "Video sending is not available in this Telegram handler."
+        try:
+            parts = shlex.split(rest.strip())
+        except ValueError as exc:
+            return f"Usage: /video <path> [caption]\nCould not parse path: {exc}"
+        if not parts:
+            return "Usage: /video <path> [caption]"
+        path, error = self._resolve_media_path(parts[0], chat_id=chat_id)
+        if error:
+            return error
+        assert path is not None
+        if not _looks_like_video(path):
+            return f"Not a recognized video file: {path.name}"
+        caption = " ".join(parts[1:]).strip()
+        try:
+            self.video_sender(chat_id, path, caption)
+        except Exception as exc:
+            return f"Video send failed: {exc}"
+        lines = [
+            "Video sent.",
+            f"file: {path.name}",
+        ]
+        if caption:
+            lines.append(f"caption: {_one_line(caption, 220)}")
+        return "\n".join(lines)
+
+    def _resolve_media_path(self, value: str, *, chat_id: int | None) -> tuple[Path | None, str]:
+        raw = value.strip()
+        if not raw:
+            return None, "Usage: /video <path> [caption]"
+        candidate = Path(raw).expanduser()
+        if not candidate.is_absolute():
+            project = self._default_project(chat_id=chat_id)
+            base = Path(project.project_dir).expanduser() if project is not None else Path.cwd()
+            candidate = base / candidate
+        resolved = candidate.resolve()
+        if not resolved.exists():
+            return None, f"File not found: {resolved}"
+        if not resolved.is_file():
+            return None, f"Not a file: {resolved}"
+        return resolved, ""
 
     def _projects(self, *, chat_id: int | None = None) -> str:
         records = ProjectRegistry(self.workspace).list()
@@ -1090,6 +1409,7 @@ class TelegramCommandHandler:
         )
         if chat_id is not None:
             self.chat_state.set_current_task(chat_id, record.task_id)
+            self.chat_state.set_current_session(chat_id, "")
             if record.project_id:
                 self.chat_state.set_current_project(chat_id, record.project_id)
             if record.agent_id:
@@ -1114,18 +1434,21 @@ class TelegramCommandHandler:
             return self._use_project(value, chat_id=chat_id)
         if lowered_kind in {"agent", "role"}:
             return self._use_agent(value, chat_id=chat_id)
+        if lowered_kind in {"session", "thread"}:
+            return self._use_session(value, chat_id=chat_id)
         if lowered_kind in {"task", "todo"}:
             task_ref = value.strip()
         else:
             task_ref = rest.strip()
         if not task_ref:
-            return "Usage: /use <task>, /use project <project>, or /use agent <agent>"
+            return "Usage: /use <task>, /use project <project>, /use agent <agent>, or /use session <session>"
         if task_ref.lower() in {"assistant", "home"}:
             return self._assistant_mode(chat_id=chat_id)
         task = self._resolve_task(task_ref, chat_id=chat_id)
         if task is None:
             return f"Task not found: {task_ref}"
         self.chat_state.set_current_task(chat_id, task.task_id)
+        self.chat_state.set_current_session(chat_id, task.session_id or "")
         if task.project_id:
             self.chat_state.set_current_project(chat_id, task.project_id)
         if task.agent_id:
@@ -1150,6 +1473,7 @@ class TelegramCommandHandler:
         self.chat_state.set_current_project(chat_id, project.project_id)
         self.chat_state.set_current_agent(chat_id, project.default_agent_id)
         self.chat_state.set_current_task(chat_id, "")
+        self.chat_state.set_current_session(chat_id, "")
         return "\n".join(
             [
                 "Current project set:",
@@ -1170,6 +1494,7 @@ class TelegramCommandHandler:
         if agent.project_id:
             self.chat_state.set_current_project(chat_id, agent.project_id)
         self.chat_state.set_current_task(chat_id, "")
+        self.chat_state.set_current_session(chat_id, "")
         return "\n".join(
             [
                 "Current agent set:",
@@ -1197,6 +1522,8 @@ class TelegramCommandHandler:
             lines.append(f"Current agent: {agent.title} ({agent.agent_id})")
         current_task_id = self.chat_state.current_task(chat_id)
         task = self._resolve_task(current_task_id) if current_task_id else None
+        current_session_id = self.chat_state.current_session(chat_id)
+        session = SessionRegistry(self.workspace).resolve(current_session_id) if current_session_id else None
         if task is None:
             lines.append("Current task: none")
             lines.append("Use /use task <task>, /tasks, or /task new <title>")
@@ -1205,6 +1532,14 @@ class TelegramCommandHandler:
             lines.append(task.title)
             lines.append(f"id: {task.task_id}")
             lines.append(f"status: {task.status}")
+        if session is None:
+            lines.append("Current session: none")
+        else:
+            lines.append("Current session:")
+            lines.append(session.title)
+            lines.append(f"id: {session.session_id}")
+            lines.append(f"agent: {session.agent_id}  adapter: {session.adapter}")
+            lines.append("Plain text messages will resume this session.")
         if self.job_queue is not None:
             latest = self.job_queue.latest_for_chat(chat_id)
             if latest is not None:
@@ -1226,11 +1561,18 @@ class TelegramCommandHandler:
             lines.append(f"Agent id: {agent.agent_id}  adapter: {agent.adapter}  role: {agent.role}")
         current_task_id = self.chat_state.current_task(chat_id) if chat_id is not None else ""
         current_task = self._resolve_task(current_task_id) if current_task_id else None
+        current_session_id = self.chat_state.current_session(chat_id) if chat_id is not None else ""
+        current_session = SessionRegistry(self.workspace).resolve(current_session_id) if current_session_id else None
         if current_task is None:
             lines.append("Current task: -")
         else:
             lines.append(f"Current task: {current_task.title}")
             lines.append(f"Task status: {current_task.status}  priority: {current_task.priority}")
+        if current_session is None:
+            lines.append("Current session: -")
+        else:
+            lines.append(f"Current session: {current_session.title}")
+            lines.append(f"Session agent: {current_session.agent_id}  adapter: {current_session.adapter}")
 
         if self.job_queue is not None and chat_id is not None:
             latest = self.job_queue.latest_for_chat(chat_id)
@@ -1678,24 +2020,40 @@ class TelegramCommandHandler:
         if not records:
             return "No sessions."
         records = records[:10]
+        current_session_id = self.chat_state.current_session(chat_id) if chat_id is not None else ""
         if chat_id is not None:
             self.chat_state.set_recent_sessions(chat_id, [record.session_id for record in records])
         lines = ["Sessions:"]
         for index, record in enumerate(records, 1):
-            lines.append(f"{index}. {record.title}")
+            marker = " [current]" if record.session_id == current_session_id else ""
+            lines.append(f"{index}. {record.title}{marker}")
             lines.append(f"   status: {record.status}  agent: {record.agent_id}  adapter: {record.adapter}")
+            task = self._task_for_session(record.session_id)
+            if task is not None:
+                lines.append(f"   task: {task.title}")
             if record.provider_session_id:
                 lines.append(f"   provider: {record.provider_session_kind or 'session'}")
             if record.last_assistant_final:
                 lines.append(f"   last: {_one_line(record.last_assistant_final, 120)}")
         lines.append("")
-        lines.append("Use /session <list #> or /resume <list #> <message>.")
+        lines.append("Use /session <list #>, /use session <list #>, or /resume <list #> <message>.")
         return "\n".join(lines)
 
     def _session(self, rest: str, *, chat_id: int | None) -> str:
         session_ref = rest.strip()
         if not session_ref:
-            return "Usage: /session <session_id, title, or number>"
+            return (
+                "Usage: /session <session_id, title, or number>, "
+                "/session scan [codex|kimi] <old cwd>, or /session import <scan #>"
+            )
+        subcommand, subrest = _split_once(session_ref)
+        lowered = subcommand.lower()
+        if lowered == "scan":
+            return self._session_scan(subrest, chat_id=chat_id)
+        if lowered == "import":
+            return self._session_import(subrest, chat_id=chat_id)
+        if lowered in {"use", "select"}:
+            return self._use_session(subrest, chat_id=chat_id)
         record = self._resolve_session(session_ref, chat_id=chat_id)
         if record is None:
             return f"Session not found: {session_ref}"
@@ -1717,7 +2075,109 @@ class TelegramCommandHandler:
         if record.last_assistant_final:
             lines.append(f"last reply: {_one_line(record.last_assistant_final, 240)}")
         lines.append("")
-        lines.append("Use /resume <message> if this is the current task session, or /resume <list #> <message>.")
+        lines.append("Use /session use <list #> to make plain text resume this session, or /resume <list #> <message> once.")
+        return "\n".join(lines)
+
+    def _session_scan(self, rest: str, *, chat_id: int | None) -> str:
+        provider, scan_rest = _parse_provider_scan(rest)
+        cwd = scan_rest.strip()
+        if not cwd and chat_id is not None:
+            current_project = self._resolve_project(self.chat_state.current_project(chat_id))
+            if current_project is not None:
+                cwd = current_project.project_dir
+        if not cwd:
+            return "Usage: /session scan [codex|kimi] <old provider cwd>"
+
+        candidates = scan_provider_sessions(provider=provider, project_dir=cwd)[:10]
+        if not candidates:
+            provider_text = f" {provider}" if provider else ""
+            return f"No{provider_text} provider sessions found for: {cwd}"
+        if chat_id is not None:
+            self.chat_state.set_recent_provider_sessions(chat_id, candidates)
+
+        lines = [f"Provider sessions for: {cwd}"]
+        for index, candidate in enumerate(candidates, 1):
+            marker = " [last]" if bool(candidate.metadata.get("is_last_session")) else ""
+            lines.append(f"{index}. {candidate.title}{marker}")
+            lines.append(
+                f"   provider: {candidate.provider}  id: {_short_id(candidate.provider_session_id)}  "
+                f"updated: {_format_timestamp(candidate.updated_at)}"
+            )
+        lines.append("")
+        lines.append("Use /session import <list #> [project <project>] [task <task>] [agent <agent>].")
+        return "\n".join(lines)
+
+    def _session_import(self, rest: str, *, chat_id: int | None) -> str:
+        if chat_id is None:
+            return "This command requires a Telegram chat."
+        clean = rest.strip()
+        if not clean:
+            return "Usage: /session import <scan #> [project <project>] [task <task>] [agent <agent>]"
+        ref, option_text = _split_once(clean)
+        if not ref.isdigit():
+            return "Usage: /session import <scan #> [project <project>] [task <task>] [agent <agent>]"
+        candidate = self.chat_state.recent_provider_session(chat_id, int(ref))
+        if candidate is None:
+            return "Provider session not found in recent scan. Use /session scan <old cwd> first."
+
+        options = _parse_session_import_options(option_text)
+        project = self._resolve_project(options.get("project", ""))
+        if project is None:
+            current_project_id = self.chat_state.current_project(chat_id)
+            project = self._resolve_project(current_project_id) if current_project_id else None
+        task: TaskRecord | None = None
+        if options.get("task"):
+            task = self._resolve_task(options["task"], chat_id=chat_id)
+            if task is None:
+                return f"Task not found: {options['task']}"
+            if project is None and task.project_id:
+                project = self._resolve_project(task.project_id)
+        if options.get("project") and project is None:
+            return f"Project not found: {options['project']}"
+
+        agent_id = options.get("agent") or self.chat_state.current_agent(chat_id)
+        if not agent_id and project is not None:
+            agent_id = project.default_agent_id
+        agent_id = agent_id or "default"
+        project_dir = options.get("cwd") or (project.project_dir if project is not None else candidate.project_dir)
+
+        registry = SessionRegistry(self.workspace)
+        record = registry.import_provider_session(
+            provider_session_id=candidate.provider_session_id,
+            provider_session_kind=candidate.provider_session_kind,
+            agent_id=agent_id,
+            adapter=candidate.adapter,
+            project_dir=project_dir,
+            title=options.get("title") or candidate.title,
+            metadata={
+                "provider": candidate.provider,
+                "imported_by": "telegram",
+                "source_path": candidate.source_path,
+            },
+        )
+        if task is not None:
+            TaskBoard(self.workspace).attach_session(task.task_id, record.session_id)
+            self.chat_state.set_current_task(chat_id, task.task_id)
+        if project is not None:
+            self.chat_state.set_current_project(chat_id, project.project_id)
+        self.chat_state.set_current_agent(chat_id, agent_id)
+        self.chat_state.set_current_session(chat_id, record.session_id)
+        self.chat_state.set_recent_sessions(chat_id, [record.session_id])
+
+        lines = [
+            "Provider session imported:",
+            f"title: {record.title}",
+            f"session: {record.session_id}",
+            f"provider: {candidate.provider} {_short_id(candidate.provider_session_id)}",
+            f"agent: {record.agent_id}",
+            f"project_dir: {record.project_dir}",
+        ]
+        if project is not None:
+            lines.append(f"project: {project.title}")
+        if task is not None:
+            lines.append(f"task: {task.title}")
+        lines.append("")
+        lines.append("Use /resume <message> or /resume 1 <message> to continue it.")
         return "\n".join(lines)
 
     async def _resume(self, rest: str, *, chat_id: int | None) -> str:
@@ -1729,9 +2189,8 @@ class TelegramCommandHandler:
         assert session is not None
 
         task = self._task_for_session(session.session_id)
-        if task is not None:
-            self.chat_state.set_current_task(chat_id, task.task_id)
-        metadata = {"session_id": session.session_id}
+        self._select_session(chat_id, session, task=task)
+        metadata = {"session_id": session.session_id, "agent_id": session.agent_id}
         if self.job_queue is not None:
             job = self.job_queue.start(
                 chat_id=chat_id,
@@ -1748,7 +2207,10 @@ class TelegramCommandHandler:
                 ]
             )
         try:
-            result = await self.runner(self.workspace, RunRequest(prompt=prompt, session=session.session_id))
+            result = await self.runner(
+                self.workspace,
+                RunRequest(prompt=prompt, session=session.session_id, agent=session.agent_id),
+            )
         except RunConfigurationError as exc:
             return str(exc)
         lines = [result.final_text or "Run finished without a final text response.", "", f"session: {result.session_id}"]
@@ -1780,9 +2242,142 @@ class TelegramCommandHandler:
             if session is not None:
                 return session, clean, ""
 
+        current_session_id = self.chat_state.current_session(chat_id)
+        current_session = SessionRegistry(self.workspace).resolve(current_session_id) if current_session_id else None
+        if current_session is not None:
+            return current_session, clean, ""
+
         if session_ref and not maybe_prompt and self._resolve_session(session_ref, chat_id=chat_id) is not None:
             return None, "", "Usage: /resume <session number> <message>"
         return None, "", "No current resumable session. Use /sessions, then /resume <list #> <message>."
+
+    async def _run_session_prompt(self, session: SessionRecord, prompt: str, *, chat_id: int) -> str:
+        task = self._task_for_session(session.session_id)
+        self._select_session(chat_id, session, task=task)
+        metadata = {"session_id": session.session_id, "agent_id": session.agent_id}
+        if self.job_queue is not None:
+            job = self.job_queue.start(
+                chat_id=chat_id,
+                task_id=task.task_id if task is not None else "",
+                prompt=prompt,
+                metadata=metadata,
+            )
+            return "\n".join(
+                [
+                    f"Session job started: {job.job_id}",
+                    f"session: {session.title}",
+                    f"agent: {session.agent_id}",
+                    f"task: {task.title if task is not None else '-'}",
+                    "status: queued",
+                    "Use /job to view the latest job",
+                ]
+            )
+        try:
+            result = await self.runner(
+                self.workspace,
+                RunRequest(prompt=prompt, session=session.session_id, agent=session.agent_id),
+            )
+        except RunConfigurationError as exc:
+            return str(exc)
+        lines = [result.final_text or "Run finished without a final text response.", "", f"session: {result.session_id}"]
+        return "\n".join(lines)
+
+    def _use_session(self, session_ref: str, *, chat_id: int | None) -> str:
+        if chat_id is None:
+            return "This command requires a Telegram chat."
+        if not session_ref.strip():
+            return "Usage: /use session <session_id, title, or list #>"
+        session = self._resolve_session(session_ref, chat_id=chat_id)
+        if session is None:
+            return f"Session not found: {session_ref}"
+        task = self._task_for_session(session.session_id)
+        project = self._select_session(chat_id, session, task=task)
+        lines = [
+            "Session selected.",
+            "Plain text messages will resume this session.",
+            f"session: {session.title}",
+            f"id: {session.session_id}",
+            f"agent: {session.agent_id}",
+            f"adapter: {session.adapter}",
+        ]
+        if task is not None:
+            lines.append(f"task: {task.title}")
+            lines.append(f"task id: {task.task_id}")
+        else:
+            lines.append("task: -")
+        if project is not None:
+            lines.append(f"project: {project.title} ({project.project_id})")
+        return "\n".join(lines)
+
+    def _select_session(
+        self,
+        chat_id: int,
+        session: SessionRecord,
+        *,
+        task: TaskRecord | None = None,
+    ) -> ProjectRecord | None:
+        self.chat_state.set_current_session(chat_id, session.session_id)
+        project: ProjectRecord | None = None
+        if task is not None:
+            self.chat_state.set_current_task(chat_id, task.task_id)
+            if task.project_id:
+                project = ProjectRegistry(self.workspace).resolve(task.project_id)
+                self.chat_state.set_current_project(chat_id, task.project_id)
+            if task.agent_id:
+                self.chat_state.set_current_agent(chat_id, task.agent_id)
+            elif session.agent_id:
+                self.chat_state.set_current_agent(chat_id, session.agent_id)
+            return project
+
+        self.chat_state.set_current_task(chat_id, "")
+        if session.agent_id:
+            self.chat_state.set_current_agent(chat_id, session.agent_id)
+        project = self._project_for_session(session)
+        if project is not None:
+            self.chat_state.set_current_project(chat_id, project.project_id)
+        return project
+
+    async def _resume_job(self, rest: str, *, chat_id: int | None) -> str:
+        if chat_id is None:
+            return "This command requires a Telegram chat."
+        if self.job_queue is None:
+            return "Jobs are not enabled for this interface."
+        job_ref, prompt = _split_once(rest.strip())
+        if not job_ref:
+            latest = self.job_queue.latest_for_chat(chat_id, statuses={"interrupted", "error", "cancelled"})
+            if latest is None:
+                return "Usage: /job resume <job_id or list #> [message]"
+            job = latest
+        else:
+            job_id = self._resolve_job_id(job_ref, chat_id=chat_id)
+            job = self.job_queue.get(job_id)
+        if job is None:
+            return f"Job not found: {job_ref}"
+        if job.status not in {"interrupted", "error", "cancelled"}:
+            return f"Job is {job.status}, not resumable: {job.job_id}"
+        prompt = prompt.strip() or _interrupted_job_resume_prompt(job)
+        metadata = dict(job.metadata or {})
+        session_id = _safe_session_id_for_resume(self.workspace, job.session_id)
+        if session_id:
+            metadata["session_id"] = session_id
+        elif "session_id" in metadata:
+            metadata.pop("session_id", None)
+        resume_task_id = job.task_id if job.task_id and TaskBoard(self.workspace).resolve(job.task_id) is not None else ""
+        new_job = self.job_queue.start(chat_id=chat_id, task_id=resume_task_id, prompt=prompt, metadata=metadata)
+        self.chat_state.set_recent(chat_id, task_ids=[resume_task_id] if resume_task_id else [], job_ids=[new_job.job_id, job.job_id])
+        lines = [
+            f"Interrupted job resumed: {job.job_id}",
+            f"New job started: {new_job.job_id}",
+            f"status: queued",
+        ]
+        if session_id:
+            lines.append(f"session: {session_id}")
+        elif resume_task_id:
+            lines.append("session: not available; resumed from task context")
+        else:
+            lines.append("session: not available; rerunning the saved prompt context")
+        lines.append("Use /job to view the latest job.")
+        return "\n".join(lines)
 
     def _task_for_session(self, session_id: str) -> TaskRecord | None:
         if not session_id:
@@ -1791,6 +2386,22 @@ class TelegramCommandHandler:
         if not matches:
             return None
         return matches[0]
+
+    def _project_for_session(self, session: SessionRecord) -> ProjectRecord | None:
+        if not session.project_dir:
+            return None
+        try:
+            session_dir = str(Path(session.project_dir).expanduser().resolve())
+        except OSError:
+            session_dir = session.project_dir
+        for project in ProjectRegistry(self.workspace).list():
+            try:
+                project_dir = str(Path(project.project_dir).expanduser().resolve())
+            except OSError:
+                project_dir = project.project_dir
+            if project_dir == session_dir:
+                return project
+        return None
 
     def _agents(self, rest: str, *, chat_id: int | None) -> str:
         project_ref = rest.strip()
@@ -2296,26 +2907,71 @@ class TelegramCommandHandler:
             mapped = self.chat_state.recent_job_id(chat_id, int(value.strip()))
             if mapped:
                 return mapped
+            if self.job_queue is not None:
+                records = self.job_queue.list(chat_id=chat_id)
+                index = int(value.strip())
+                if 1 <= index <= len(records):
+                    return records[index - 1].job_id
         return value.strip()
 
 
+def request_process_restart(*, delay: float = 1.0) -> bool:
+    """Schedule a same-argv process replacement so updated code is loaded."""
+
+    global _RESTART_SCHEDULED
+    with _RESTART_LOCK:
+        if _RESTART_SCHEDULED:
+            return False
+        _RESTART_SCHEDULED = True
+
+    command = [sys.executable, "-m", "agentdeck", *sys.argv[1:]]
+    env = os.environ.copy()
+
+    def restart_later() -> None:
+        time.sleep(max(0.0, delay))
+        os.execvpe(command[0], command, env)
+
+    thread = threading.Thread(target=restart_later, name="agentdeck-restart", daemon=False)
+    thread.start()
+    return True
+
+
 class TelegramServer:
-    def __init__(self, workspace: Workspace, api: TelegramBotApi, config: TelegramConfig) -> None:
+    def __init__(
+        self,
+        workspace: Workspace,
+        api: TelegramBotApi,
+        config: TelegramConfig,
+        *,
+        restart_callback: Callable[[], bool | None] | None = request_process_restart,
+    ) -> None:
         self.workspace = workspace
         self.api = api
         self.config = config
+        self.command_audit = TelegramCommandAuditLog(workspace, bot_id=config.bot_id)
         self.job_queue = TelegramJobQueue(workspace, sender=api.send_message, state_scope=config.bot_id)
         self.handler = TelegramCommandHandler(
             workspace,
             job_queue=self.job_queue,
+            video_sender=getattr(api, "send_video", None),
             assistant_agent_id=config.assistant_agent_id or ASSISTANT_AGENT_ID,
             bot_id=config.bot_id,
+            restart_callback=restart_callback,
         )
 
     def serve_forever(self, *, once: bool = False) -> None:
+        self._send_restart_notices()
         offset: int | None = None
         while True:
-            updates = self.api.get_updates(offset=offset, timeout=self.config.poll_timeout)
+            try:
+                updates = self.api.get_updates(offset=offset, timeout=self.config.poll_timeout)
+            except Exception as exc:  # keep the daemon alive through transient Bot API failures
+                bot = f" bot={self.config.bot_id}" if self.config.bot_id else ""
+                print(f"[agentdeck] telegram polling error{bot}: {exc}", flush=True)
+                if once:
+                    return
+                time.sleep(5)
+                continue
             for update in updates:
                 offset = int(update.get("update_id", 0)) + 1
                 self._handle_update(update)
@@ -2332,14 +2988,55 @@ class TelegramServer:
         if not isinstance(chat_id, int) or not isinstance(text, str):
             return
         if self.config.allowed_chat_ids and chat_id not in self.config.allowed_chat_ids:
+            self.command_audit.append(
+                chat_id=chat_id,
+                text=text,
+                outcome="ignored",
+                detail="chat_id is not allowed",
+            )
             return
         try:
             replies = asyncio.run(self.handler.handle_text(text, chat_id=chat_id))
         except Exception as exc:  # keep polling even if one command fails
+            self.command_audit.append(
+                chat_id=chat_id,
+                text=text,
+                outcome="error",
+                detail=str(exc),
+            )
             replies = [f"AgentDeck error: {exc}"]
+        else:
+            self.command_audit.append(
+                chat_id=chat_id,
+                text=text,
+                outcome="handled",
+                reply_count=len([reply for reply in replies if reply]),
+            )
         for reply in replies:
             if reply:
                 self.api.send_message(chat_id, reply)
+
+    def _send_restart_notices(self) -> None:
+        notices = TelegramRestartNoticeStore(self.workspace).pop_for_bot(self.config.bot_id)
+        if not notices:
+            return
+        for notice in notices:
+            chat_id = notice.get("chat_id")
+            if not isinstance(chat_id, int):
+                continue
+            try:
+                self.api.send_message(
+                    chat_id,
+                    "\n".join(
+                        [
+                            "AgentDeck restarted.",
+                            f"pid: {os.getpid()}",
+                            f"bot: {self.config.bot_id or 'default'}",
+                        ]
+                    ),
+                )
+            except Exception as exc:
+                print(f"[agentdeck] restart notice failed bot={self.config.bot_id}: {exc}", flush=True)
 
 
 class TelegramMultiServer:
@@ -2437,6 +3134,77 @@ def _consume_optional_choice(text: str, choices: set[str], *, default: str) -> t
     if first.lower() in choices:
         return first.lower(), rest
     return default, text.strip()
+
+
+def _parse_provider_scan(rest: str) -> tuple[str | None, str]:
+    first, remaining = _split_once(rest)
+    lowered = first.lower()
+    if lowered in {"codex", "kimi"}:
+        return lowered, remaining
+    return None, rest.strip()
+
+
+def _parse_session_import_options(rest: str) -> dict[str, str]:
+    tokens = rest.strip().split()
+    options: dict[str, str] = {}
+    index = 0
+    while index < len(tokens):
+        key = tokens[index].lower()
+        if key == "title":
+            title = " ".join(tokens[index + 1 :]).strip()
+            if title:
+                options["title"] = title
+            break
+        if key in {"project", "task", "agent", "cwd"} and index + 1 < len(tokens):
+            options[key] = tokens[index + 1]
+            index += 2
+            continue
+        index += 1
+    return options
+
+
+def _short_id(value: str, *, keep: int = 8) -> str:
+    clean = value.strip()
+    if len(clean) <= keep:
+        return clean
+    return clean[:keep]
+
+
+def _build_multipart_body(boundary: str, fields: dict[str, str | int | bool], files: dict[str, Path]) -> bytes:
+    chunks: list[bytes] = []
+    boundary_bytes = boundary.encode("ascii")
+    for name, value in fields.items():
+        chunks.extend(
+            [
+                b"--" + boundary_bytes + b"\r\n",
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"),
+                str(value).encode("utf-8"),
+                b"\r\n",
+            ]
+        )
+    for name, path in files.items():
+        filename = path.name
+        content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+        chunks.extend(
+            [
+                b"--" + boundary_bytes + b"\r\n",
+                (
+                    f'Content-Disposition: form-data; name="{name}"; filename="{filename}"\r\n'
+                    f"Content-Type: {content_type}\r\n\r\n"
+                ).encode("utf-8"),
+                path.read_bytes(),
+                b"\r\n",
+            ]
+        )
+    chunks.append(b"--" + boundary_bytes + b"--\r\n")
+    return b"".join(chunks)
+
+
+def _looks_like_video(path: Path) -> bool:
+    content_type = mimetypes.guess_type(path.name)[0] or ""
+    if content_type.startswith("video/"):
+        return True
+    return path.suffix.lower() in {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
 
 
 def _parse_allowed_chat_ids(values: list[str]) -> list[int]:
@@ -2543,6 +3311,12 @@ def _format_auto_until(until: float) -> str:
     return f"{remaining / 3600:.2f}h remaining"
 
 
+def _format_timestamp(value: float) -> str:
+    if not value:
+        return "-"
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value))
+
+
 def _approval_resume_prompt(record: ApprovalRecord) -> str:
     request = _one_line(record.request_text, 300)
     lines = [
@@ -2552,6 +3326,22 @@ def _approval_resume_prompt(record: ApprovalRecord) -> str:
     ]
     if request:
         lines.append(f"Approved request: {request}")
+    return "\n".join(lines)
+
+
+def _interrupted_job_resume_prompt(job: JobRecord) -> str:
+    lines = [
+        "请继续这个被中断的 AgentDeck job。",
+        f"原 job: {job.job_id}",
+    ]
+    if job.task_id:
+        lines.append(f"task: {job.task_id}")
+    if job.prompt:
+        lines.append("")
+        lines.append("原始用户指令:")
+        lines.append(job.prompt)
+    lines.append("")
+    lines.append("要求：根据当前项目和任务上下文继续推进；如果发现前一次运行可能已经部分完成，请先检查状态再继续。")
     return "\n".join(lines)
 
 
@@ -2630,6 +3420,7 @@ def _assistant_action_allowed(action: str) -> tuple[bool, str]:
         "/projects",
         "/agents",
         "/tasks",
+        "/sessions",
         "/current",
         "/status",
         "/list",
@@ -2641,6 +3432,8 @@ def _assistant_action_allowed(action: str) -> tuple[bool, str]:
     }
     if command in read_only:
         return True, ""
+    if command == "/restart":
+        return (True, "") if not rest.strip() else (False, "/restart does not accept arguments")
     if command == "/use":
         return (True, "") if rest.strip() else (False, "/use requires a project, agent, or task reference")
     if command == "/project":
@@ -2651,6 +3444,12 @@ def _assistant_action_allowed(action: str) -> tuple[bool, str]:
         return (True, "") if rest.strip() else (False, "/task requires a task reference or new task title")
     if command == "/newtask":
         return (True, "") if rest.strip() else (False, "/newtask requires a title")
+    if command == "/session":
+        if not rest.strip():
+            return False, "/session requires a session reference, scan command, or import command"
+        if lowered_sub in {"scan", "import"}:
+            return True, ""
+        return True, ""
     if command == "/agent":
         if not rest.strip():
             return True, ""
@@ -2658,6 +3457,38 @@ def _assistant_action_allowed(action: str) -> tuple[bool, str]:
             return False, "/agent template is not in the assistant safe command whitelist"
         return True, ""
     return False, "command is not in the assistant safe command whitelist"
+
+
+def _assistant_unverified_state_change_warning(text: str) -> str:
+    clean = " ".join(_strip_assistant_actions(text).split())
+    if not clean:
+        return ""
+    patterns = [
+        r"(已|已经|currently|now)\s*.*(进入|切换|选中|选择|selected|switched|entered)\s*.*(session|任务|项目|agent|task|project)",
+        r"(进入|切换到|选中|选择了)\s*.*(session|任务|项目|agent|task|project)",
+    ]
+    if not any(re.search(pattern, clean, flags=re.IGNORECASE) for pattern in patterns):
+        return ""
+    return "\n".join(
+        [
+            "State change was not verified.",
+            "The assistant did not execute an AGENTDECK_ACTION, so AgentDeck may not have actually switched context.",
+            "Use /current to confirm, or send /use session <list #> / /use task <list #> directly.",
+        ]
+    )
+
+
+def _natural_restart_intent(text: str) -> str | None:
+    clean = " ".join(text.strip().lower().split())
+    if not clean or clean.startswith("/"):
+        return None
+    if "agentdeck" not in clean:
+        return None
+    if not any(word in clean for word in ("重启", "重载", "restart", "reload")):
+        return None
+    if any(word in clean for word in ("为什么", "原因", "怎么", "如何", "why", "how")):
+        return None
+    return "force" if any(word in clean for word in ("强制", "force", "forced")) else ""
 
 
 def _format_memory_document(index: int, memory: MemoryDocument) -> list[str]:
@@ -2738,8 +3569,11 @@ def _help_text() -> str:
             "/newtask <task title>",
             "/use <task_id or exact task title>",
             "/use task <task_id or list #>",
+            "/use session <session_id or list #>",
             "/assistant",
             "/current",
+            "/restart",
+            "/video <path> [caption]",
             "/list",
             "/context [task]",
             "/memories [task]",
@@ -2751,6 +3585,9 @@ def _help_text() -> str:
             "/reviews [task]",
             "/sessions [agent]",
             "/session <session_id or list #>",
+            "/session use <session_id or list #>",
+            "/session scan [codex|kimi] <old cwd>",
+            "/session import <scan #> [project <project>] [task <task>] [agent <agent>]",
             "/resume <session_id or list #> <message>",
             "/auto start [hours]",
             "/auto task [hours]",
@@ -2769,6 +3606,7 @@ def _help_text() -> str:
             "/jobs",
             "/job <job_id>",
             "/job <list #>",
+            "/job resume <job_id or list #> [message]",
             "/cancel <job_id>",
             "/cancel <list #>",
         ]
