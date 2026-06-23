@@ -23,6 +23,7 @@ from agentdeck.interfaces.telegram import (
     TelegramJobQueue,
     TelegramRestartNoticeStore,
     TelegramServer,
+    TelegramUpdateOffsetStore,
     config_from_env,
     split_message,
 )
@@ -787,6 +788,58 @@ class TelegramInterfaceTests(unittest.TestCase):
             self.assertIn("AgentDeck restarted.", api.messages[0][1])
             self.assertIn("bot: minsys-bot4", api.messages[0][1])
             self.assertEqual(TelegramRestartNoticeStore(workspace).pop_for_bot("minsys-bot4"), [])
+
+    def test_telegram_server_persists_update_offset_before_restart_replay(self) -> None:
+        class ReplayApi:
+            def __init__(self) -> None:
+                self.offsets: list[int | None] = []
+                self.messages: list[tuple[int, str]] = []
+
+            def get_updates(self, *, offset: int | None = None, timeout: int = 30) -> list[dict[str, object]]:
+                self.offsets.append(offset)
+                if offset is None or offset <= 10:
+                    return [
+                        {
+                            "update_id": 10,
+                            "message": {
+                                "chat": {"id": 42},
+                                "text": "/restart",
+                            },
+                        }
+                    ]
+                return []
+
+            def send_message(self, chat_id: int, text: str) -> None:
+                self.messages.append((chat_id, text))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            calls: list[str] = []
+
+            first_api = ReplayApi()
+            first = TelegramServer(
+                workspace,
+                first_api,
+                TelegramConfig(token="123456:ABC", bot_id="minsys-bot4", poll_timeout=0),
+                restart_callback=lambda: calls.append("restart"),
+            )
+            first.serve_forever(once=True)
+
+            self.assertEqual(calls, ["restart"])
+            self.assertEqual(TelegramUpdateOffsetStore(workspace).get("minsys-bot4"), 11)
+
+            second_api = ReplayApi()
+            second = TelegramServer(
+                workspace,
+                second_api,
+                TelegramConfig(token="123456:ABC", bot_id="minsys-bot4", poll_timeout=0),
+                restart_callback=lambda: calls.append("restart"),
+            )
+            second.serve_forever(once=True)
+
+            self.assertEqual(calls, ["restart"])
+            self.assertEqual(second_api.offsets, [11])
+            self.assertTrue(any("AgentDeck restarted." in text for _, text in second_api.messages))
 
     def test_natural_language_restart_question_still_routes_to_assistant(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

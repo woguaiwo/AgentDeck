@@ -491,9 +491,10 @@ class TelegramCommandAuditLog:
 class TelegramRestartNoticeStore:
     """Persist restart completion notices that the new daemon should send."""
 
+    _LOCK = threading.Lock()
+
     def __init__(self, workspace: Workspace) -> None:
         self.workspace = workspace
-        self._lock = threading.Lock()
 
     @property
     def path(self) -> Path:
@@ -505,14 +506,14 @@ class TelegramRestartNoticeStore:
             "chat_id": chat_id,
             "created_at": time.time(),
         }
-        with self._lock:
+        with self._LOCK:
             records = self._read()
             records.append(record)
             self._write(records)
 
     def pop_for_bot(self, bot_id: str) -> list[dict[str, Any]]:
         clean_bot_id = bot_id.strip()
-        with self._lock:
+        with self._LOCK:
             records = self._read()
             matched = [record for record in records if str(record.get("bot_id") or "") == clean_bot_id]
             remaining = [record for record in records if str(record.get("bot_id") or "") != clean_bot_id]
@@ -540,7 +541,60 @@ class TelegramRestartNoticeStore:
                 pass
             return
         payload = {"version": 1, "notices": records}
-        tmp = self.path.with_suffix(".tmp")
+        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+        tmp.replace(self.path)
+
+
+class TelegramUpdateOffsetStore:
+    """Persist Telegram getUpdates offsets per bot."""
+
+    _LOCK = threading.Lock()
+
+    def __init__(self, workspace: Workspace) -> None:
+        self.workspace = workspace
+
+    @property
+    def path(self) -> Path:
+        return self.workspace.root / "telegram" / "offsets.json"
+
+    def get(self, bot_id: str) -> int | None:
+        with self._LOCK:
+            value = self._read().get(bot_id.strip())
+        return int(value) if isinstance(value, int) and value > 0 else None
+
+    def set(self, bot_id: str, offset: int) -> None:
+        if offset <= 0:
+            return
+        with self._LOCK:
+            data = self._read()
+            data[bot_id.strip()] = int(offset)
+            self._write(data)
+
+    def _read(self) -> dict[str, int]:
+        if not self.path.exists():
+            return {}
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        offsets = data.get("offsets", data) if isinstance(data, dict) else {}
+        if not isinstance(offsets, dict):
+            return {}
+        clean: dict[str, int] = {}
+        for key, value in offsets.items():
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                continue
+            if parsed > 0:
+                clean[str(key)] = parsed
+        return clean
+
+    def _write(self, offsets: dict[str, int]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {"version": 1, "offsets": offsets}
+        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
         tmp.replace(self.path)
 
@@ -2949,6 +3003,7 @@ class TelegramServer:
         self.api = api
         self.config = config
         self.command_audit = TelegramCommandAuditLog(workspace, bot_id=config.bot_id)
+        self.offset_store = TelegramUpdateOffsetStore(workspace)
         self.job_queue = TelegramJobQueue(workspace, sender=api.send_message, state_scope=config.bot_id)
         self.handler = TelegramCommandHandler(
             workspace,
@@ -2961,7 +3016,7 @@ class TelegramServer:
 
     def serve_forever(self, *, once: bool = False) -> None:
         self._send_restart_notices()
-        offset: int | None = None
+        offset: int | None = self.offset_store.get(self.config.bot_id)
         while True:
             try:
                 updates = self.api.get_updates(offset=offset, timeout=self.config.poll_timeout)
@@ -2973,8 +3028,13 @@ class TelegramServer:
                 time.sleep(5)
                 continue
             for update in updates:
-                offset = int(update.get("update_id", 0)) + 1
+                try:
+                    next_offset = int(update.get("update_id", 0)) + 1
+                except (TypeError, ValueError):
+                    continue
                 self._handle_update(update)
+                offset = next_offset
+                self.offset_store.set(self.config.bot_id, offset)
             if once:
                 return
 
