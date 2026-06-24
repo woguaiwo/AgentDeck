@@ -841,6 +841,41 @@ class TelegramInterfaceTests(unittest.TestCase):
             self.assertEqual(second_api.offsets, [11])
             self.assertTrue(any("AgentDeck restarted." in text for _, text in second_api.messages))
 
+    def test_telegram_server_acks_update_before_dispatch(self) -> None:
+        class OneUpdateApi:
+            def get_updates(self, *, offset: int | None = None, timeout: int = 30) -> list[dict[str, object]]:
+                return [
+                    {
+                        "update_id": 20,
+                        "message": {
+                            "chat": {"id": 42},
+                            "text": "hello",
+                        },
+                    }
+                ]
+
+            def send_message(self, chat_id: int, text: str) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            server = TelegramServer(
+                workspace,
+                OneUpdateApi(),
+                TelegramConfig(token="123456:ABC", bot_id="minsys-bot4", poll_timeout=0),
+                restart_callback=None,
+            )
+            seen_offsets: list[int | None] = []
+
+            def handle(update: dict[str, object]) -> None:
+                seen_offsets.append(TelegramUpdateOffsetStore(workspace).get("minsys-bot4"))
+
+            server._handle_update = handle  # type: ignore[method-assign]
+
+            server.serve_forever(once=True)
+
+            self.assertEqual(seen_offsets, [21])
+
     def test_natural_language_restart_question_still_routes_to_assistant(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Workspace(Path(tmpdir) / ".agentdeck")

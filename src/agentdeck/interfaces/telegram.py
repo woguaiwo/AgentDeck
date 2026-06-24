@@ -3032,9 +3032,10 @@ class TelegramServer:
                     next_offset = int(update.get("update_id", 0)) + 1
                 except (TypeError, ValueError):
                     continue
-                self._handle_update(update)
                 offset = next_offset
                 self.offset_store.set(self.config.bot_id, offset)
+                # Ack before dispatch so restart/exec paths cannot replay side-effecting updates.
+                self._handle_update(update)
             if once:
                 return
 
