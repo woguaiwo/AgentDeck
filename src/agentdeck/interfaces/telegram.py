@@ -2441,6 +2441,48 @@ class TelegramCommandHandler:
             return None
         return matches[0]
 
+    def _ensure_task_for_current_session(self, chat_id: int) -> tuple[TaskRecord | None, bool]:
+        session_id = self.chat_state.current_session(chat_id)
+        session = SessionRegistry(self.workspace).resolve(session_id) if session_id else None
+        if session is None:
+            return None, False
+        existing = self._task_for_session(session.session_id)
+        if existing is not None:
+            self.chat_state.set_current_task(chat_id, existing.task_id)
+            if existing.project_id:
+                self.chat_state.set_current_project(chat_id, existing.project_id)
+            if existing.agent_id:
+                self.chat_state.set_current_agent(chat_id, existing.agent_id)
+            return existing, False
+
+        project = self._project_for_session(session)
+        agent = AgentRegistry(self.workspace).resolve(session.agent_id) if session.agent_id else None
+        project_id = project.project_id if project is not None else (agent.project_id if agent is not None else "")
+        team_id = project.team_id if project is not None else (agent.team_id if agent is not None else "default")
+        agent_id = session.agent_id or (project.default_agent_id if project is not None else "owner")
+        title = session.title.strip() or f"Continue session {session.session_id}"
+        description = (
+            "Auto-created from the current Telegram session so /auto can track "
+            "progress, handoffs, and follow-up runs."
+        )
+        task = TaskBoard(self.workspace).create(
+            title=title,
+            description=description,
+            project_id=project_id,
+            agent_id=agent_id,
+            team_id=team_id,
+        )
+        attached = TaskBoard(self.workspace).attach_session(task.task_id, session.session_id)
+        if attached is not None:
+            task = attached
+        self.chat_state.set_current_task(chat_id, task.task_id)
+        self.chat_state.set_current_session(chat_id, session.session_id)
+        if task.project_id:
+            self.chat_state.set_current_project(chat_id, task.project_id)
+        if task.agent_id:
+            self.chat_state.set_current_agent(chat_id, task.agent_id)
+        return task, True
+
     def _project_for_session(self, session: SessionRecord) -> ProjectRecord | None:
         if not session.project_dir:
             return None
@@ -2744,8 +2786,11 @@ class TelegramCommandHandler:
     def _auto_start(self, rest: str, *, chat_id: int, approval_mode: str, mode: str) -> str:
         task_id = self.chat_state.current_task(chat_id)
         task = self._resolve_task(task_id) if task_id else None
+        created_task = False
         if task is None:
-            return "No current task. Use /use <task_id or title>, then /auto start."
+            task, created_task = self._ensure_task_for_current_session(chat_id)
+        if task is None:
+            return "No current task. Use /use <task_id or title>, /use session <ref>, or /task new <title>, then /auto start."
         duration_text, prompt_override = _split_once(rest.strip())
         until = 0.0
         if duration_text:
@@ -2781,6 +2826,8 @@ class TelegramCommandHandler:
             f"approval: {_format_auto_approval_mode(normalized_approval_mode)}",
             f"mode: {normalized_mode}",
         ]
+        if created_task:
+            lines.insert(1, f"Created task from current session: {task.task_id}")
         if self.job_queue is None:
             lines.append("Jobs are not enabled for this interface.")
             return "\n".join(lines)

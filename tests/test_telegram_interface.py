@@ -1457,6 +1457,90 @@ class TelegramInterfaceTests(unittest.TestCase):
             finally:
                 telegram_module.AUTO_CONTINUE_DELAY_SECONDS = old_delay
 
+    def test_auto_start_creates_task_for_current_unlinked_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            workspace.ensure()
+            project_dir = tmp / "imu-generation"
+            project_dir.mkdir()
+            self._main(
+                [
+                    "--workspace",
+                    str(workspace.root),
+                    "projects",
+                    "create",
+                    "imu-generation",
+                    "--title",
+                    "IMU Generation",
+                    "--cwd",
+                    str(project_dir),
+                ]
+            )
+            self._main(
+                [
+                    "--workspace",
+                    str(workspace.root),
+                    "agents",
+                    "create",
+                    "imu-generation-owner",
+                    "--project",
+                    "imu-generation",
+                    "--adapter",
+                    "echo",
+                    "--cwd",
+                    str(project_dir),
+                ]
+            )
+            session = SessionRegistry(workspace).upsert_start(
+                session_id="session-imu-existing",
+                agent_id="imu-generation-owner",
+                adapter="echo",
+                project_dir=str(project_dir),
+                prompt="existing work",
+                title="IMU Generation Owner",
+            )
+            seen: list[RunRequest] = []
+
+            async def runner(workspace_arg: Workspace, request: RunRequest) -> RunServiceResult:
+                seen.append(request)
+                return RunServiceResult(
+                    session_id=session.session_id,
+                    final_text="auto done",
+                    events=[],
+                    agent_id="imu-generation-owner",
+                    adapter="echo",
+                    task_id=request.task or "",
+                )
+
+            old_delay = telegram_module.AUTO_CONTINUE_DELAY_SECONDS
+            telegram_module.AUTO_CONTINUE_DELAY_SECONDS = 10.0
+            try:
+                queue = TelegramJobQueue(workspace, sender=lambda chat_id, text: None, runner=runner)
+                handler = TelegramCommandHandler(workspace, job_queue=queue)
+
+                selected = asyncio.run(handler.handle_text(f"/use session {session.session_id}", chat_id=42))[0]
+                self.assertIn("task: -", selected)
+
+                reply = asyncio.run(handler.handle_text("/auto start", chat_id=42))[0]
+                self.assertIn("Auto mode enabled.", reply)
+                self.assertIn("Created task from current session:", reply)
+                self.assertIn("IMU Generation Owner", reply)
+                job_id = re.search(r"Job started: (job-\S+)", reply).group(1)
+                queue.wait(job_id, timeout=2)
+
+                current_task_id = TelegramChatStateStore(workspace).current_task(42)
+                task = TaskBoard(workspace).get(current_task_id)
+                assert task is not None
+                self.assertEqual(task.session_id, session.session_id)
+                self.assertEqual(task.project_id, "imu-generation")
+                self.assertEqual(task.agent_id, "imu-generation-owner")
+                self.assertEqual(seen[0].task, task.task_id)
+                self.assertEqual(seen[0].session, session.session_id)
+                asyncio.run(handler.handle_text("/auto end", chat_id=42))
+            finally:
+                telegram_module.AUTO_CONTINUE_DELAY_SECONDS = old_delay
+
     def test_auto_active_job_check_is_bot_scoped(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Workspace(Path(tmpdir) / ".agentdeck")
