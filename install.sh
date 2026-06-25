@@ -71,6 +71,14 @@ echo "Scripts dir: $SCRIPTS_DIR"
 
 "$PYTHON_BIN" -m pip install -e "$ROOT_DIR"
 
+if command -v git >/dev/null 2>&1 && git -C "$ROOT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git -C "$ROOT_DIR" config --local --unset-all credential.helper >/dev/null 2>&1 || true
+  git -C "$ROOT_DIR" config --local credential.helper "!/bin/bash \"$ROOT_DIR/tools/git-credential-helper.sh\""
+  echo
+  echo "Configured repo-local GitHub credential helper for this checkout."
+  echo "It uses GITHUB_TOKEN, GH_TOKEN, or AGENTDECK_GITHUB_TOKEN when present."
+fi
+
 if [[ ":$PATH:" != *":$SCRIPTS_DIR:"* ]]; then
   echo
   echo "Note: scripts dir is not on PATH for this shell:"

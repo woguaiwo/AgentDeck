@@ -61,7 +61,10 @@ cd /path/to/AgentDeck
 
 The installer performs an editable install with the current Python environment,
 initializes the default platform workspace, and verifies the `agentdeck` command
-when it is available on `PATH`.
+when it is available on `PATH`. It also configures this checkout to use a
+repo-local GitHub credential helper that reads `GITHUB_TOKEN`, `GH_TOKEN`, or
+`AGENTDECK_GITHUB_TOKEN`, so `git push` from this repository does not depend on
+editor-provided `askpass` hooks.
 
 If your Python scripts directory is not on `PATH`, the installer prints the
 exact `export PATH=...` line. To let it append that line to your shell rc file:
