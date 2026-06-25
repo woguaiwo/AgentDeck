@@ -102,6 +102,10 @@ class Workspace:
         return self.root / "inbox"
 
     @property
+    def errors_dir(self) -> Path:
+        return self.root / "errors"
+
+    @property
     def board_dir(self) -> Path:
         return self.root / "board"
 
@@ -122,6 +126,7 @@ class Workspace:
             self.session_state_dir,
             self.project_state_dir,
             self.inbox_dir,
+            self.errors_dir,
             self.board_dir,
             self.memory_dir / "user",
             self.memory_dir / "projects",
@@ -148,6 +153,7 @@ class Workspace:
             "journal": str(self.journal_dir),
             "session_state": str(self.session_state_dir),
             "project_state": str(self.project_state_dir),
+            "errors": str(self.errors_dir),
             "memory": str(self.memory_dir),
         }
 

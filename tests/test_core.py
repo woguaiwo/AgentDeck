@@ -56,6 +56,7 @@ class CoreStorageTests(unittest.TestCase):
             self.assertTrue(workspace.journal_dir.is_dir())
             self.assertTrue(workspace.session_state_dir.is_dir())
             self.assertTrue(workspace.project_state_dir.is_dir())
+            self.assertTrue(workspace.errors_dir.is_dir())
             self.assertTrue(workspace.board_dir.is_dir())
             self.assertTrue((workspace.memory_dir / "user").is_dir())
             self.assertTrue((workspace.memory_dir / "projects").is_dir())

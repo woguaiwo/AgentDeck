@@ -127,6 +127,17 @@ class JobRegistry:
         self._write(records)
         return record
 
+    def update_metadata(self, job_id: str, metadata: dict[str, Any]) -> JobRecord | None:
+        records = self._read()
+        record = records.get(job_id)
+        if record is None:
+            return None
+        record.metadata.update(dict(metadata))
+        record.updated_at = time.time()
+        records[job_id] = record
+        self._write(records)
+        return record
+
     def finish(
         self,
         job_id: str,

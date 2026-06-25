@@ -14,10 +14,12 @@ import time
 from pathlib import Path
 
 from agentdeck.core.config import DEFAULT_PROJECT_LOCAL_CONFIG, Workspace, find_project_local_config, project_local_config_path
+from agentdeck.core.error_daemon import ErrorHandlingDaemon
 from agentdeck.core.run_service import RunConfigurationError, RunRequest, build_agentdeck_context, run_agent_prompt
 from agentdeck.interfaces.telegram import TelegramBotApi, TelegramMultiServer, TelegramServer, config_from_env
 from agentdeck.storage.approvals import APPROVAL_STATUSES, ApprovalRecord, ApprovalRegistry
 from agentdeck.storage.event_log import EventLog
+from agentdeck.storage.errors import ErrorIncidentStore
 from agentdeck.storage.agents import ASSISTANT_AGENT_ID, DEFAULT_ASSISTANT_TEMPLATE, AgentRecord, AgentRegistry
 from agentdeck.storage.jobs import JobRecord, JobRegistry
 from agentdeck.storage.memory import MarkdownMemoryStore
@@ -131,6 +133,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     events = sub.add_parser("events", help="Inspect event log")
     events.add_argument("--tail", type=int, default=20)
+
+    errors = sub.add_parser("errors", help="Handle backend error incidents")
+    errors_sub = errors.add_subparsers(dest="errors_command", required=True)
+    errors_serve = errors_sub.add_parser("serve", help="Run error-handling daemon in the foreground")
+    errors_serve.add_argument("--once", action="store_true", help="Process pending incidents once and exit")
+    errors_serve.add_argument("--poll-interval", type=float, default=5.0)
+    errors_start = errors_sub.add_parser("start", help="Start error-handling daemon as a detached process")
+    errors_start.add_argument("--poll-interval", type=float, default=5.0)
+    errors_stop = errors_sub.add_parser("stop", help="Stop detached error-handling daemon")
+    errors_stop.add_argument("--force", action="store_true", help="Send SIGKILL if SIGTERM does not stop the daemon")
+    errors_restart = errors_sub.add_parser("restart", help="Restart detached error-handling daemon")
+    errors_restart.add_argument("--poll-interval", type=float, default=5.0)
+    errors_restart.add_argument("--force", action="store_true", help="Send SIGKILL if SIGTERM does not stop the old daemon")
+    errors_sub.add_parser("status", help="Show detached error-handling daemon status")
+    errors_list = errors_sub.add_parser("list", help="List error incidents")
+    errors_list.add_argument("--status", choices=["pending", "resolved"])
+    errors_list.add_argument("--limit", type=int, default=20)
+    errors_decisions = errors_sub.add_parser("decisions", help="List recent error handler decisions")
+    errors_decisions.add_argument("--limit", type=int, default=20)
+    errors_unknowns = errors_sub.add_parser("unknowns", help="List unknown error fingerprints")
+    errors_unknowns.add_argument("--limit", type=int, default=20)
 
     approvals = sub.add_parser("approvals", help="Manage backend approval requests")
     approval_sub = approvals.add_subparsers(dest="approvals_command", required=True)
@@ -485,6 +508,29 @@ def main(argv: list[str] | None = None) -> int:
         for event in EventLog(workspace).tail(args.tail):
             print(json.dumps(event.to_dict(), ensure_ascii=False, sort_keys=True))
         return 0
+
+    if args.command == "errors":
+        workspace.ensure()
+        if args.errors_command == "serve":
+            ErrorHandlingDaemon(workspace).serve_forever(once=args.once, poll_interval=args.poll_interval)
+            return 0
+        if args.errors_command == "start":
+            return _errors_start(args, workspace)
+        if args.errors_command == "stop":
+            return _errors_stop(args, workspace)
+        if args.errors_command == "restart":
+            stop_code = _errors_stop(argparse.Namespace(force=bool(getattr(args, "force", False))), workspace)
+            if stop_code not in {0, 1}:
+                return stop_code
+            return _errors_start(args, workspace)
+        if args.errors_command == "status":
+            return _errors_status(workspace)
+        if args.errors_command == "list":
+            return _errors_list(workspace, status=args.status, limit=args.limit)
+        if args.errors_command == "decisions":
+            return _errors_decisions(workspace, limit=args.limit)
+        if args.errors_command == "unknowns":
+            return _errors_unknowns(workspace, limit=args.limit)
 
     if args.command == "approvals":
         workspace.ensure()
@@ -970,6 +1016,126 @@ def _active_telegram_jobs(workspace: Workspace) -> list[JobRecord]:
     for status in {"queued", "running", "cancel_requested"}:
         records.extend(registry.list(interface="telegram", status=status))
     return sorted(records, key=lambda item: item.updated_at, reverse=True)
+
+
+def _errors_start(args: argparse.Namespace, workspace: Workspace) -> int:
+    pid = _read_pid(_errors_pid_path(workspace))
+    if pid and _pid_alive(pid):
+        print(f"error handler service already running: pid={pid}")
+        print(f"log: {_errors_log_path(workspace)}")
+        return 0
+    workspace.errors_dir.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        "-m",
+        "agentdeck",
+        "--workspace",
+        str(workspace.root),
+        "errors",
+        "serve",
+        "--poll-interval",
+        str(getattr(args, "poll_interval", 5.0)),
+    ]
+    with _errors_log_path(workspace).open("ab") as log:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env=os.environ.copy(),
+            close_fds=True,
+            start_new_session=True,
+        )
+    _errors_pid_path(workspace).write_text(str(process.pid), encoding="utf-8")
+    print(f"error handler service started: pid={process.pid}")
+    print(f"workspace: {workspace.root}")
+    print(f"log: {_errors_log_path(workspace)}")
+    return 0
+
+
+def _errors_stop(args: argparse.Namespace, workspace: Workspace) -> int:
+    pid_path = _errors_pid_path(workspace)
+    pid = _read_pid(pid_path)
+    if not pid:
+        print("error handler service is not running")
+        return 1
+    if not _pid_alive(pid):
+        _unlink_quietly(pid_path)
+        print(f"error handler service is not running; removed stale pid {pid}")
+        return 1
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(50):
+        if not _pid_alive(pid):
+            _unlink_quietly(pid_path)
+            print(f"error handler service stopped: pid={pid}")
+            return 0
+        time.sleep(0.1)
+    if args.force:
+        os.kill(pid, signal.SIGKILL)
+        _unlink_quietly(pid_path)
+        print(f"error handler service killed: pid={pid}")
+        return 0
+    print(f"error handler service did not stop after SIGTERM: pid={pid}", file=sys.stderr)
+    return 2
+
+
+def _errors_status(workspace: Workspace) -> int:
+    pid = _read_pid(_errors_pid_path(workspace))
+    if pid and _pid_alive(pid):
+        print(f"error handler service: running pid={pid}")
+        print(f"log: {_errors_log_path(workspace)}")
+        return 0
+    if pid:
+        print(f"error handler service: stopped stale_pid={pid}")
+        print(f"log: {_errors_log_path(workspace)}")
+        return 1
+    print("error handler service: stopped")
+    print(f"log: {_errors_log_path(workspace)}")
+    return 1
+
+
+def _errors_list(workspace: Workspace, *, status: str | None, limit: int) -> int:
+    records = ErrorIncidentStore(workspace).list(status=status, limit=limit)
+    if not records:
+        print("no error incidents")
+        return 0
+    print("status\tkind\taction\tincident_id\tjob\tsession")
+    decisions = {record.incident_id: record for record in ErrorIncidentStore(workspace).decisions(limit=max(limit * 2, 20))}
+    for incident in records:
+        decision = decisions.get(incident.incident_id)
+        action = decision.action if decision is not None else "-"
+        print(f"{incident.status}\t{incident.error_kind}\t{action}\t{incident.incident_id}\t{incident.job_id or '-'}\t{incident.session_id or '-'}")
+    return 0
+
+
+def _errors_decisions(workspace: Workspace, *, limit: int) -> int:
+    records = ErrorIncidentStore(workspace).decisions(limit=limit)
+    if not records:
+        print("no error decisions")
+        return 0
+    print("action\tincident_id\treason")
+    for record in records:
+        print(f"{record.action}\t{record.incident_id}\t{record.reason}")
+    return 0
+
+
+def _errors_unknowns(workspace: Workspace, *, limit: int) -> int:
+    records = ErrorIncidentStore(workspace).unknowns(limit=limit)
+    if not records:
+        print("no unknown errors")
+        return 0
+    print("count\tkind\tfingerprint\tfirst_incident\tlast_incident")
+    for record in records:
+        print(f"{record.count}\t{record.error_kind}\t{record.fingerprint}\t{record.first_incident_id}\t{record.last_incident_id or '-'}")
+    return 0
+
+
+def _errors_pid_path(workspace: Workspace) -> Path:
+    return workspace.errors_dir / "error-handler.pid"
+
+
+def _errors_log_path(workspace: Workspace) -> Path:
+    return workspace.errors_dir / "error-handler.log"
 
 
 def _telegram_status(workspace: Workspace) -> int:

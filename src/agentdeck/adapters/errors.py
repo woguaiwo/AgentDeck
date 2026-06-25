@@ -17,6 +17,7 @@ class AdapterErrorKind(str, Enum):
     APPROVAL_REQUIRED = "approval_required"
     PROCESS_FAILED = "process_failed"
     RATE_LIMIT = "rate_limit"
+    USAGE_WARNING = "usage_warning"
     UNKNOWN = "unknown"
 
 
@@ -30,6 +31,7 @@ _ERROR_HINTS = {
     AdapterErrorKind.APPROVAL_REQUIRED: "Use human approval mode, or run auto mode only in an isolated workspace.",
     AdapterErrorKind.PROCESS_FAILED: "Open the job details or event log for the backend stderr.",
     AdapterErrorKind.RATE_LIMIT: "Wait and retry, or switch this agent to a cheaper/available model.",
+    AdapterErrorKind.USAGE_WARNING: "Usage is still available, but the account or model limit is running low.",
     AdapterErrorKind.UNKNOWN: "Open the job details or event log for the raw backend output.",
 }
 
@@ -43,7 +45,26 @@ def classify_adapter_error(text: str, *, return_code: int | None = None) -> dict
 
     if any(marker in lowered for marker in ("unauthorized", "authentication", "auth failed", "invalid api key", "401")):
         kind = AdapterErrorKind.AUTH_FAILED
-    elif any(marker in lowered for marker in ("rate limit", "too many requests", "429", "quota exceeded")):
+    elif (
+        ("weekly limit" in lowered and any(marker in lowered for marker in ("left", "remaining", "less than")))
+        or ("usage limit" in lowered and any(marker in lowered for marker in ("left", "remaining", "less than")))
+    ):
+        kind = AdapterErrorKind.USAGE_WARNING
+    elif any(
+        marker in lowered
+        for marker in (
+            "rate limit",
+            "too many requests",
+            "429",
+            "quota exceeded",
+            "at capacity",
+            "model is busy",
+            "temporarily unavailable",
+            "server overloaded",
+            "weekly limit reached",
+            "usage limit reached",
+        )
+    ):
         kind = AdapterErrorKind.RATE_LIMIT
     elif "model" in lowered and any(marker in lowered for marker in ("not found", "unknown", "invalid")):
         kind = AdapterErrorKind.MODEL_NOT_FOUND

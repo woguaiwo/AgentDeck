@@ -16,6 +16,12 @@ from urllib.parse import parse_qs, urlencode, urlparse
 
 from agentdeck.core.cancel import CancellationToken
 from agentdeck.core.config import Workspace
+from agentdeck.core.error_daemon import (
+    ErrorHandlingDaemon,
+    create_error_incident_for_job,
+    event_should_fail_job,
+    first_error_event,
+)
 from agentdeck.core.run_service import RunConfigurationError, RunRequest, run_agent_prompt
 from agentdeck.interfaces.telegram import AUTO_TASK_DONE_MARKER
 from agentdeck.storage.admin import AdminMutationError, delete_project, rename_global_id, restore_project
@@ -156,8 +162,24 @@ class WebJobQueue:
             status = "done"
             if token is not None and token.is_cancelled():
                 status = "cancelled"
+            error_event = first_error_event(result.events)
+            if status == "done" and event_should_fail_job(error_event):
+                assert error_event is not None
+                incident = create_error_incident_for_job(self.workspace, job=job, event=error_event, adapter=result.adapter)
+                self.registry.finish(
+                    job.job_id,
+                    status="error",
+                    session_id=result.session_id,
+                    final_text=result.final_text,
+                    error=error_event.text or "Backend adapter error.",
+                )
+                ErrorHandlingDaemon(self.workspace).process_incident(incident)
+                return
+            if error_event is not None:
+                incident = create_error_incident_for_job(self.workspace, job=job, event=error_event, adapter=result.adapter)
+                ErrorHandlingDaemon(self.workspace).process_incident(incident)
             self.registry.finish(job.job_id, status=status, session_id=result.session_id, final_text=result.final_text)
-            if status == "done":
+            if status == "done" and not event_should_fail_job(error_event):
                 self._continue_auto_if_needed(job, result.final_text, approval_requested=result.approval_requested)
         except RunConfigurationError as exc:
             self.registry.finish(job.job_id, status="error", error=str(exc))

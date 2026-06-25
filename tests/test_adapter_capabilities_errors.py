@@ -38,6 +38,14 @@ class AdapterCapabilitiesAndErrorsTests(unittest.TestCase):
             AdapterErrorKind.RATE_LIMIT.value,
         )
         self.assertEqual(
+            classify_adapter_error("Selected model is at capacity. Please try a different model.")["error_kind"],
+            AdapterErrorKind.RATE_LIMIT.value,
+        )
+        self.assertEqual(
+            classify_adapter_error("Heads up, you have less than 25% of your weekly limit left.")["error_kind"],
+            AdapterErrorKind.USAGE_WARNING.value,
+        )
+        self.assertEqual(
             classify_adapter_error("model not found")["error_kind"],
             AdapterErrorKind.MODEL_NOT_FOUND.value,
         )

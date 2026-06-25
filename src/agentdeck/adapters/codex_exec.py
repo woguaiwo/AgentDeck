@@ -127,7 +127,8 @@ class CodexExecAdapter:
             assert process.stderr is not None
             stderr = _filter_stderr((await process.stderr.read()).decode("utf-8", errors="replace"))
             return_code = await _wait_for_process_exit(process)
-            cancelled = await _finish_cancel_task(cancel_task)
+            cancel_requested = cancellation is not None and cancellation.is_cancelled()
+            cancelled = cancel_requested or await _finish_cancel_task(cancel_task)
 
             if cancelled:
                 yield AgentEvent(

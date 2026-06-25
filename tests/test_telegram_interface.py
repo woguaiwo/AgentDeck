@@ -29,6 +29,7 @@ from agentdeck.interfaces.telegram import (
 )
 from agentdeck.storage.approvals import ApprovalRegistry
 from agentdeck.storage.agents import DEFAULT_ASSISTANT_TEMPLATE, AgentRegistry, role_template_for_agent
+from agentdeck.storage.errors import ErrorIncidentStore
 from agentdeck.storage.jobs import JobRegistry
 from agentdeck.storage.progress import ProgressJournal
 from agentdeck.storage.projects import ProjectRegistry
@@ -1540,6 +1541,53 @@ class TelegramInterfaceTests(unittest.TestCase):
                 asyncio.run(handler.handle_text("/auto end", chat_id=42))
             finally:
                 telegram_module.AUTO_CONTINUE_DELAY_SECONDS = old_delay
+
+    def test_adapter_error_marks_telegram_job_failed_and_records_incident(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            workspace.ensure()
+            task = TaskBoard(workspace).create(title="Capacity task")
+            sent: list[tuple[int, str]] = []
+
+            async def runner(workspace_arg: Workspace, request: RunRequest) -> RunServiceResult:
+                return RunServiceResult(
+                    session_id="session-capacity",
+                    final_text="",
+                    events=[
+                        AgentEvent(
+                            EventKind.ERROR,
+                            "owner",
+                            "session-capacity",
+                            text="codex exec exited with status 1",
+                            payload={
+                                "error_kind": "rate_limit",
+                                "hint": "Wait and retry, or switch this agent to a cheaper/available model.",
+                                "stderr": "Selected model is at capacity.",
+                            },
+                        )
+                    ],
+                    agent_id="owner",
+                    adapter="codex",
+                    task_id=request.task or "",
+                )
+
+            queue = TelegramJobQueue(workspace, sender=lambda chat_id, text: sent.append((chat_id, text)), runner=runner)
+            handler = TelegramCommandHandler(workspace, job_queue=queue)
+
+            asyncio.run(handler.handle_text(f"/use {task.task_id}", chat_id=42))
+            reply = asyncio.run(handler.handle_text("/run reproduce capacity", chat_id=42))[0]
+            job_id = re.search(r"Job started: (job-\S+)", reply).group(1)
+            job = queue.wait(job_id, timeout=2)
+
+            assert job is not None
+            self.assertEqual(job.status, "error")
+            self.assertEqual(job.error, "codex exec exited with status 1")
+            self.assertTrue(any("Job failed" in text for _, text in sent))
+            self.assertTrue(any("AgentDeck error handler:" in text for _, text in sent))
+            incidents = ErrorIncidentStore(workspace).list()
+            self.assertEqual(len(incidents), 1)
+            self.assertEqual(incidents[0].error_kind, "rate_limit")
+            self.assertIn("Selected model is at capacity.", incidents[0].text)
 
     def test_auto_active_job_check_is_bot_scoped(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

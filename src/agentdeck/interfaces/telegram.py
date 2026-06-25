@@ -21,6 +21,13 @@ from typing import Any, Callable
 from agentdeck.adapters.capabilities import adapter_requires_provider_session
 from agentdeck.core.cancel import CancellationToken
 from agentdeck.core.config import Workspace
+from agentdeck.core.error_daemon import (
+    ErrorHandlingDaemon,
+    create_error_incident_for_job,
+    event_should_fail_job,
+    first_error_event,
+    format_error_decision_message,
+)
 from agentdeck.core.events import EventKind
 from agentdeck.core.run_service import (
     RunConfigurationError,
@@ -724,6 +731,7 @@ class TelegramJobQueue:
             self._stop_auto_after_failure(finished or job, str(exc))
         else:
             cancel_event = next((event for event in result.events if event.kind == EventKind.CANCELLED), None)
+            error_event = first_error_event(result.events)
             cancel_was_requested = self._cancel_was_requested(job_id)
             if cancel_event is not None:
                 finished = self._finish_job(
@@ -733,7 +741,41 @@ class TelegramJobQueue:
                     final_text=result.final_text,
                     error=cancel_event.text or "Run cancelled.",
                 )
+            elif event_should_fail_job(error_event):
+                current = self.registry.get(job_id) or job
+                assert error_event is not None
+                incident = create_error_incident_for_job(
+                    self.workspace,
+                    job=current,
+                    event=error_event,
+                    adapter=result.adapter,
+                )
+                finished = self._finish_job(
+                    job_id,
+                    status="error",
+                    session_id=result.session_id,
+                    final_text=result.final_text,
+                    error=error_event.text or "Backend adapter error.",
+                )
+                daemon = ErrorHandlingDaemon(
+                    self.workspace,
+                    notifier=lambda incident_arg, decision: self._send(
+                        job.chat_id,
+                        format_error_decision_message(incident_arg, decision),
+                    ),
+                )
+                daemon.process_incident(incident)
+                finished = self.registry.get(job_id) or finished
             else:
+                if error_event is not None:
+                    current = self.registry.get(job_id) or job
+                    incident = create_error_incident_for_job(
+                        self.workspace,
+                        job=current,
+                        event=error_event,
+                        adapter=result.adapter,
+                    )
+                    ErrorHandlingDaemon(self.workspace).process_incident(incident)
                 finished = self._finish_job(
                     job_id,
                     status="done",
@@ -3454,7 +3496,12 @@ def _interrupted_job_resume_prompt(job: JobRecord) -> str:
 
 
 def _format_job_completion(job: JobRecord, approval_requested: bool) -> str:
-    heading = "Job cancelled" if job.status == "cancelled" else "Job done"
+    if job.status == "cancelled":
+        heading = "Job cancelled"
+    elif job.status == "error":
+        heading = "Job failed"
+    else:
+        heading = "Job done"
     lines = [
         f"{heading}: {job.job_id}",
         f"task: {job.task_id or '-'}",
