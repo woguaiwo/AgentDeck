@@ -108,6 +108,35 @@ fi
 "$PYTHON_BIN" -m agentdeck init
 "$PYTHON_BIN" -m agentdeck doctor
 
+TELEGRAM_DIR="$ROOT_DIR/.agentdeck/telegram"
+TELEGRAM_BOTS_TOML="$TELEGRAM_DIR/bots.toml"
+mkdir -p "$TELEGRAM_DIR"
+if [[ ! -e "$TELEGRAM_BOTS_TOML" ]]; then
+  cat > "$TELEGRAM_BOTS_TOML" <<'EOF'
+# AgentDeck Telegram bot registry import file.
+# Fill in one section per bot, then run:
+#   agentdeck telegram bots import .agentdeck/telegram/bots.toml
+#   agentdeck assistant setup-bots --adapter codex --cwd /path/to/AgentDeck
+#   agentdeck telegram restart
+#
+# Tokens are secrets. This file lives under .agentdeck/, which is ignored by git.
+
+[bots.example-bot]
+title = "example-bot"
+token = "123456789:replace-with-telegram-bot-token"
+allowed_chat_ids = [123456789]
+# server_id defaults to the current host if omitted.
+# assistant_agent_id can be left blank; setup-bots will create one.
+EOF
+  echo
+  echo "Created Telegram bot config template:"
+  echo "  $TELEGRAM_BOTS_TOML"
+else
+  echo
+  echo "Telegram bot config already exists:"
+  echo "  $TELEGRAM_BOTS_TOML"
+fi
+
 if command -v agentdeck >/dev/null 2>&1; then
   agentdeck doctor >/dev/null
   echo
