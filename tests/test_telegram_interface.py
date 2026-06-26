@@ -29,6 +29,7 @@ from agentdeck.interfaces.telegram import (
 )
 from agentdeck.storage.approvals import ApprovalRegistry
 from agentdeck.storage.agents import DEFAULT_ASSISTANT_TEMPLATE, AgentRegistry, role_template_for_agent
+from agentdeck.storage.directories import DirectoryRegistry
 from agentdeck.storage.errors import ErrorIncidentStore
 from agentdeck.storage.focus import FocusRegistry
 from agentdeck.storage.jobs import JobRegistry
@@ -111,6 +112,47 @@ class TelegramInterfaceTests(unittest.TestCase):
             self.assertIn("done: continue this", reply)
             self.assertEqual(seen[-1].focus, focus_id)
             self.assertEqual(seen[-1].agent, "owner")
+
+    def test_handler_lists_uses_and_reports_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            project = tmp / "project"
+            lab = project / "lab"
+            lab.mkdir(parents=True)
+            ProjectRegistry(workspace).upsert(project_id="proj", title="Project One", project_dir=project)
+            ProjectRegistry(workspace).add_directory("proj", lab)
+            AgentRegistry(workspace).upsert(
+                agent_id="lab-owner",
+                title="Lab Owner",
+                project_id="proj",
+                adapter="echo",
+                project_dir=lab,
+            )
+
+            handler = TelegramCommandHandler(workspace)
+
+            listed = asyncio.run(handler.handle_text("/directories proj", chat_id=42))[0]
+            self.assertIn("Directories (Project One):", listed)
+            self.assertIn(str(lab.resolve()), listed)
+
+            selected = asyncio.run(handler.handle_text("/use directory 2", chat_id=42))[0]
+            self.assertIn("Current directory set:", selected)
+            self.assertIn("Lab Owner", selected)
+            state = TelegramChatStateStore(workspace)
+            directory = DirectoryRegistry(workspace).resolve(lab)
+            assert directory is not None
+            self.assertEqual(state.current_directory(42), directory.directory_id)
+            self.assertEqual(state.current_project(42), "proj")
+            self.assertEqual(state.current_agent(42), "lab-owner")
+
+            current = asyncio.run(handler.handle_text("/current", chat_id=42))[0]
+            self.assertIn("Current directory: lab", current)
+            self.assertIn(str(lab.resolve()), current)
+
+            status = asyncio.run(handler.handle_text("/status", chat_id=42))[0]
+            self.assertIn("Directory: lab", status)
+            self.assertIn("Directory path:", status)
 
     def test_auto_start_uses_current_focus_without_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

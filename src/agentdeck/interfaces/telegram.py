@@ -38,6 +38,7 @@ from agentdeck.core.run_service import (
 )
 from agentdeck.storage.approvals import ApprovalRecord, ApprovalRegistry
 from agentdeck.storage.agents import ASSISTANT_AGENT_ID, AgentRecord, AgentRegistry
+from agentdeck.storage.directories import DirectoryRecord, DirectoryRegistry
 from agentdeck.storage.focus import FOCUS_STATUSES, FocusRecord, FocusRegistry
 from agentdeck.storage.jobs import JobRecord, JobRegistry
 from agentdeck.storage.memory import MemoryDocument, MarkdownMemoryStore
@@ -219,6 +220,20 @@ class TelegramChatStateStore:
             data[key] = chat
             self._write(data)
 
+    def current_directory(self, chat_id: int) -> str:
+        with self._lock:
+            data = self._read()
+            return str(data.get(self._chat_key(chat_id), {}).get("current_directory_id") or "")
+
+    def set_current_directory(self, chat_id: int, directory_id: str) -> None:
+        with self._lock:
+            data = self._read()
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
+            chat["current_directory_id"] = directory_id
+            data[key] = chat
+            self._write(data)
+
     def auto_state(self, chat_id: int) -> dict[str, Any]:
         with self._lock:
             data = self._read()
@@ -308,6 +323,15 @@ class TelegramChatStateStore:
             key = self._chat_key(chat_id)
             chat = dict(data.get(key) or {})
             chat["recent_agent_ids"] = agent_ids
+            data[key] = chat
+            self._write(data)
+
+    def set_recent_directories(self, chat_id: int, directory_ids: list[str]) -> None:
+        with self._lock:
+            data = self._read()
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
+            chat["recent_directory_ids"] = directory_ids
             data[key] = chat
             self._write(data)
 
@@ -405,6 +429,14 @@ class TelegramChatStateStore:
             if not isinstance(agent_ids, list) or index < 1 or index > len(agent_ids):
                 return ""
             return str(agent_ids[index - 1])
+
+    def recent_directory_id(self, chat_id: int, index: int) -> str:
+        with self._lock:
+            data = self._read()
+            directory_ids = data.get(self._chat_key(chat_id), {}).get("recent_directory_ids") or []
+            if not isinstance(directory_ids, list) or index < 1 or index > len(directory_ids):
+                return ""
+            return str(directory_ids[index - 1])
 
     def recent_job_id(self, chat_id: int, index: int) -> str:
         with self._lock:
@@ -1044,6 +1076,10 @@ class TelegramCommandHandler:
             return [self._projects(chat_id=chat_id)]
         if command in {"/project", "project"}:
             return [self._project(rest, chat_id=chat_id)]
+        if command in {"/directories", "directories"}:
+            return [self._directories(rest, chat_id=chat_id)]
+        if command in {"/directory", "directory"}:
+            return [self._directory(rest, chat_id=chat_id)]
         if command in {"/projectstate", "projectstate"}:
             return [self._project_state(rest, chat_id=chat_id)]
         if command in {"/decisions", "decisions"}:
@@ -1402,8 +1438,13 @@ class TelegramCommandHandler:
             f"default agent: {project.default_agent_id}",
             f"status: {project.status}",
         ]
+        directories = DirectoryRegistry(self.workspace).list(project_id=project.project_id)
+        if directories:
+            lines.append("directories:")
+            for directory in directories[:6]:
+                lines.append(f"- {directory.title} ({directory.directory_id})  {directory.role}")
         lines.append("")
-        lines.append("Use /project use <id or list #>, /agents, /focus, or /focus new <title>.")
+        lines.append("Use /project use <id or list #>, /directories, /agents, /focus, or /focus new <title>.")
         return "\n".join(lines)
 
     def _new_project(self, rest: str, *, chat_id: int | None) -> str:
@@ -1425,6 +1466,9 @@ class TelegramCommandHandler:
         if chat_id is not None:
             self.chat_state.set_current_project(chat_id, project.project_id)
             self.chat_state.set_current_agent(chat_id, project.default_agent_id)
+            directory = self._primary_directory_for_project(project)
+            if directory is not None:
+                self.chat_state.set_current_directory(chat_id, directory.directory_id)
         return "\n".join(
             [
                 "Project created and selected:",
@@ -1435,6 +1479,95 @@ class TelegramCommandHandler:
                 "Next: /agent new owner codex owner, or /focus new <title>",
             ]
         )
+
+    def _directories(self, rest: str, *, chat_id: int | None) -> str:
+        project_ref = rest.strip()
+        project: ProjectRecord | None = None
+        if project_ref:
+            project = self._resolve_project(project_ref, chat_id=chat_id)
+            if project is None:
+                return f"Project not found: {project_ref}"
+        elif chat_id is not None:
+            current_project_id = self.chat_state.current_project(chat_id)
+            project = self._resolve_project(current_project_id) if current_project_id else None
+        records = DirectoryRegistry(self.workspace).list(project_id=project.project_id if project is not None else None)
+        if not records:
+            return "No directories."
+        if chat_id is not None:
+            self.chat_state.set_recent_directories(chat_id, [record.directory_id for record in records])
+        current_directory_id = self.chat_state.current_directory(chat_id) if chat_id is not None else ""
+        heading = f"Directories ({project.title}):" if project is not None else "Directories:"
+        lines = [heading]
+        for index, record in enumerate(records[:12], 1):
+            marker = " [current]" if record.directory_id == current_directory_id else ""
+            lines.append(f"{index}. {record.title}{marker}")
+            lines.append(f"   id: {record.directory_id}")
+            lines.append(f"   project: {record.project_id or '-'}  role: {record.role}  status: {record.status}")
+            if record.parent_directory_id:
+                lines.append(f"   parent: {record.parent_directory_id}")
+            lines.append(f"   path: {record.path}")
+        lines.append("")
+        lines.append("Use /use directory <list #>, /directory <list #>, or /directory add <path> [project].")
+        return "\n".join(lines)
+
+    def _directory(self, rest: str, *, chat_id: int | None) -> str:
+        command, tail = _split_once(rest.strip())
+        lowered = command.lower()
+        if lowered in {"use", "select"}:
+            if chat_id is None:
+                return "This command requires a Telegram chat."
+            return self._use_directory(tail, chat_id=chat_id)
+        if lowered in {"add", "new", "create"}:
+            return self._add_directory(tail, chat_id=chat_id)
+        if lowered in {"list", "ls"}:
+            return self._directories(tail, chat_id=chat_id)
+
+        directory_ref = rest.strip()
+        if not directory_ref:
+            if chat_id is not None:
+                current = self.chat_state.current_directory(chat_id)
+                if current:
+                    directory_ref = current
+            if not directory_ref:
+                return "Usage: /directory <directory_id, path, title, or list #>, /directory add <path> [project], or /directory list [project]"
+        record = self._resolve_directory(directory_ref, chat_id=chat_id)
+        if record is None:
+            return f"Directory not found: {directory_ref}"
+        return self._format_directory_detail(record)
+
+    def _add_directory(self, rest: str, *, chat_id: int | None) -> str:
+        path_text, project_ref = _split_once(rest.strip())
+        if not path_text:
+            return "Usage: /directory add <path> [project]"
+        project: ProjectRecord | None = None
+        if project_ref:
+            project = self._resolve_project(project_ref, chat_id=chat_id)
+            if project is None:
+                return f"Project not found: {project_ref}"
+        else:
+            project = self._default_project(chat_id=chat_id)
+        record = DirectoryRegistry(self.workspace).upsert(
+            path=path_text,
+            project_id=project.project_id if project is not None else "",
+            title=Path(path_text).expanduser().name or path_text,
+            role="workspace",
+            metadata={"source": "telegram"},
+        )
+        if project is not None:
+            ProjectRegistry(self.workspace).add_directory(project.project_id, record.path)
+        if chat_id is not None:
+            self.chat_state.set_current_directory(chat_id, record.directory_id)
+            self.chat_state.set_recent_directories(chat_id, [record.directory_id])
+            if record.project_id:
+                self.chat_state.set_current_project(chat_id, record.project_id)
+        lines = [
+            "Directory added and selected:",
+            record.title,
+            f"id: {record.directory_id}",
+            f"project: {record.project_id or '-'}",
+            f"path: {record.path}",
+        ]
+        return "\n".join(lines)
 
     def _project_state(self, rest: str, *, chat_id: int | None) -> str:
         project, error = self._resolve_project_or_current(rest, chat_id=chat_id, usage="Usage: /projectstate [project]")
@@ -1745,6 +1878,8 @@ class TelegramCommandHandler:
         lowered_kind = kind.lower()
         if lowered_kind in {"project", "proj"}:
             return self._use_project(value, chat_id=chat_id)
+        if lowered_kind in {"directory", "dir", "cwd"}:
+            return self._use_directory(value, chat_id=chat_id)
         if lowered_kind in {"agent", "role"}:
             return self._use_agent(value, chat_id=chat_id)
         if lowered_kind in {"session", "thread"}:
@@ -1756,7 +1891,10 @@ class TelegramCommandHandler:
         else:
             task_ref = rest.strip()
         if not task_ref:
-            return "Usage: /use <task>, /use project <project>, /use agent <agent>, /use focus <focus>, or /use session <session>"
+            return (
+                "Usage: /use <task>, /use project <project>, /use directory <directory>, "
+                "/use agent <agent>, /use focus <focus>, or /use session <session>"
+            )
         if task_ref.lower() in {"assistant", "home"}:
             return self._assistant_mode(chat_id=chat_id)
         task = self._resolve_task(task_ref, chat_id=chat_id)
@@ -1788,6 +1926,9 @@ class TelegramCommandHandler:
             return f"Project not found: {project_ref}"
         self.chat_state.set_current_project(chat_id, project.project_id)
         self.chat_state.set_current_agent(chat_id, project.default_agent_id)
+        primary_directory = self._primary_directory_for_project(project)
+        if primary_directory is not None:
+            self.chat_state.set_current_directory(chat_id, primary_directory.directory_id)
         self.chat_state.set_current_task(chat_id, "")
         self.chat_state.set_current_session(chat_id, "")
         return "\n".join(
@@ -1796,6 +1937,7 @@ class TelegramCommandHandler:
                 project.title,
                 f"id: {project.project_id}",
                 f"default agent: {project.default_agent_id}",
+                f"directory: {primary_directory.path if primary_directory is not None else project.project_dir}",
                 "Use /focus, /agents, /focus new <title>, or /run after selecting a focus.",
             ]
         )
@@ -1809,6 +1951,9 @@ class TelegramCommandHandler:
         self.chat_state.set_current_agent(chat_id, agent.agent_id)
         if agent.project_id:
             self.chat_state.set_current_project(chat_id, agent.project_id)
+        directory = self._directory_for_agent(agent)
+        if directory is not None:
+            self.chat_state.set_current_directory(chat_id, directory.directory_id)
         self.chat_state.set_current_task(chat_id, "")
         self.chat_state.set_current_session(chat_id, "")
         return "\n".join(
@@ -1819,8 +1964,45 @@ class TelegramCommandHandler:
                 f"role: {agent.role}",
                 f"project: {agent.project_id or '-'}",
                 f"adapter: {agent.adapter}",
+                f"directory: {directory.path if directory is not None else agent.project_dir}",
             ]
         )
+
+    def _use_directory(self, directory_ref: str, *, chat_id: int) -> str:
+        if not directory_ref.strip():
+            return "Usage: /use directory <directory_id, path, title, or list #>"
+        directory = self._resolve_directory(directory_ref, chat_id=chat_id)
+        if directory is None:
+            return f"Directory not found: {directory_ref}"
+        self.chat_state.set_current_directory(chat_id, directory.directory_id)
+        selected_project: ProjectRecord | None = None
+        if directory.project_id:
+            selected_project = self._resolve_project(directory.project_id)
+            if selected_project is not None:
+                self.chat_state.set_current_project(chat_id, selected_project.project_id)
+        matching_agents = self._agents_for_directory(directory)
+        selected_agent: AgentRecord | None = None
+        if len(matching_agents) == 1:
+            selected_agent = matching_agents[0]
+            self.chat_state.set_current_agent(chat_id, selected_agent.agent_id)
+            if selected_agent.project_id:
+                self.chat_state.set_current_project(chat_id, selected_agent.project_id)
+        lines = [
+            "Current directory set:",
+            directory.title,
+            f"id: {directory.directory_id}",
+            f"path: {directory.path}",
+            f"project: {selected_project.title if selected_project is not None else (directory.project_id or '-')}",
+        ]
+        if selected_agent is not None:
+            lines.append(f"agent: {selected_agent.title} ({selected_agent.agent_id})")
+        elif matching_agents:
+            lines.append(f"agents here: {len(matching_agents)}")
+            lines.append("Use /agents or /use agent <ref> to pick one.")
+        else:
+            lines.append("agent: -")
+        lines.append("Current session/focus was not cleared.")
+        return "\n".join(lines)
 
     def _current(self, *, chat_id: int | None) -> str:
         if chat_id is None:
@@ -1828,6 +2010,7 @@ class TelegramCommandHandler:
         lines: list[str] = []
         project = self._resolve_project(self.chat_state.current_project(chat_id))
         agent = self._resolve_agent(self.chat_state.current_agent(chat_id))
+        directory = self._resolve_directory(self.chat_state.current_directory(chat_id))
         if project is None:
             lines.append("Current project: none")
         else:
@@ -1836,6 +2019,11 @@ class TelegramCommandHandler:
             lines.append("Current agent: none")
         else:
             lines.append(f"Current agent: {agent.title} ({agent.agent_id})")
+        if directory is None:
+            lines.append("Current directory: none")
+        else:
+            lines.append(f"Current directory: {directory.title} ({directory.directory_id})")
+            lines.append(f"path: {directory.path}")
         current_focus_id = self.chat_state.current_focus(chat_id)
         focus = self._resolve_focus(current_focus_id) if current_focus_id else None
         current_task_id = self.chat_state.current_task(chat_id)
@@ -1873,12 +2061,17 @@ class TelegramCommandHandler:
         lines: list[str] = ["AgentDeck Status"]
         project = self._resolve_project(self.chat_state.current_project(chat_id)) if chat_id is not None else None
         agent = self._resolve_agent(self.chat_state.current_agent(chat_id)) if chat_id is not None else None
+        directory = self._resolve_directory(self.chat_state.current_directory(chat_id)) if chat_id is not None else None
         lines.append(f"Project: {project.title if project is not None else '-'}")
         if project is not None:
             lines.append(f"Project id: {project.project_id}")
         lines.append(f"Agent: {agent.title if agent is not None else '-'}")
         if agent is not None:
             lines.append(f"Agent id: {agent.agent_id}  adapter: {agent.adapter}  role: {agent.role}")
+        lines.append(f"Directory: {directory.title if directory is not None else '-'}")
+        if directory is not None:
+            lines.append(f"Directory id: {directory.directory_id}")
+            lines.append(f"Directory path: {directory.path}")
         current_focus_id = self.chat_state.current_focus(chat_id) if chat_id is not None else ""
         current_focus = self._resolve_focus(current_focus_id) if current_focus_id else None
         current_task_id = self.chat_state.current_task(chat_id) if chat_id is not None else ""
@@ -1935,8 +2128,8 @@ class TelegramCommandHandler:
 
         lines.append("")
         lines.append("Next:")
-        lines.append("- /projects, /agents, /focus")
-        lines.append("- /use project <list #>, /use agent <list #>, /use focus <list #>")
+        lines.append("- /projects, /directories, /agents, /focus")
+        lines.append("- /use project <list #>, /use directory <list #>, /use agent <list #>, /use focus <list #>")
         lines.append("- /projectstate, /decisions, /context, /memories, /compact")
         lines.append("- send plain text, /run <message>, /auto start")
         return "\n".join(lines)
@@ -1946,6 +2139,9 @@ class TelegramCommandHandler:
         current_project_id = self.chat_state.current_project(chat_id) if chat_id is not None else ""
         scoped_project = self._resolve_project(current_project_id) if current_project_id else None
         agents = AgentRegistry(self.workspace).list(project_id=scoped_project.project_id if scoped_project is not None else None)[:8]
+        directories = DirectoryRegistry(self.workspace).list(
+            project_id=scoped_project.project_id if scoped_project is not None else None
+        )[:8]
         focus_records = FocusRegistry(self.workspace).list(
             project_id=scoped_project.project_id if scoped_project is not None else None
         )[:8]
@@ -1955,6 +2151,7 @@ class TelegramCommandHandler:
         if chat_id is not None:
             self.chat_state.set_recent_projects(chat_id, [project.project_id for project in projects])
             self.chat_state.set_recent_agents(chat_id, [agent.agent_id for agent in agents])
+            self.chat_state.set_recent_directories(chat_id, [directory.directory_id for directory in directories])
             self.chat_state.set_recent_focus(chat_id, [focus.focus_id for focus in focus_records])
             self.chat_state.set_recent(
                 chat_id,
@@ -1965,6 +2162,7 @@ class TelegramCommandHandler:
 
         current_focus_id = self.chat_state.current_focus(chat_id) if chat_id is not None else ""
         current_task_id = self.chat_state.current_task(chat_id) if chat_id is not None else ""
+        current_directory_id = self.chat_state.current_directory(chat_id) if chat_id is not None else ""
         lines: list[str] = ["Recent:"]
         if not projects:
             lines.append("Projects: none")
@@ -1986,6 +2184,18 @@ class TelegramCommandHandler:
                 marker = " [current]" if agent.agent_id == current_agent_id else ""
                 lines.append(f"{index}. {agent.title}{marker}")
                 lines.append(f"   id: {agent.agent_id}  adapter: {agent.adapter}  role: {agent.role}")
+
+        if not directories:
+            lines.append("")
+            lines.append("Directories: none")
+        else:
+            lines.append("")
+            lines.append("Directories:")
+            for index, directory in enumerate(directories, 1):
+                marker = " [current]" if directory.directory_id == current_directory_id else ""
+                lines.append(f"{index}. {directory.title}{marker}")
+                lines.append(f"   id: {directory.directory_id}  project: {directory.project_id or '-'}")
+                lines.append(f"   path: {directory.path}")
 
         if not focus_records:
             lines.append("")
@@ -2431,6 +2641,95 @@ class TelegramCommandHandler:
             return matches[0]
         return None
 
+    def _resolve_directory(self, value: str, *, chat_id: int | None = None) -> DirectoryRecord | None:
+        clean = str(value).strip()
+        if not clean:
+            return None
+        if chat_id is not None and clean.isdigit():
+            mapped = self.chat_state.recent_directory_id(chat_id, int(clean))
+            if mapped:
+                clean = mapped
+        registry = DirectoryRegistry(self.workspace)
+        record = registry.resolve(clean)
+        if record is not None:
+            return record
+        lowered = " ".join(clean.split()).lower()
+        matches = [item for item in registry.list() if item.title.lower() == lowered]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    def _directory_for_path(
+        self,
+        path: str | Path,
+        *,
+        project_id: str = "",
+        ensure: bool = False,
+    ) -> DirectoryRecord | None:
+        clean = str(path or "").strip()
+        if not clean:
+            return None
+        registry = DirectoryRegistry(self.workspace)
+        record = registry.resolve(clean)
+        if record is not None:
+            return record
+        if not ensure:
+            return None
+        return registry.upsert(path=clean, project_id=project_id, title=Path(clean).expanduser().name or clean)
+
+    def _directory_for_agent(self, agent: AgentRecord) -> DirectoryRecord | None:
+        directory_id = str(agent.metadata.get("directory_id") or "")
+        if directory_id:
+            record = DirectoryRegistry(self.workspace).resolve(directory_id)
+            if record is not None:
+                return record
+        return self._directory_for_path(agent.project_dir, project_id=agent.project_id, ensure=True)
+
+    def _primary_directory_for_project(self, project: ProjectRecord) -> DirectoryRecord | None:
+        directory_ids = project.metadata.get("directory_ids")
+        if isinstance(directory_ids, list):
+            for directory_id in directory_ids:
+                record = DirectoryRegistry(self.workspace).resolve(str(directory_id))
+                if record is not None:
+                    return record
+        return self._directory_for_path(project.project_dir, project_id=project.project_id, ensure=True)
+
+    def _agents_for_directory(self, directory: DirectoryRecord) -> list[AgentRecord]:
+        agents: list[AgentRecord] = []
+        registry = AgentRegistry(self.workspace)
+        for agent in registry.list(project_id=directory.project_id or None):
+            agent_directory_id = str(agent.metadata.get("directory_id") or "")
+            if agent_directory_id == directory.directory_id:
+                agents.append(agent)
+                continue
+            try:
+                agent_dir = str(Path(agent.project_dir).expanduser().resolve())
+            except OSError:
+                agent_dir = agent.project_dir
+            if agent_dir == directory.path:
+                agents.append(agent)
+        return agents
+
+    def _format_directory_detail(self, record: DirectoryRecord) -> str:
+        lines = [
+            record.title,
+            f"id: {record.directory_id}",
+            f"project: {record.project_id or '-'}",
+            f"role: {record.role}",
+            f"status: {record.status}",
+            f"path: {record.path}",
+        ]
+        if record.parent_directory_id:
+            lines.append(f"parent: {record.parent_directory_id}")
+        agents = self._agents_for_directory(record)
+        if agents:
+            lines.append("agents:")
+            for agent in agents[:6]:
+                lines.append(f"- {agent.title} ({agent.agent_id})  {agent.adapter}/{agent.role}")
+        lines.append("")
+        lines.append("Use /directory use <id or list #> to select it.")
+        return "\n".join(lines)
+
     def _resolve_task(self, value: str, *, chat_id: int | None = None) -> TaskRecord | None:
         if chat_id is not None and value.strip().isdigit():
             mapped = self.chat_state.recent_task_id(chat_id, int(value.strip()))
@@ -2479,6 +2778,11 @@ class TelegramCommandHandler:
             marker = " [current]" if record.session_id == current_session_id else ""
             lines.append(f"{index}. {record.title}{marker}")
             lines.append(f"   status: {record.status}  agent: {record.agent_id}  adapter: {record.adapter}")
+            directory = self._directory_for_path(record.project_dir)
+            if directory is not None:
+                lines.append(f"   directory: {directory.title} ({directory.directory_id})")
+            elif record.project_dir:
+                lines.append(f"   directory: {record.project_dir}")
             focus = self._focus_for_session(record.session_id)
             if focus is not None:
                 lines.append(f"   focus: {focus.title}")
@@ -2519,6 +2823,9 @@ class TelegramCommandHandler:
             f"adapter: {record.adapter}",
             f"project_dir: {record.project_dir}",
         ]
+        directory = self._directory_for_path(record.project_dir)
+        if directory is not None:
+            lines.append(f"directory: {directory.title} ({directory.directory_id})")
         task = self._task_for_session(record.session_id)
         focus = self._focus_for_session(record.session_id)
         if focus is not None:
@@ -2619,6 +2926,13 @@ class TelegramCommandHandler:
             self.chat_state.set_current_task(chat_id, task.task_id)
         if project is not None:
             self.chat_state.set_current_project(chat_id, project.project_id)
+        directory = self._directory_for_path(
+            record.project_dir,
+            project_id=project.project_id if project is not None else "",
+            ensure=True,
+        )
+        if directory is not None:
+            self.chat_state.set_current_directory(chat_id, directory.directory_id)
         self.chat_state.set_current_agent(chat_id, agent_id)
         self.chat_state.set_current_session(chat_id, record.session_id)
         self.chat_state.set_recent_sessions(chat_id, [record.session_id])
@@ -2817,6 +3131,9 @@ class TelegramCommandHandler:
             self.chat_state.set_current_task(chat_id, task.task_id)
             focus = self._focus_for_session(session.session_id)
             self.chat_state.set_current_focus(chat_id, focus.focus_id if focus is not None else "")
+            directory = self._directory_for_path(session.project_dir, ensure=True)
+            if directory is not None:
+                self.chat_state.set_current_directory(chat_id, directory.directory_id)
             if task.project_id:
                 project = ProjectRegistry(self.workspace).resolve(task.project_id)
                 self.chat_state.set_current_project(chat_id, task.project_id)
@@ -2834,6 +3151,9 @@ class TelegramCommandHandler:
             self.chat_state.set_current_focus(chat_id, "")
         if session.agent_id:
             self.chat_state.set_current_agent(chat_id, session.agent_id)
+        directory = self._directory_for_path(session.project_dir, ensure=True)
+        if directory is not None:
+            self.chat_state.set_current_directory(chat_id, directory.directory_id)
         project = self._project_for_session(session)
         if project is not None:
             self.chat_state.set_current_project(chat_id, project.project_id)
@@ -2876,6 +3196,10 @@ class TelegramCommandHandler:
             self.chat_state.set_current_project(chat_id, focus.project_id)
         if focus.agent_id:
             self.chat_state.set_current_agent(chat_id, focus.agent_id)
+        if focus.directory:
+            directory = self._directory_for_path(focus.directory, project_id=focus.project_id, ensure=True)
+            if directory is not None:
+                self.chat_state.set_current_directory(chat_id, directory.directory_id)
 
     def _focus_for_session(self, session_id: str) -> FocusRecord | None:
         if not session_id:
@@ -3205,6 +3529,9 @@ class TelegramCommandHandler:
             self.chat_state.set_current_agent(chat_id, agent.agent_id)
             if agent.project_id:
                 self.chat_state.set_current_project(chat_id, agent.project_id)
+            directory = self._directory_for_agent(agent)
+            if directory is not None:
+                self.chat_state.set_current_directory(chat_id, directory.directory_id)
         return "\n".join(
             [
                 "Agent created and selected:",
@@ -4136,6 +4463,7 @@ def _assistant_action_allowed(action: str) -> tuple[bool, str]:
     lowered_sub = subcommand.lower()
     read_only = {
         "/projects",
+        "/directories",
         "/agents",
         "/tasks",
         "/sessions",
@@ -4156,6 +4484,10 @@ def _assistant_action_allowed(action: str) -> tuple[bool, str]:
         return (True, "") if rest.strip() else (False, "/use requires a project, agent, or task reference")
     if command == "/project":
         if not rest.strip() or lowered_sub in {"new", "create", "use", "select"}:
+            return True, ""
+        return True, ""
+    if command == "/directory":
+        if not rest.strip() or lowered_sub in {"list", "use", "select", "add", "new", "create"}:
             return True, ""
         return True, ""
     if command == "/task":
@@ -4271,10 +4603,14 @@ def _help_text() -> str:
             "/projects",
             "/project <project_id or list #>",
             "/project new <project_id> <cwd> [title]",
+            "/directories [project]",
+            "/directory <directory_id, path, title, or list #>",
+            "/directory add <path> [project]",
             "/projectstate [project]",
             "/decisions [project]",
             "/decide <decision text>",
             "/use project <project_id or list #>",
+            "/use directory <directory_id or list #>",
             "/agents [project]",
             "/agent <agent_id or list #>",
             "/agent new <agent_id> [adapter] [role] [title]",
