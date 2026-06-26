@@ -3164,7 +3164,10 @@ class TelegramServer:
             )
         for reply in replies:
             if reply:
-                self.api.send_message(chat_id, reply)
+                try:
+                    self.api.send_message(chat_id, reply)
+                except Exception as exc:
+                    print(f"[agentdeck] telegram send error bot={self.config.bot_id}: {exc}", flush=True)
 
     def _send_restart_notices(self) -> None:
         notices = TelegramRestartNoticeStore(self.workspace).pop_for_bot(self.config.bot_id)

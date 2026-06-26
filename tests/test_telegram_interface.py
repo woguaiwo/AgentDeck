@@ -1037,6 +1037,46 @@ class TelegramInterfaceTests(unittest.TestCase):
             self.assertIn("telegram polling error bot=minsys-bot3", stdout.getvalue())
             self.assertIn("409", stdout.getvalue())
 
+    def test_telegram_send_error_does_not_escape_server_loop(self) -> None:
+        class FailingSendApi:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def get_updates(self, *, offset: int | None = None, timeout: int = 30) -> list[dict[str, object]]:
+                self.calls += 1
+                if self.calls > 1:
+                    return []
+                return [
+                    {
+                        "update_id": 1,
+                        "message": {
+                            "chat": {"id": 42},
+                            "text": "hello",
+                        },
+                    }
+                ]
+
+            def send_message(self, chat_id: int, text: str) -> None:
+                raise RuntimeError("HTTP Error 502: Bad Gateway")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            server = TelegramServer(
+                workspace,
+                FailingSendApi(),
+                TelegramConfig(token="123456:ABC", bot_id="minsys-bot5", poll_timeout=0),
+                restart_callback=None,
+            )
+            # Avoid agent/registry setup; just ensure send failure is swallowed.
+            server.handler.handle_text = lambda text, chat_id=None: ["reply"]  # type: ignore[method-assign]
+            stdout = io.StringIO()
+
+            with contextlib.redirect_stdout(stdout):
+                server.serve_forever(once=True)
+
+            self.assertIn("telegram send error bot=minsys-bot5", stdout.getvalue())
+            self.assertIn("502", stdout.getvalue())
+
     def test_telegram_server_writes_command_audit_log(self) -> None:
         class StatusApi:
             def __init__(self) -> None:
