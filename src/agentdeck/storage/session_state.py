@@ -22,6 +22,7 @@ class SessionStateCard:
     current_state: str = ""
     next_step: str = ""
     task_id: str = ""
+    focus_id: str = ""
     project_id: str = ""
     agent_id: str = ""
     blockers: list[str] = field(default_factory=list)
@@ -41,6 +42,7 @@ class SessionStateCard:
             current_state=str(data.get("current_state") or ""),
             next_step=str(data.get("next_step") or ""),
             task_id=str(data.get("task_id") or ""),
+            focus_id=str(data.get("focus_id") or ""),
             project_id=str(data.get("project_id") or ""),
             agent_id=str(data.get("agent_id") or ""),
             blockers=_string_list(data.get("blockers")),
@@ -96,6 +98,7 @@ class SessionStateStore:
             raise ValueError("progress entry has no session_id")
         card = self.get(entry.session_id) or SessionStateCard(session_id=entry.session_id)
         card.task_id = entry.task_id or card.task_id
+        card.focus_id = entry.focus_id or card.focus_id
         card.project_id = entry.project_id or card.project_id
         card.agent_id = entry.agent_id or card.agent_id
         card.objective = objective.strip() or card.objective

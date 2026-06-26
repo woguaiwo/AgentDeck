@@ -599,10 +599,23 @@ Use `projects state <project>` and `projects decisions <project>` to inspect
 the project state and decision log. Telegram supports `/projectstate`,
 `/decisions`, and `/decide <decision text>` for phone control.
 
-`tasks handoff` records compact progress for the legacy manager/executor task
-workflow. It writes a phone-readable handoff note back to the task, appends a
-structured entry to `.agentdeck/journal/progress.jsonl`, and updates the
-attached session state card when the task has a session:
+`focus handoff` records compact progress for the current session-owned focus.
+It writes a phone-readable handoff note back to the focus, appends a structured
+entry to `.agentdeck/journal/progress.jsonl`, and updates the attached session
+state card when the focus has a session:
+
+```bash
+agentdeck focus handoff <focus_id> \
+  --summary "Loader investigation has a stable direction" \
+  --completed "Mapped the failing data path" \
+  --verified "Ran focused tests" \
+  --next "Patch the loader edge case" \
+  --decision "Keep this agent bound to the data directory" \
+  --artifact "src/data/loader.py"
+```
+
+`tasks handoff` remains available for the legacy manager/executor task
+workflow:
 
 ```bash
 agentdeck tasks handoff <task_id> \
@@ -620,9 +633,19 @@ used for resume and future auto-mode context. Use `agentdeck focus context
 commands such as `agentdeck tasks context <task_id>` and `agentdeck tasks
 handoffs <task_id>` remain available for older task-based workflows.
 
-`tasks manager-review` records the manager side of the loop. Handoffs are
+`focus manager-review` records the manager side of the loop. Handoffs are
 executor reports; manager reviews are compact direction, approval, or requested
 changes for the next execution run:
+
+```bash
+agentdeck focus manager-review <focus_id> \
+  --summary "Direction approved" \
+  --status approved \
+  --next "Continue with the patch" \
+  --decision "Do not broaden the scope yet"
+```
+
+`tasks manager-review` remains available for older task records:
 
 ```bash
 agentdeck tasks manager-review <task_id> \

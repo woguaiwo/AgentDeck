@@ -329,6 +329,40 @@ def build_parser() -> argparse.ArgumentParser:
     focus_attach = focus_sub.add_parser("attach-session", help="Attach a session to a focus")
     focus_attach.add_argument("focus")
     focus_attach.add_argument("session")
+    focus_handoffs = focus_sub.add_parser("handoffs", help="List recent handoffs for one focus")
+    focus_handoffs.add_argument("focus")
+    focus_handoffs.add_argument("--limit", type=int, default=5)
+    focus_reviews = focus_sub.add_parser("reviews", help="List recent manager reviews for one focus")
+    focus_reviews.add_argument("focus")
+    focus_reviews.add_argument("--limit", type=int, default=5)
+    focus_handoff = focus_sub.add_parser("handoff", help="Append a structured focus handoff and update session state")
+    focus_handoff.add_argument("focus")
+    focus_handoff.add_argument("--summary", required=True)
+    focus_handoff.add_argument("--completed", action="append", default=[])
+    focus_handoff.add_argument("--verified", action="append", default=[])
+    focus_handoff.add_argument("--next", dest="next_steps", action="append", default=[])
+    focus_handoff.add_argument("--blocker", dest="blockers", action="append", default=[])
+    focus_handoff.add_argument("--decision", dest="decisions", action="append", default=[])
+    focus_handoff.add_argument("--artifact", dest="artifacts", action="append", default=[])
+    focus_handoff.add_argument("--session", help="Session id; defaults to the focus session")
+    focus_handoff.add_argument("--agent", help="Agent id; defaults to the focus agent")
+    focus_manager_review = focus_sub.add_parser(
+        "manager-review",
+        help="Append a structured focus manager review and update session state",
+    )
+    focus_manager_review.add_argument("focus")
+    focus_manager_review.add_argument("--summary", required=True)
+    focus_manager_review.add_argument(
+        "--status",
+        choices=["noted", "approved", "changes-requested", "blocked"],
+        default="noted",
+    )
+    focus_manager_review.add_argument("--next", dest="next_steps", action="append", default=[])
+    focus_manager_review.add_argument("--blocker", dest="blockers", action="append", default=[])
+    focus_manager_review.add_argument("--decision", dest="decisions", action="append", default=[])
+    focus_manager_review.add_argument("--artifact", dest="artifacts", action="append", default=[])
+    focus_manager_review.add_argument("--session", help="Session id; defaults to the focus session")
+    focus_manager_review.add_argument("--reviewer", default="manager")
 
     tasks = sub.add_parser("tasks", help="Manage task board")
     task_sub = tasks.add_subparsers(dest="tasks_command", required=True)
@@ -881,6 +915,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.focus_command == "context":
             return _print_focus_context(workspace, registry, args.focus)
+        if args.focus_command == "handoffs":
+            return _print_focus_handoffs(workspace, registry, args.focus, limit=args.limit)
+        if args.focus_command == "reviews":
+            return _print_focus_reviews(workspace, registry, args.focus, limit=args.limit)
         if args.focus_command == "note":
             return _update_focus_note(registry, args.focus, args.note)
         if args.focus_command == "set":
@@ -900,6 +938,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"focus: {record.title} ({record.focus_id}) session={record.session_id}")
             return 0
+        if args.focus_command == "handoff":
+            return _record_focus_handoff(workspace, registry, args)
+        if args.focus_command == "manager-review":
+            return _record_focus_manager_review(workspace, registry, args)
 
     if args.command == "tasks":
         workspace.ensure()
@@ -1999,6 +2041,50 @@ def _print_focus_context(workspace: Workspace, registry: FocusRegistry, focus: s
     return 0
 
 
+def _print_focus_handoffs(workspace: Workspace, registry: FocusRegistry, focus: str, *, limit: int = 5) -> int:
+    record = registry.resolve(focus)
+    if record is None:
+        print(f"focus not found: {focus}", file=sys.stderr)
+        return 2
+    entries = ProgressJournal(workspace).list(kind="handoff", focus_id=record.focus_id, limit=max(limit, 0))
+    if not entries:
+        print(f"no handoffs for focus: {record.title} ({record.focus_id})")
+        return 0
+    print(f"handoffs for focus: {record.title} ({record.focus_id})")
+    for entry in entries:
+        print(f"- {entry.summary}")
+        if entry.next_steps:
+            print(f"  next: {entry.next_steps[0]}")
+        if entry.blockers:
+            print(f"  blocker: {entry.blockers[0]}")
+        if entry.decisions:
+            print(f"  decision: {entry.decisions[0]}")
+    return 0
+
+
+def _print_focus_reviews(workspace: Workspace, registry: FocusRegistry, focus: str, *, limit: int = 5) -> int:
+    record = registry.resolve(focus)
+    if record is None:
+        print(f"focus not found: {focus}", file=sys.stderr)
+        return 2
+    entries = ProgressJournal(workspace).list(kind="manager-review", focus_id=record.focus_id, limit=max(limit, 0))
+    if not entries:
+        print(f"no manager reviews for focus: {record.title} ({record.focus_id})")
+        return 0
+    print(f"manager reviews for focus: {record.title} ({record.focus_id})")
+    for entry in entries:
+        status = str(entry.metadata.get("status") or "").strip()
+        prefix = f"{status}: " if status else ""
+        print(f"- {prefix}{entry.summary}")
+        if entry.next_steps:
+            print(f"  next: {entry.next_steps[0]}")
+        if entry.blockers:
+            print(f"  blocker: {entry.blockers[0]}")
+        if entry.decisions:
+            print(f"  decision: {entry.decisions[0]}")
+    return 0
+
+
 def _print_task_handoffs(workspace: Workspace, board: TaskBoard, task: str, *, limit: int = 5) -> int:
     record = board.resolve(task)
     if record is None:
@@ -2082,6 +2168,45 @@ def _record_task_handoff(workspace: Workspace, board: TaskBoard, args: argparse.
     return 0
 
 
+def _record_focus_handoff(workspace: Workspace, registry: FocusRegistry, args: argparse.Namespace) -> int:
+    focus = registry.resolve(args.focus)
+    if focus is None:
+        print(f"focus not found: {args.focus}", file=sys.stderr)
+        return 2
+    session_id = (args.session or focus.session_id or "").strip()
+    agent_id = (args.agent or focus.agent_id or "").strip()
+    try:
+        entry = ProgressJournal(workspace).append(
+            kind="handoff",
+            summary=args.summary,
+            project_id=focus.project_id,
+            focus_id=focus.focus_id,
+            session_id=session_id,
+            agent_id=agent_id,
+            completed=args.completed,
+            verified=args.verified,
+            next_steps=args.next_steps,
+            blockers=args.blockers,
+            decisions=args.decisions,
+            artifacts=args.artifacts,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    note_record = registry.add_note(focus.focus_id, format_handoff(entry), kind="handoff")
+    if session_id:
+        objective = focus.description or focus.title
+        SessionStateStore(workspace).upsert_from_progress(entry, objective=objective)
+
+    notes_count = len(note_record.notes) if note_record is not None else 0
+    print(f"handoff: {entry.entry_id}")
+    print(f"focus: {focus.title} ({focus.focus_id}) notes={notes_count}")
+    if session_id:
+        print(f"session_state: {session_id}")
+    return 0
+
+
 def _record_manager_review(workspace: Workspace, board: TaskBoard, args: argparse.Namespace) -> int:
     task = board.resolve(args.task)
     if task is None:
@@ -2115,6 +2240,44 @@ def _record_manager_review(workspace: Workspace, board: TaskBoard, args: argpars
     notes_count = len(note_record.notes) if note_record is not None else 0
     print(f"manager_review: {entry.entry_id}")
     print(f"task: {task.title} ({task.task_id}) notes={notes_count}")
+    if session_id:
+        print(f"session_state: {session_id}")
+    return 0
+
+
+def _record_focus_manager_review(workspace: Workspace, registry: FocusRegistry, args: argparse.Namespace) -> int:
+    focus = registry.resolve(args.focus)
+    if focus is None:
+        print(f"focus not found: {args.focus}", file=sys.stderr)
+        return 2
+    session_id = (args.session or focus.session_id or "").strip()
+    reviewer = (args.reviewer or "manager").strip()
+    try:
+        entry = ProgressJournal(workspace).append(
+            kind="manager-review",
+            summary=args.summary,
+            project_id=focus.project_id,
+            focus_id=focus.focus_id,
+            session_id=session_id,
+            agent_id=reviewer,
+            next_steps=args.next_steps,
+            blockers=args.blockers,
+            decisions=args.decisions,
+            artifacts=args.artifacts,
+            metadata={"status": args.status, "reviewer": reviewer},
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
+    note_record = registry.add_note(focus.focus_id, format_review(entry), kind="manager-review")
+    if session_id:
+        objective = focus.description or focus.title
+        SessionStateStore(workspace).upsert_from_progress(entry, objective=objective)
+
+    notes_count = len(note_record.notes) if note_record is not None else 0
+    print(f"manager_review: {entry.entry_id}")
+    print(f"focus: {focus.title} ({focus.focus_id}) notes={notes_count}")
     if session_id:
         print(f"session_state: {session_id}")
     return 0

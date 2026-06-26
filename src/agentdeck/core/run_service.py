@@ -279,16 +279,13 @@ def build_agentdeck_context(
         active_agent = AgentRegistry(workspace).resolve(focus.agent_id)
     agent_role_template = role_template_for_agent(active_agent) if active_agent is not None else ""
     memories = collect_relevant_memories(workspace, task, focus=focus) if include_memories else []
-    handoffs = ProgressJournal(workspace).list(
-        kind="handoff",
-        task_id=task.task_id if task is not None else None,
-        session_id=None if task is not None else (state_id or None),
-        limit=3,
-    )
-    reviews = ProgressJournal(workspace).list(
-        kind="manager-review",
-        task_id=task.task_id if task is not None else None,
-        session_id=None if task is not None else (state_id or None),
+    handoffs = _context_progress_entries(workspace, "handoff", task=task, focus=focus, session_id=state_id, limit=3)
+    reviews = _context_progress_entries(
+        workspace,
+        "manager-review",
+        task=task,
+        focus=focus,
+        session_id=state_id,
         limit=3,
     )
 
@@ -362,6 +359,31 @@ def collect_relevant_memories(
             memories.append(document)
     memories.sort(key=lambda item: (not item.pinned, _memory_relevance_rank(item, task, focus), -item.modified_at))
     return memories[:6]
+
+
+def _context_progress_entries(
+    workspace: Workspace,
+    kind: str,
+    *,
+    task: TaskRecord | None,
+    focus: FocusRecord | None,
+    session_id: str,
+    limit: int,
+) -> list[ProgressEntry]:
+    journal = ProgressJournal(workspace)
+    if task is not None:
+        return journal.list(kind=kind, task_id=task.task_id, limit=limit)
+
+    entries: list[ProgressEntry] = []
+    if focus is not None:
+        entries.extend(journal.list(kind=kind, focus_id=focus.focus_id, limit=limit))
+    if session_id:
+        entries.extend(journal.list(kind=kind, session_id=session_id, limit=limit))
+
+    deduped: dict[str, ProgressEntry] = {}
+    for entry in entries:
+        deduped[entry.entry_id] = entry
+    return sorted(deduped.values(), key=lambda item: item.created_at, reverse=True)[: max(limit, 0)]
 
 
 def _memory_relevance_rank(memory: MemoryDocument, task: TaskRecord | None, focus: FocusRecord | None = None) -> int:
@@ -451,6 +473,7 @@ def _append_state_context(lines: list[str], state: SessionStateCard) -> None:
     _append_optional_line(lines, "objective", state.objective, max_chars=360)
     _append_optional_line(lines, "current state", state.current_state, max_chars=360)
     _append_optional_line(lines, "next step", state.next_step, max_chars=240)
+    _append_optional_line(lines, "focus", state.focus_id, max_chars=120)
     _append_list(lines, "blockers", state.blockers, max_items=4)
     _append_list(lines, "verified work", state.verified_work, max_items=5)
     _append_list(lines, "decisions", state.decisions, max_items=5)

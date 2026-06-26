@@ -20,6 +20,7 @@ class ProgressEntry:
     summary: str
     project_id: str = ""
     task_id: str = ""
+    focus_id: str = ""
     session_id: str = ""
     agent_id: str = ""
     completed: list[str] = field(default_factory=list)
@@ -39,6 +40,7 @@ class ProgressEntry:
             summary=str(data.get("summary") or ""),
             project_id=str(data.get("project_id") or ""),
             task_id=str(data.get("task_id") or ""),
+            focus_id=str(data.get("focus_id") or ""),
             session_id=str(data.get("session_id") or ""),
             agent_id=str(data.get("agent_id") or ""),
             completed=_string_list(data.get("completed")),
@@ -72,6 +74,7 @@ class ProgressJournal:
         summary: str,
         project_id: str = "",
         task_id: str = "",
+        focus_id: str = "",
         session_id: str = "",
         agent_id: str = "",
         completed: list[str] | None = None,
@@ -92,6 +95,7 @@ class ProgressJournal:
             summary=clean_summary,
             project_id=_clean_token(project_id),
             task_id=_clean_token(task_id),
+            focus_id=_clean_token(focus_id),
             session_id=session_id.strip(),
             agent_id=_clean_token(agent_id),
             completed=_clean_list(completed),
@@ -112,6 +116,7 @@ class ProgressJournal:
         *,
         kind: str | None = None,
         task_id: str | None = None,
+        focus_id: str | None = None,
         session_id: str | None = None,
         limit: int = 20,
     ) -> list[ProgressEntry]:
@@ -133,6 +138,8 @@ class ProgressJournal:
                 if kind and entry.kind != kind:
                     continue
                 if task_id and entry.task_id != task_id:
+                    continue
+                if focus_id and entry.focus_id != focus_id:
                     continue
                 if session_id and entry.session_id != session_id:
                     continue

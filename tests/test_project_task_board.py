@@ -707,6 +707,84 @@ class ProjectTaskBoardTests(unittest.TestCase):
                     [
                         "--workspace",
                         str(workspace.root),
+                        "focus",
+                        "handoff",
+                        focus.focus_id,
+                        "--summary",
+                        "Focus handoff captured",
+                        "--completed",
+                        "Added focus journal path",
+                        "--next",
+                        "Review focus-first context",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertIn("handoff: progress-", stdout.getvalue())
+            self.assertIn("session_state: session-a", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(
+                    [
+                        "--workspace",
+                        str(workspace.root),
+                        "focus",
+                        "manager-review",
+                        focus.focus_id,
+                        "--summary",
+                        "Focus direction accepted",
+                        "--status",
+                        "approved",
+                        "--decision",
+                        "Keep focus progress out of legacy task records",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertIn("manager_review: progress-", stdout.getvalue())
+
+            focus_handoffs = ProgressJournal(workspace).list(kind="handoff", focus_id=focus.focus_id)
+            focus_reviews = ProgressJournal(workspace).list(kind="manager-review", focus_id=focus.focus_id)
+            self.assertEqual(len(focus_handoffs), 1)
+            self.assertEqual(len(focus_reviews), 1)
+            self.assertEqual(focus_handoffs[0].summary, "Focus handoff captured")
+            self.assertEqual(focus_reviews[0].metadata["status"], "approved")
+
+            focus_card = SessionStateStore(workspace).get("session-a")
+            assert focus_card is not None
+            self.assertEqual(focus_card.focus_id, focus.focus_id)
+            self.assertEqual(focus_card.current_state, "Focus direction accepted")
+            self.assertIn("Keep focus progress out of legacy task records", focus_card.decisions)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--workspace", str(workspace.root), "focus", "handoffs", focus.focus_id])
+            self.assertEqual(code, 0)
+            self.assertIn("handoffs for focus: Focus memory", stdout.getvalue())
+            self.assertIn("Focus handoff captured", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--workspace", str(workspace.root), "focus", "reviews", focus.focus_id])
+            self.assertEqual(code, 0)
+            self.assertIn("manager reviews for focus: Focus memory", stdout.getvalue())
+            self.assertIn("approved: Focus direction accepted", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--workspace", str(workspace.root), "focus", "context", focus.focus_id])
+            self.assertEqual(code, 0)
+            focus_context = stdout.getvalue()
+            self.assertIn("Recent handoffs:", focus_context)
+            self.assertIn("Focus handoff captured", focus_context)
+            self.assertIn("Recent manager reviews:", focus_context)
+            self.assertIn("approved: Focus direction accepted", focus_context)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(
+                    [
+                        "--workspace",
+                        str(workspace.root),
                         "memory",
                         "compact-focus",
                         focus.focus_id,
@@ -729,6 +807,8 @@ class ProjectTaskBoardTests(unittest.TestCase):
             self.assertIn("Focus memory", focus_memory_text)
             self.assertIn("Keep focus snapshots session-first.", focus_memory_text)
             self.assertIn("Capture the current focus", focus_memory_text)
+            self.assertIn("Focus handoff captured", focus_memory_text)
+            self.assertIn("Focus direction accepted", focus_memory_text)
             self.assertNotIn("This older memory should not be copied", focus_memory_text)
 
             stdout = io.StringIO()
