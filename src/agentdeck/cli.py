@@ -133,6 +133,12 @@ def build_parser() -> argparse.ArgumentParser:
     mem_compact_task.add_argument("--title")
     mem_compact_task.add_argument("--max-chars", type=int, default=6000)
     mem_compact_task.add_argument("--pin", action="store_true", help="Prioritize this snapshot in retrieval")
+    mem_compact_focus = mem_sub.add_parser("compact-focus", help="Create a durable memory snapshot from one focus context")
+    mem_compact_focus.add_argument("focus")
+    mem_compact_focus.add_argument("--session", help="Session id override; defaults to the focus session")
+    mem_compact_focus.add_argument("--title")
+    mem_compact_focus.add_argument("--max-chars", type=int, default=6000)
+    mem_compact_focus.add_argument("--pin", action="store_true", help="Prioritize this snapshot in retrieval")
 
     events = sub.add_parser("events", help="Inspect event log")
     events.add_argument("--tail", type=int, default=20)
@@ -561,6 +567,8 @@ def main(argv: list[str] | None = None) -> int:
             return _set_memory_disabled(store, args.memory, disabled=False, scope=args.scope, owner=args.owner)
         if args.memory_command == "compact-task":
             return _compact_task_memory(workspace, args)
+        if args.memory_command == "compact-focus":
+            return _compact_focus_memory(workspace, args)
 
     if args.command == "events":
         workspace.ensure()
@@ -1824,6 +1832,58 @@ def _compact_task_memory(workspace: Workspace, args: argparse.Namespace) -> int:
     print(f"memory: {entry.memory_id}")
     print(f"path: {entry.path}")
     print(f"scope: {args.scope}")
+    if owner:
+        print(f"owner: {owner}")
+    return 0
+
+
+def _compact_focus_memory(workspace: Workspace, args: argparse.Namespace) -> int:
+    registry = FocusRegistry(workspace)
+    focus = registry.resolve(args.focus)
+    if focus is None:
+        print(f"focus not found: {args.focus}", file=sys.stderr)
+        return 2
+    session_id = args.session or focus.session_id
+    context = build_agentdeck_context(
+        workspace,
+        task=None,
+        focus=focus,
+        session_id=session_id,
+        max_chars=max(args.max_chars, 500),
+        include_memories=False,
+    )
+    if not context:
+        print(f"no focus context to compact: {focus.title} ({focus.focus_id})")
+        return 0
+
+    owner = focus.project_id
+    title = args.title or f"{focus.title} context snapshot"
+    content = "\n".join(
+        [
+            f"# {title}",
+            "",
+            "This memory was generated from structured AgentDeck state, not a raw chat transcript.",
+            "",
+            context,
+        ]
+    )
+    try:
+        entry = MarkdownMemoryStore(workspace).add(
+            title,
+            content,
+            scope="project",
+            owner=owner,
+            memory_type="focus-context",
+            source="agentdeck-context",
+            pinned=args.pin,
+            tags=["agentdeck", "focus-context"],
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    print(f"memory: {entry.memory_id}")
+    print(f"path: {entry.path}")
+    print("scope: project")
     if owner:
         print(f"owner: {owner}")
     return 0

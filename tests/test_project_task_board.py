@@ -11,6 +11,7 @@ from pathlib import Path
 from agentdeck.cli import main
 from agentdeck.core.config import Workspace
 from agentdeck.storage.agents import AgentRegistry
+from agentdeck.storage.focus import FocusRegistry
 from agentdeck.storage.memory import MarkdownMemoryStore
 from agentdeck.storage.progress import ProgressJournal
 from agentdeck.storage.projects import ProjectRegistry
@@ -681,6 +682,54 @@ class ProjectTaskBoardTests(unittest.TestCase):
             self.assertIn("Recent manager reviews:", memory_text)
             self.assertIn("Storage direction is acceptable", memory_text)
             self.assertNotIn("This older memory should not be copied", memory_text)
+
+            focus = FocusRegistry(workspace).create(
+                title="Focus memory",
+                description="Keep focus snapshots session-first.",
+                project_id="agentdeck",
+                agent_id="developer",
+                directory=project_dir,
+                session_id="session-a",
+            )
+            FocusRegistry(workspace).add_note(focus.focus_id, "Capture the current focus without copying older memory.")
+            SessionRegistry(workspace).upsert_start(
+                session_id="session-a",
+                agent_id="developer",
+                adapter="echo",
+                project_dir=project_dir,
+                prompt="Work on focus memory compaction.",
+                project_id="agentdeck",
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(
+                    [
+                        "--workspace",
+                        str(workspace.root),
+                        "memory",
+                        "compact-focus",
+                        focus.focus_id,
+                        "--title",
+                        "Focus snapshot",
+                        "--pin",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            focus_compact_out = stdout.getvalue()
+            self.assertIn("memory: mem-", focus_compact_out)
+            self.assertIn("scope: project", focus_compact_out)
+            self.assertIn("owner: agentdeck", focus_compact_out)
+            focus_path_match = re.search(r"path: (.+)", focus_compact_out)
+            assert focus_path_match is not None
+            focus_memory_path = Path(focus_path_match.group(1))
+            focus_memory_text = focus_memory_path.read_text(encoding="utf-8")
+            self.assertIn("This memory was generated from structured AgentDeck state", focus_memory_text)
+            self.assertIn("Focus:", focus_memory_text)
+            self.assertIn("Focus memory", focus_memory_text)
+            self.assertIn("Keep focus snapshots session-first.", focus_memory_text)
+            self.assertIn("Capture the current focus", focus_memory_text)
+            self.assertNotIn("This older memory should not be copied", focus_memory_text)
 
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):

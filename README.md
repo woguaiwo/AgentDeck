@@ -551,13 +551,16 @@ Agents should not share raw chat transcripts as memory. They should share:
 Raw transcripts remain available for audit, but runtime prompts should receive
 bounded, relevant memory only.
 
-Use `memory compact-task <task_id>` to turn structured legacy task context into
-a durable Markdown memory snapshot. The next memory pass should add the matching
-focus/session compact command. The existing compaction uses project state,
-session state, handoffs, and manager reviews; it does not copy raw chat
-transcripts or recursively copy older durable memory snapshots:
+Use `memory compact-focus <focus_id>` to turn the current focus, session state,
+handoffs, reviews, and project decisions into a durable Markdown memory
+snapshot. `memory compact-task <task_id>` remains available for legacy task
+context. Compaction does not copy raw chat transcripts or recursively copy older
+durable memory snapshots:
 
 ```bash
+agentdeck memory compact-focus <focus_id> \
+  --title "Loader investigation focus snapshot" \
+  --pin
 agentdeck memory compact-task <task_id> \
   --title "Loader fix context snapshot" \
   --pin
