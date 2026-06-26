@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -11,6 +12,7 @@ from typing import Any
 
 from agentdeck.core.config import Workspace
 from agentdeck.core.events import AgentEvent, EventKind
+from agentdeck.storage.directories import DirectoryRegistry
 
 
 CURRENT_FOCUS_METADATA_KEY = "current_focus_id"
@@ -80,17 +82,19 @@ class SessionRegistry:
         project_dir: str | Path,
         prompt: str,
         title: str | None = None,
+        project_id: str = "",
     ) -> SessionRecord:
         records = self._read()
         existing = records.get(session_id)
         now = time.time()
+        resolved_project_dir = str(Path(project_dir).expanduser().resolve())
         clean_title = _clean_title(title or "")
         if existing is None:
             record = SessionRecord(
                 session_id=session_id,
                 agent_id=agent_id,
                 adapter=adapter,
-                project_dir=str(Path(project_dir).expanduser().resolve()),
+                project_dir=resolved_project_dir,
                 title=clean_title or _title_from_prompt(prompt),
                 last_user_message=prompt,
                 created_at=now,
@@ -101,7 +105,7 @@ class SessionRegistry:
             record = existing
             record.agent_id = agent_id
             record.adapter = adapter
-            record.project_dir = str(Path(project_dir).expanduser().resolve())
+            record.project_dir = resolved_project_dir
             record.status = "running"
             record.updated_at = now
             record.last_user_message = prompt
@@ -111,6 +115,7 @@ class SessionRegistry:
             elif not record.title:
                 record.title = _title_from_prompt(prompt)
                 record.metadata["title_source"] = "prompt"
+        self._sync_directory_metadata(record, project_id=project_id)
         records[session_id] = record
         self._write(records)
         return record
@@ -223,6 +228,7 @@ class SessionRegistry:
         project_dir: str | Path,
         title: str = "",
         session_id: str | None = None,
+        project_id: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> SessionRecord:
         """Register an existing provider session as an AgentDeck session."""
@@ -240,12 +246,13 @@ class SessionRegistry:
 
         now = time.time()
         clean_title = _clean_title(title)
+        resolved_project_dir = str(Path(project_dir).expanduser().resolve())
         if record is None:
             record = SessionRecord(
                 session_id=session_id or _import_session_id(adapter, provider_session_id),
                 agent_id=agent_id,
                 adapter=adapter,
-                project_dir=str(Path(project_dir).expanduser().resolve()),
+                project_dir=resolved_project_dir,
                 title=clean_title or provider_session_id,
                 status="idle",
                 created_at=now,
@@ -256,7 +263,7 @@ class SessionRegistry:
         else:
             record.agent_id = agent_id
             record.adapter = adapter
-            record.project_dir = str(Path(project_dir).expanduser().resolve())
+            record.project_dir = resolved_project_dir
             record.status = "idle"
             record.updated_at = now
             record.provider_session_id = provider_session_id
@@ -272,6 +279,7 @@ class SessionRegistry:
         record.metadata["imported"] = True
         if metadata:
             record.metadata.update(metadata)
+        self._sync_directory_metadata(record, project_id=project_id)
         records[record.session_id] = record
         self._write(records)
         return record
@@ -309,6 +317,23 @@ class SessionRegistry:
         if require_provider_session:
             records = [record for record in records if bool(record.provider_session_id)]
         return records[0] if records else None
+
+    def _sync_directory_metadata(self, record: SessionRecord, *, project_id: str = "") -> None:
+        if not record.project_dir:
+            record.metadata.pop("directory_id", None)
+            return
+        clean_project_id = _clean_token(project_id or str(record.metadata.get("project_id") or ""))
+        existing = DirectoryRegistry(self.workspace).resolve(record.project_dir)
+        directory = DirectoryRegistry(self.workspace).upsert(
+            path=record.project_dir,
+            project_id=clean_project_id,
+            title=existing.title if existing is not None else (Path(record.project_dir).name or record.title or record.session_id),
+            role=existing.role if existing is not None else "session-workdir",
+            metadata={"last_session_id": record.session_id, "last_session_agent_id": record.agent_id},
+        )
+        if clean_project_id:
+            record.metadata["project_id"] = clean_project_id
+        record.metadata["directory_id"] = directory.directory_id
 
     def _update_status_event(self, record: SessionRecord, event: AgentEvent) -> None:
         payload = event.payload
@@ -382,6 +407,10 @@ def _clean_title(value: str) -> str:
 def _clean_multiline(value: str) -> str:
     lines = [" ".join(line.strip().split()) for line in str(value).splitlines()]
     return "\n".join(line for line in lines if line)
+
+
+def _clean_token(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "-", value.strip().lower()).strip(".-")
 
 
 def _import_session_id(adapter: str, provider_session_id: str) -> str:

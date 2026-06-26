@@ -670,6 +670,7 @@ def main(argv: list[str] | None = None) -> int:
                     project_dir=project_dir,
                     title=args.title or "",
                     session_id=args.session_id,
+                    project_id=project.project_id if project is not None else "",
                     metadata={"provider": args.provider, "imported_by": "cli"},
                 )
             except ValueError as exc:
@@ -1403,7 +1404,7 @@ def _print_sessions(records: list[SessionRecord]) -> None:
     if not records:
         print("no sessions")
         return
-    print("title\tsession_id\tagent\tadapter\tstatus\tupdated_at\tproject_dir")
+    print("title\tsession_id\tagent\tadapter\tstatus\tupdated_at\tdirectory_id\tproject_dir")
     for record in records:
         print(
             "\t".join(
@@ -1414,6 +1415,7 @@ def _print_sessions(records: list[SessionRecord]) -> None:
                     record.adapter,
                     record.status,
                     _format_timestamp(record.updated_at),
+                    str(record.metadata.get("directory_id") or "-"),
                     record.project_dir,
                 ]
             )

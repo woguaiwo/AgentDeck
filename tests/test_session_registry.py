@@ -11,6 +11,7 @@ from pathlib import Path
 from agentdeck.cli import main
 from agentdeck.core.config import Workspace
 from agentdeck.core.events import AgentEvent, EventKind
+from agentdeck.storage.directories import DirectoryRegistry
 from agentdeck.storage.sessions import SessionRegistry
 
 
@@ -49,6 +50,10 @@ class SessionRegistryTests(unittest.TestCase):
             self.assertEqual(record.title, "hello")
             self.assertEqual(record.last_assistant_final, "done")
             self.assertEqual(record.status, "idle")
+            directory = DirectoryRegistry(workspace).resolve(tmpdir)
+            assert directory is not None
+            self.assertEqual(record.metadata["directory_id"], directory.directory_id)
+            self.assertEqual(directory.metadata["last_session_id"], "session-a")
 
     def test_cli_sessions_list_rename_and_resolve_title(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -85,6 +90,7 @@ class SessionRegistryTests(unittest.TestCase):
             self.assertEqual(code, 0)
             listed = stdout.getvalue()
             self.assertIn("title\tsession_id", listed)
+            self.assertIn("directory_id", listed)
             self.assertIn("Build planner", listed)
             self.assertNotIn("provider_session_id", listed)
 
@@ -109,6 +115,7 @@ class SessionRegistryTests(unittest.TestCase):
             shown = json.loads(stdout.getvalue())
             self.assertEqual(shown["session_id"], session_id)
             self.assertEqual(shown["title"], "Planner review")
+            self.assertTrue(shown["metadata"].get("directory_id"))
 
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
@@ -243,6 +250,11 @@ class SessionRegistryTests(unittest.TestCase):
                 )
             self.assertEqual(code, 0)
             self.assertIn("imported: Imported thread", stdout.getvalue())
+            imported = SessionRegistry(workspace).resolve("thread-imported")
+            assert imported is not None
+            directory = DirectoryRegistry(workspace).resolve(project)
+            assert directory is not None
+            self.assertEqual(imported.metadata["directory_id"], directory.directory_id)
 
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):

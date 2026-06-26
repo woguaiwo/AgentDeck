@@ -68,6 +68,7 @@ class AgentRuntime:
             project_dir=self.project_dir,
             prompt=user_prompt,
             title=title,
+            project_id=self.project_id,
         )
         start = AgentEvent(EventKind.SESSION_STARTED, self.agent_id, sid, payload={"adapter": self.adapter.name})
         user_payload = {"adapter_prompt_modified": prompt != user_prompt} if prompt != user_prompt else {}

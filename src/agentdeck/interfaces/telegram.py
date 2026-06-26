@@ -2677,6 +2677,14 @@ class TelegramCommandHandler:
             return None
         return registry.upsert(path=clean, project_id=project_id, title=Path(clean).expanduser().name or clean)
 
+    def _directory_for_session(self, session: SessionRecord) -> DirectoryRecord | None:
+        directory_id = str(session.metadata.get("directory_id") or "")
+        if directory_id:
+            record = DirectoryRegistry(self.workspace).resolve(directory_id)
+            if record is not None:
+                return record
+        return self._directory_for_path(session.project_dir)
+
     def _directory_for_agent(self, agent: AgentRecord) -> DirectoryRecord | None:
         directory_id = str(agent.metadata.get("directory_id") or "")
         if directory_id:
@@ -2778,7 +2786,7 @@ class TelegramCommandHandler:
             marker = " [current]" if record.session_id == current_session_id else ""
             lines.append(f"{index}. {record.title}{marker}")
             lines.append(f"   status: {record.status}  agent: {record.agent_id}  adapter: {record.adapter}")
-            directory = self._directory_for_path(record.project_dir)
+            directory = self._directory_for_session(record)
             if directory is not None:
                 lines.append(f"   directory: {directory.title} ({directory.directory_id})")
             elif record.project_dir:
@@ -2823,7 +2831,7 @@ class TelegramCommandHandler:
             f"adapter: {record.adapter}",
             f"project_dir: {record.project_dir}",
         ]
-        directory = self._directory_for_path(record.project_dir)
+        directory = self._directory_for_session(record)
         if directory is not None:
             lines.append(f"directory: {directory.title} ({directory.directory_id})")
         task = self._task_for_session(record.session_id)
@@ -2915,6 +2923,7 @@ class TelegramCommandHandler:
             adapter=candidate.adapter,
             project_dir=project_dir,
             title=options.get("title") or candidate.title,
+            project_id=project.project_id if project is not None else "",
             metadata={
                 "provider": candidate.provider,
                 "imported_by": "telegram",
