@@ -2459,7 +2459,22 @@ class TelegramCommandHandler:
         return "\n".join(lines)
 
     def _handoffs(self, rest: str, *, chat_id: int | None) -> str:
-        task, error = self._resolve_task_or_current(rest, chat_id=chat_id, usage="Usage: /handoffs [task]")
+        focus = self._resolve_focus_for_progress(rest, chat_id=chat_id)
+        if focus is not None:
+            entries = ProgressJournal(self.workspace).list(kind="handoff", focus_id=focus.focus_id, limit=5)
+            if not entries:
+                return f"No handoffs for focus: {focus.title}"
+            lines = [f"Handoffs: {focus.title}"]
+            self._append_progress_entries(lines, entries)
+            lines.append("")
+            lines.append("Use /context to see what will be injected into the next run.")
+            return "\n".join(lines)
+
+        task, error = self._resolve_task_or_current(
+            rest,
+            chat_id=chat_id,
+            usage="Usage: /handoffs [focus or legacy task]",
+        )
         if error:
             return error
         assert task is not None
@@ -2467,14 +2482,7 @@ class TelegramCommandHandler:
         if not entries:
             return f"No handoffs for task: {task.title}"
         lines = [f"Handoffs: {task.title}"]
-        for index, entry in enumerate(entries, 1):
-            lines.append(f"{index}. {_one_line(entry.summary, 220)}")
-            if entry.next_steps:
-                lines.append(f"   next: {_one_line(entry.next_steps[0], 220)}")
-            if entry.blockers:
-                lines.append(f"   blocker: {_one_line(entry.blockers[0], 220)}")
-            if entry.decisions:
-                lines.append(f"   decision: {_one_line(entry.decisions[0], 220)}")
+        self._append_progress_entries(lines, entries)
         lines.append("")
         lines.append("Use /context to see what will be injected into the next run.")
         return "\n".join(lines)
@@ -2483,6 +2491,39 @@ class TelegramCommandHandler:
         summary = rest.strip()
         if not summary:
             return "Usage: /review <manager review summary>"
+        focus = self._resolve_focus_for_progress("", chat_id=chat_id)
+        if focus is not None:
+            reviewer = "manager"
+            if chat_id is not None:
+                reviewer = self.chat_state.current_agent(chat_id) or focus.agent_id or reviewer
+            try:
+                entry = ProgressJournal(self.workspace).append(
+                    kind="manager-review",
+                    summary=summary,
+                    project_id=focus.project_id,
+                    focus_id=focus.focus_id,
+                    session_id=focus.session_id,
+                    agent_id=reviewer,
+                    metadata={"status": "noted", "reviewer": reviewer},
+                )
+            except ValueError as exc:
+                return str(exc)
+            FocusRegistry(self.workspace).add_note(focus.focus_id, format_review(entry), kind="manager-review")
+            if focus.session_id:
+                SessionStateStore(self.workspace).upsert_from_progress(
+                    entry,
+                    objective=focus.description or focus.title,
+                )
+            return "\n".join(
+                [
+                    f"Manager review recorded: {focus.title}",
+                    f"id: {entry.entry_id}",
+                    f"focus: {focus.focus_id}",
+                    "",
+                    "Use /reviews to inspect or /context to see the next-run context.",
+                ]
+            )
+
         task, error = self._resolve_task_or_current("", chat_id=chat_id, usage="Usage: /review <manager review summary>")
         if error:
             return error
@@ -2515,7 +2556,22 @@ class TelegramCommandHandler:
         )
 
     def _reviews(self, rest: str, *, chat_id: int | None) -> str:
-        task, error = self._resolve_task_or_current(rest, chat_id=chat_id, usage="Usage: /reviews [task]")
+        focus = self._resolve_focus_for_progress(rest, chat_id=chat_id)
+        if focus is not None:
+            entries = ProgressJournal(self.workspace).list(kind="manager-review", focus_id=focus.focus_id, limit=5)
+            if not entries:
+                return f"No manager reviews for focus: {focus.title}"
+            lines = [f"Manager reviews: {focus.title}"]
+            self._append_progress_entries(lines, entries, include_status=True)
+            lines.append("")
+            lines.append("Use /context to see what will be injected into the next run.")
+            return "\n".join(lines)
+
+        task, error = self._resolve_task_or_current(
+            rest,
+            chat_id=chat_id,
+            usage="Usage: /reviews [focus or legacy task]",
+        )
         if error:
             return error
         assert task is not None
@@ -2523,9 +2579,21 @@ class TelegramCommandHandler:
         if not entries:
             return f"No manager reviews for task: {task.title}"
         lines = [f"Manager reviews: {task.title}"]
+        self._append_progress_entries(lines, entries, include_status=True)
+        lines.append("")
+        lines.append("Use /context to see what will be injected into the next run.")
+        return "\n".join(lines)
+
+    def _append_progress_entries(
+        self,
+        lines: list[str],
+        entries: list,
+        *,
+        include_status: bool = False,
+    ) -> None:
         for index, entry in enumerate(entries, 1):
             status = str(entry.metadata.get("status") or "").strip()
-            prefix = f"{status}: " if status else ""
+            prefix = f"{status}: " if include_status and status else ""
             lines.append(f"{index}. {prefix}{_one_line(entry.summary, 220)}")
             if entry.next_steps:
                 lines.append(f"   next: {_one_line(entry.next_steps[0], 220)}")
@@ -2533,9 +2601,15 @@ class TelegramCommandHandler:
                 lines.append(f"   blocker: {_one_line(entry.blockers[0], 220)}")
             if entry.decisions:
                 lines.append(f"   decision: {_one_line(entry.decisions[0], 220)}")
-        lines.append("")
-        lines.append("Use /context to see what will be injected into the next run.")
-        return "\n".join(lines)
+
+    def _resolve_focus_for_progress(self, rest: str, *, chat_id: int | None) -> FocusRecord | None:
+        focus_ref = rest.strip()
+        if focus_ref:
+            return self._resolve_focus(focus_ref, chat_id=chat_id)
+        if chat_id is None:
+            return None
+        focus_id = self.chat_state.current_focus(chat_id)
+        return self._resolve_focus(focus_id) if focus_id else None
 
     def _resolve_task_or_current(
         self,
@@ -4643,9 +4717,9 @@ def _help_text() -> str:
             "/memory disable <memory #, id, title, or path>",
             "/memory enable <memory #, id, title, or path>",
             "/compact [--pin] [title]",
-            "/handoffs [task]",
+            "/handoffs [focus or legacy task]",
             "/review <manager review summary>",
-            "/reviews [task]",
+            "/reviews [focus or legacy task]",
             "/sessions [agent]",
             "/session <session_id or list #>",
             "/session use <session_id or list #>",

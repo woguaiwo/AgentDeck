@@ -327,9 +327,9 @@ Supported commands:
 /memory disable <memory #, id, title, or path>
 /memory enable <memory #, id, title, or path>
 /compact [--pin] [title]
-/handoffs [task]
+/handoffs [focus or legacy task]
 /review <manager review summary>
-/reviews [task]
+/reviews [focus or legacy task]
 /sessions [agent]
 /session <session_id or list #>
 /session use <session_id or list #>

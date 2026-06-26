@@ -1432,6 +1432,74 @@ class TelegramInterfaceTests(unittest.TestCase):
             missing = asyncio.run(handler.handle_text("/context missing-task", chat_id=42))[0]
             self.assertIn("No current focus", missing)
 
+    def test_focus_handoffs_and_reviews_use_current_focus(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            project_dir = tmp / "project"
+            project_dir.mkdir()
+            ProjectRegistry(workspace).upsert(project_id="proj", project_dir=project_dir)
+            AgentRegistry(workspace).upsert(agent_id="owner", project_id="proj", adapter="echo", project_dir=project_dir)
+            SessionRegistry(workspace).upsert_start(
+                session_id="session-focus-progress",
+                agent_id="owner",
+                adapter="echo",
+                project_dir=project_dir,
+                prompt="Work on focus progress.",
+                project_id="proj",
+            )
+            focus = FocusRegistry(workspace).create(
+                title="Focus progress",
+                description="Keep phone progress tied to focus.",
+                project_id="proj",
+                agent_id="owner",
+                directory=project_dir,
+                session_id="session-focus-progress",
+            )
+            ProgressJournal(workspace).append(
+                kind="handoff",
+                summary="Focus handoff is recorded",
+                project_id="proj",
+                focus_id=focus.focus_id,
+                session_id="session-focus-progress",
+                next_steps=["Show focus progress on Telegram"],
+            )
+            handler = TelegramCommandHandler(workspace)
+
+            selected = asyncio.run(handler.handle_text(f"/use focus {focus.focus_id}", chat_id=42))[0]
+            self.assertIn("Focus selected.", selected)
+
+            context = asyncio.run(handler.handle_text("/context", chat_id=42))[0]
+            self.assertIn("Focus progress", context)
+            self.assertIn("Focus handoff is recorded", context)
+
+            review = asyncio.run(handler.handle_text("/review Keep the focus path narrow", chat_id=42))[0]
+            self.assertIn("Manager review recorded: Focus progress", review)
+            self.assertIn(f"focus: {focus.focus_id}", review)
+
+            reviews = ProgressJournal(workspace).list(kind="manager-review", focus_id=focus.focus_id)
+            self.assertEqual(len(reviews), 1)
+            self.assertEqual(reviews[0].summary, "Keep the focus path narrow")
+            self.assertEqual(reviews[0].task_id, "")
+
+            card = SessionStateStore(workspace).get("session-focus-progress")
+            assert card is not None
+            self.assertEqual(card.focus_id, focus.focus_id)
+            self.assertEqual(card.current_state, "Keep the focus path narrow")
+
+            handoffs = asyncio.run(handler.handle_text("/handoffs", chat_id=42))[0]
+            self.assertIn("Handoffs: Focus progress", handoffs)
+            self.assertIn("Focus handoff is recorded", handoffs)
+            self.assertIn("next: Show focus progress on Telegram", handoffs)
+
+            listed_reviews = asyncio.run(handler.handle_text("/reviews", chat_id=42))[0]
+            self.assertIn("Manager reviews: Focus progress", listed_reviews)
+            self.assertIn("noted: Keep the focus path narrow", listed_reviews)
+
+            updated_context = asyncio.run(handler.handle_text("/context", chat_id=42))[0]
+            self.assertIn("Recent manager reviews:", updated_context)
+            self.assertIn("Keep the focus path narrow", updated_context)
+
     def test_project_state_and_decisions_are_visible_from_telegram(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
