@@ -9,6 +9,8 @@ from agentdeck.core.events import AgentEvent, EventKind
 from agentdeck.interfaces.web import build_dashboard_snapshot, build_web_response, handle_web_action, render_dashboard_html
 from agentdeck.storage.agents import AgentRegistry
 from agentdeck.storage.approvals import ApprovalRegistry
+from agentdeck.storage.directories import DirectoryRegistry
+from agentdeck.storage.focus import FocusRegistry
 from agentdeck.storage.jobs import JobRegistry
 from agentdeck.storage.projects import ProjectRegistry
 from agentdeck.storage.sessions import SessionRegistry
@@ -24,9 +26,13 @@ class WebInterfaceTests(unittest.TestCase):
             html = render_dashboard_html(snapshot)
 
             self.assertEqual(snapshot["counts"]["projects"], 1)
+            self.assertEqual(snapshot["counts"]["directories"], 2)
+            self.assertEqual(snapshot["counts"]["active_focus"], 1)
             self.assertEqual(snapshot["counts"]["active_tasks"], 1)
             self.assertEqual(snapshot["counts"]["pending_approvals"], 1)
             self.assertIn("Project One", html)
+            self.assertIn("Web focus", html)
+            self.assertIn("Directories", html)
             self.assertIn("Web task", html)
             self.assertIn("Run shell command?", html)
             self.assertIn("Archive Project", html)
@@ -53,8 +59,11 @@ class WebInterfaceTests(unittest.TestCase):
             self.assertEqual(missing_response.status, HTTPStatus.NOT_FOUND)
             self.assertTrue(health["ok"])
             self.assertEqual(overview["counts"]["projects"], 1)
+            self.assertEqual(overview["counts"]["directories"], 2)
+            self.assertEqual(overview["focus"][0]["title"], "Web focus")
             self.assertIn("AgentDeck", html)
             self.assertIn("Project One", html)
+            self.assertIn("Web focus", html)
             self.assertIn("Dashboard", task_html)
             self.assertIn("Web task", task_html)
 
@@ -111,7 +120,9 @@ def _sample_workspace(root: Path) -> Workspace:
     workspace = Workspace(root / ".agentdeck")
     workspace.ensure()
     project_dir = root / "project"
+    child_dir = project_dir / "src"
     project_dir.mkdir()
+    child_dir.mkdir()
     project = ProjectRegistry(workspace).upsert(
         project_id="proj",
         title="Project One",
@@ -125,6 +136,15 @@ def _sample_workspace(root: Path) -> Workspace:
         adapter="echo",
         project_dir=project_dir,
         replace=True,
+    )
+    DirectoryRegistry(workspace).upsert(path=child_dir, project_id=project.project_id, role="workspace")
+    FocusRegistry(workspace).create(
+        title="Web focus",
+        description="Make web console show session-directory-focus routing.",
+        project_id=project.project_id,
+        agent_id="owner",
+        directory=project_dir,
+        session_id="session-web",
     )
     task = TaskBoard(workspace).create(title="Web task", project_id=project.project_id, status="doing")
     task.task_id = "task-a"

@@ -27,6 +27,8 @@ from agentdeck.interfaces.telegram import AUTO_TASK_DONE_MARKER
 from agentdeck.storage.admin import AdminMutationError, delete_project, rename_global_id, restore_project
 from agentdeck.storage.agents import ASSISTANT_AGENT_ID, AgentRegistry
 from agentdeck.storage.approvals import ApprovalRegistry
+from agentdeck.storage.directories import DirectoryRegistry
+from agentdeck.storage.focus import FocusRegistry
 from agentdeck.storage.jobs import JobRegistry
 from agentdeck.storage.projects import ProjectRegistry
 from agentdeck.storage.sessions import SessionRegistry
@@ -46,6 +48,8 @@ DEFAULT_WEB_AUTO_PROMPT = (
 @dataclass(frozen=True)
 class DashboardLimits:
     projects: int = 12
+    directories: int = 12
+    focus: int = 18
     tasks: int = 18
     agents: int = 12
     sessions: int = 12
@@ -226,6 +230,8 @@ def build_dashboard_snapshot(workspace: Workspace, *, limits: DashboardLimits | 
 
     limits = limits or DashboardLimits()
     projects = ProjectRegistry(workspace).list()
+    directories = DirectoryRegistry(workspace).list()
+    focus_records = FocusRegistry(workspace).list()
     tasks = TaskBoard(workspace).list()
     agents = AgentRegistry(workspace).list()
     sessions = SessionRegistry(workspace).list()
@@ -242,6 +248,7 @@ def build_dashboard_snapshot(workspace: Workspace, *, limits: DashboardLimits | 
 
     pending_approvals = [approval for approval in approvals if approval.status == "pending"]
     active_jobs = [job for job in jobs if job.status in {"queued", "running", "cancel_requested"}]
+    active_focus = [focus for focus in focus_records if focus.status not in {"done"}]
     active_tasks = [task for task in tasks if task.status != "done"]
 
     auto_states = _read_web_auto_states(workspace)
@@ -253,6 +260,9 @@ def build_dashboard_snapshot(workspace: Workspace, *, limits: DashboardLimits | 
         "counts": {
             "projects": len(projects),
             "active_projects": len([project for project in projects if project.status == "active"]),
+            "directories": len(directories),
+            "focus": len(focus_records),
+            "active_focus": len(active_focus),
             "tasks": len(tasks),
             "active_tasks": len(active_tasks),
             "agents": len(agents),
@@ -263,7 +273,9 @@ def build_dashboard_snapshot(workspace: Workspace, *, limits: DashboardLimits | 
         },
         "task_counts": task_counts,
         "job_counts": job_counts,
-        "projects": [_project_summary(project, tasks) for project in projects[: limits.projects]],
+        "projects": [_project_summary(project, tasks, focus_records, directories) for project in projects[: limits.projects]],
+        "directories": [_directory_summary(directory) for directory in directories[: limits.directories]],
+        "focus": [_focus_summary(focus) for focus in focus_records[: limits.focus]],
         "tasks": [_task_summary(task, auto_states=auto_states) for task in tasks[: limits.tasks]],
         "agents": [_agent_summary(agent) for agent in agents[: limits.agents]],
         "sessions": [_session_summary(session) for session in sessions[: limits.sessions]],
@@ -465,7 +477,7 @@ def render_dashboard_html(snapshot: dict[str, Any], *, notice: str = "", error: 
             "<main>",
             '<section class="metrics" aria-label="Workspace summary">',
             _metric("Projects", counts.get("projects", 0), f"{counts.get('active_projects', 0)} active"),
-            _metric("Tasks", counts.get("active_tasks", 0), f"{counts.get('tasks', 0)} total"),
+            _metric("Focus", counts.get("active_focus", 0), f"{counts.get('focus', 0)} total"),
             _metric("Jobs", counts.get("active_jobs", 0), f"{counts.get('jobs', 0)} recent"),
             _metric("Approvals", counts.get("pending_approvals", 0), "pending"),
             "</section>",
@@ -477,6 +489,8 @@ def render_dashboard_html(snapshot: dict[str, Any], *, notice: str = "", error: 
             _actions_panel(),
             '<section class="board">',
             _panel("Projects", _project_cards(snapshot.get("projects", []))),
+            _panel("Directories", _directory_cards(snapshot.get("directories", []))),
+            _panel("Focus", _focus_cards(snapshot.get("focus", []))),
             _panel("Tasks", _task_cards(snapshot.get("tasks", []))),
             _panel("Agents", _agent_cards(snapshot.get("agents", []))),
             _panel("Sessions", _session_cards(snapshot.get("sessions", []))),
@@ -546,12 +560,36 @@ def render_task_detail_html(workspace: Workspace, task: dict[str, Any], *, notic
     )
 
 
-def _project_summary(project: Any, tasks: list[Any]) -> dict[str, Any]:
+def _project_summary(project: Any, tasks: list[Any], focus_records: list[Any], directories: list[Any]) -> dict[str, Any]:
     open_tasks = len([task for task in tasks if task.project_id == project.project_id and task.status != "done"])
+    open_focus = len(
+        [focus for focus in focus_records if focus.project_id == project.project_id and focus.status not in {"done"}]
+    )
+    directory_count = len([directory for directory in directories if directory.project_id == project.project_id])
     return {
         **project.to_dict(),
         "updated_at_text": _format_timestamp(project.updated_at),
         "open_tasks": open_tasks,
+        "open_focus": open_focus,
+        "directory_count": directory_count,
+    }
+
+
+def _directory_summary(directory: Any) -> dict[str, Any]:
+    return {
+        **directory.to_dict(),
+        "updated_at_text": _format_timestamp(directory.updated_at),
+    }
+
+
+def _focus_summary(focus: Any) -> dict[str, Any]:
+    latest_note = focus.notes[-1] if focus.notes else {}
+    return {
+        **focus.to_dict(),
+        "updated_at_text": _format_timestamp(focus.updated_at),
+        "description": _preview(focus.description, 220),
+        "latest_note": _preview(str(latest_note.get("text") or ""), 180),
+        "latest_note_kind": str(latest_note.get("kind") or ""),
     }
 
 
@@ -722,7 +760,8 @@ def _project_cards(records: list[dict[str, Any]]) -> str:
             meta=[
                 _badge(str(record.get("status") or "")),
                 f"id {record.get('project_id') or ''}",
-                f"open tasks {record.get('open_tasks') or 0}",
+                f"focus {record.get('open_focus') or 0}",
+                f"dirs {record.get('directory_count') or 0}",
             ],
             rows=[
                 ("team", record.get("team_id", "")),
@@ -749,6 +788,50 @@ def _project_action(record: dict[str, Any]) -> str:
         f'<input type="hidden" name="project_id" value="{project_id}">'
         '<button class="danger" type="submit">Archive Project</button>'
         "</form>"
+    )
+
+
+def _directory_cards(records: list[dict[str, Any]]) -> str:
+    if not records:
+        return _empty("No directories")
+    return "".join(
+        _card(
+            title=str(record.get("title") or record.get("directory_id") or ""),
+            meta=[
+                _badge(str(record.get("role") or "")),
+                f"id {record.get('directory_id') or ''}",
+                f"{record.get('status') or 'active'}",
+            ],
+            rows=[
+                ("project", record.get("project_id", "")),
+                ("parent", record.get("parent_directory_id", "")),
+                ("path", record.get("path", "")),
+            ],
+        )
+        for record in records
+    )
+
+
+def _focus_cards(records: list[dict[str, Any]]) -> str:
+    if not records:
+        return _empty("No focus records")
+    return "".join(
+        _card(
+            title=str(record.get("title") or record.get("focus_id") or ""),
+            meta=[
+                _badge(str(record.get("status") or "")),
+                f"id {record.get('focus_id') or ''}",
+            ],
+            rows=[
+                ("project", record.get("project_id", "")),
+                ("agent", record.get("agent_id", "")),
+                ("session", record.get("session_id", "")),
+                ("dir", record.get("directory", "")),
+                ("text", record.get("description", "")),
+                ("note", record.get("latest_note", "")),
+            ],
+        )
+        for record in records
     )
 
 

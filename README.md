@@ -213,10 +213,10 @@ By default it listens on `127.0.0.1:8765`:
 http://127.0.0.1:8765
 ```
 
-The Web console shows projects, tasks, agents, sessions, recent jobs, and
-pending approvals, plus JSON endpoints for future frontends. It still has more
-task-first UI than Telegram; the next UI pass should expose directories and
-focus records as first-class navigation objects.
+The Web console shows projects, directories, focus records, legacy tasks,
+agents, sessions, recent jobs, and pending approvals, plus JSON endpoints for
+future frontends. Its run and auto actions still keep legacy task compatibility,
+while read-only navigation now exposes the session-directory-focus model.
 
 ```text
 /
