@@ -187,6 +187,12 @@ async def run_agent_prompt(workspace: Workspace, request: RunRequest) -> RunServ
         refreshed_focus = focus_registry.resolve(focus.focus_id)
         if refreshed_focus is not None and refreshed_focus.session_id != result.session_id:
             focus_registry.attach_session(refreshed_focus.focus_id, result.session_id)
+        session_registry.set_current_focus(
+            result.session_id,
+            focus.focus_id,
+            focus_text=focus.description or focus.title,
+            actor=request.agent or "agentdeck",
+        )
         focus_registry.add_note(
             focus.focus_id,
             f"Ran prompt with agent {request.agent}; session_id: {result.session_id}",

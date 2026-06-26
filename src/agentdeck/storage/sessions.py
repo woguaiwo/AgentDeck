@@ -13,6 +13,10 @@ from agentdeck.core.config import Workspace
 from agentdeck.core.events import AgentEvent, EventKind
 
 
+CURRENT_FOCUS_METADATA_KEY = "current_focus_id"
+FOCUS_HISTORY_METADATA_KEY = "focus_history"
+
+
 @dataclass
 class SessionRecord:
     """Compact index of one AgentDeck session."""
@@ -160,6 +164,54 @@ class SessionRegistry:
         records[record.session_id] = record
         self._write(records)
         return record
+
+    def set_current_focus(
+        self,
+        session: str,
+        focus_id: str,
+        *,
+        focus_text: str = "",
+        actor: str = "system",
+    ) -> SessionRecord | None:
+        records = self._read()
+        record = self.resolve(session)
+        if record is None:
+            return None
+        previous = str(record.metadata.get(CURRENT_FOCUS_METADATA_KEY) or "")
+        clean_focus_id = focus_id.strip()
+        record.metadata[CURRENT_FOCUS_METADATA_KEY] = clean_focus_id
+        history = record.metadata.get(FOCUS_HISTORY_METADATA_KEY)
+        if not isinstance(history, list):
+            history = []
+        history.append(
+            {
+                "from": previous,
+                "to": clean_focus_id,
+                "text": _clean_multiline(focus_text),
+                "actor": _clean_title(actor) or "system",
+                "created_at": time.time(),
+            }
+        )
+        record.metadata[FOCUS_HISTORY_METADATA_KEY] = history[-50:]
+        record.updated_at = time.time()
+        records[record.session_id] = record
+        self._write(records)
+        return record
+
+    def current_focus_id(self, session: str) -> str:
+        record = self.resolve(session)
+        if record is None:
+            return ""
+        return str(record.metadata.get(CURRENT_FOCUS_METADATA_KEY) or "")
+
+    def focus_history(self, session: str, *, limit: int = 10) -> list[dict[str, Any]]:
+        record = self.resolve(session)
+        if record is None:
+            return []
+        history = record.metadata.get(FOCUS_HISTORY_METADATA_KEY)
+        if not isinstance(history, list):
+            return []
+        return [dict(item) for item in history[-max(limit, 0) :] if isinstance(item, dict)]
 
     def import_provider_session(
         self,
@@ -325,6 +377,11 @@ def _title_from_prompt(prompt: str, *, max_chars: int = 72) -> str:
 
 def _clean_title(value: str) -> str:
     return " ".join(value.strip().split())
+
+
+def _clean_multiline(value: str) -> str:
+    lines = [" ".join(line.strip().split()) for line in str(value).splitlines()]
+    return "\n".join(line for line in lines if line)
 
 
 def _import_session_id(adapter: str, provider_session_id: str) -> str:

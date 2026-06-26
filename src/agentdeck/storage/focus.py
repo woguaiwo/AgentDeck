@@ -170,6 +170,19 @@ class FocusRegistry:
         self._write(records)
         return record
 
+    def set_text(self, focus: str, text: str, *, note: str = "") -> FocusRecord | None:
+        records = self._read()
+        record = self.resolve(focus)
+        if record is None:
+            return None
+        record.description = _clean_multiline(text)
+        if note:
+            _append_note(record, note, kind="focus-text")
+        record.updated_at = time.time()
+        records[record.focus_id] = record
+        self._write(records)
+        return record
+
     def attach_session(self, focus: str, session_id: str) -> FocusRecord | None:
         records = self._read()
         record = self.resolve(focus)
@@ -244,6 +257,11 @@ def _maybe_normalize_id(value: str) -> str:
 
 def _clean_text(value: str) -> str:
     return " ".join(value.strip().split())
+
+
+def _clean_multiline(value: str) -> str:
+    lines = [" ".join(line.strip().split()) for line in str(value).splitlines()]
+    return "\n".join(line for line in lines if line)
 
 
 def _clean_note_text(value: str) -> str:

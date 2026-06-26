@@ -8,6 +8,7 @@ from agentdeck.core.run_service import build_agentdeck_context
 from agentdeck.storage.focus import FocusRegistry
 from agentdeck.storage.memory import MarkdownMemoryStore
 from agentdeck.storage.projects import ProjectRegistry
+from agentdeck.storage.sessions import SessionRegistry
 from agentdeck.storage.telegram_bots import TelegramBotRegistry, current_server_id, redacted_token
 
 
@@ -213,6 +214,38 @@ Server: Minsys
             self.assertIn("Explore model handoff", context)
             self.assertIn(str(project_dir.resolve()), context)
             self.assertIn("Keep the session-first design.", context)
+
+    def test_session_tracks_current_focus_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            project_dir = tmp / "project"
+            project_dir.mkdir()
+            SessionRegistry(workspace).upsert_start(
+                session_id="session-a",
+                agent_id="owner",
+                adapter="echo",
+                project_dir=project_dir,
+                prompt="start",
+            )
+            focus = FocusRegistry(workspace).create(
+                title="Study adapter migration",
+                description="Compare direct provider session import with context-pack migration.",
+                agent_id="owner",
+                directory=project_dir,
+            )
+
+            record = SessionRegistry(workspace).set_current_focus(
+                "session-a",
+                focus.focus_id,
+                focus_text=focus.description,
+                actor="test",
+            )
+            assert record is not None
+            self.assertEqual(SessionRegistry(workspace).current_focus_id("session-a"), focus.focus_id)
+            history = SessionRegistry(workspace).focus_history("session-a")
+            self.assertEqual(history[-1]["to"], focus.focus_id)
+            self.assertIn("context-pack migration", history[-1]["text"])
 
 
 if __name__ == "__main__":

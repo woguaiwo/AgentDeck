@@ -297,6 +297,9 @@ def build_parser() -> argparse.ArgumentParser:
     focus_note = focus_sub.add_parser("note", help="Append a focus note")
     focus_note.add_argument("focus")
     focus_note.add_argument("note")
+    focus_set = focus_sub.add_parser("set", help="Replace the focus paragraph text")
+    focus_set.add_argument("focus")
+    focus_set.add_argument("text")
     focus_status = focus_sub.add_parser("status", help="Set focus status")
     focus_status.add_argument("focus")
     focus_status.add_argument("status", choices=sorted(FOCUS_STATUSES))
@@ -816,6 +819,8 @@ def main(argv: list[str] | None = None) -> int:
             return _print_focus_context(workspace, registry, args.focus)
         if args.focus_command == "note":
             return _update_focus_note(registry, args.focus, args.note)
+        if args.focus_command == "set":
+            return _set_focus_text(workspace, registry, args.focus, args.text)
         if args.focus_command == "status":
             return _update_focus_status(registry, args.focus, args.status, note=args.note or "")
         if args.focus_command == "attach-session":
@@ -823,6 +828,12 @@ def main(argv: list[str] | None = None) -> int:
             if record is None:
                 print(f"focus not found: {args.focus}", file=sys.stderr)
                 return 2
+            SessionRegistry(workspace).set_current_focus(
+                args.session,
+                record.focus_id,
+                focus_text=record.description or record.title,
+                actor="cli",
+            )
             print(f"focus: {record.title} ({record.focus_id}) session={record.session_id}")
             return 0
 
@@ -1793,6 +1804,23 @@ def _update_focus_note(registry: FocusRegistry, focus: str, note: str) -> int:
         print(f"focus not found: {focus}", file=sys.stderr)
         return 2
     print(f"focus: {record.title} ({record.focus_id}) notes={len(record.notes)}")
+    return 0
+
+
+def _set_focus_text(workspace: Workspace, registry: FocusRegistry, focus: str, text: str) -> int:
+    record = registry.set_text(focus, text, note="Focus text updated from CLI.")
+    if record is None:
+        print(f"focus not found: {focus}", file=sys.stderr)
+        return 2
+    if record.session_id:
+        SessionRegistry(workspace).set_current_focus(
+            record.session_id,
+            record.focus_id,
+            focus_text=record.description,
+            actor="cli",
+        )
+    print(f"focus: {record.title} ({record.focus_id})")
+    print(f"text: {record.description}")
     return 0
 
 
