@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from agentdeck.core.config import Workspace
+from agentdeck.storage.directories import DirectoryRegistry
 
 
 ROLE_TEMPLATE_METADATA_KEY = "role_template"
@@ -158,6 +159,14 @@ class AgentRegistry:
             updated_at=now,
             metadata=dict(existing.metadata) if existing is not None else {},
         )
+        directory = DirectoryRegistry(self.workspace).upsert(
+            path=record.project_dir,
+            project_id=record.project_id,
+            title=Path(record.project_dir).name or record.title,
+            role="agent-workdir",
+            metadata={"source": "agent", "agent_id": record.agent_id},
+        )
+        record.metadata["directory_id"] = directory.directory_id
         records[agent_id] = record
         self._write(records)
         return record

@@ -9,6 +9,7 @@ from pathlib import Path
 from agentdeck.cli import main
 from agentdeck.core.config import Workspace
 from agentdeck.storage.agents import AgentRegistry, role_template_for_agent
+from agentdeck.storage.directories import DirectoryRegistry
 from agentdeck.storage.sessions import SessionRegistry
 from agentdeck.storage.telegram_bots import TelegramBotRegistry, assistant_agent_id_for_bot
 
@@ -36,6 +37,10 @@ class AgentRegistryTests(unittest.TestCase):
             self.assertEqual(registry.resolve("Motion-X Owner").agent_id, "motion-x-owner")
             self.assertEqual(registry.list(team_id="motion-x")[0].title, "Motion-X Owner")
             self.assertIn("Coordinate the current task", role_template_for_agent(record))
+            directory = DirectoryRegistry(workspace).resolve(tmpdir)
+            assert directory is not None
+            self.assertEqual(record.metadata["directory_id"], directory.directory_id)
+            self.assertEqual(directory.metadata["agent_id"], "motion-x-owner")
 
     def test_cli_agents_create_list_show_and_run_resume_latest(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

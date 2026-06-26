@@ -168,6 +168,44 @@ class ProjectTaskBoardTests(unittest.TestCase):
             self.assertEqual(shown_project["project_id"], "motionx")
             self.assertEqual(shown_project["project_dir"], str(project_dir.resolve()))
 
+            module_dir = project_dir / "module"
+            module_dir.mkdir()
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(
+                    [
+                        "--workspace",
+                        str(workspace.root),
+                        "directories",
+                        "add",
+                        str(module_dir),
+                        "--project",
+                        "motionx",
+                        "--parent",
+                        str(project_dir),
+                        "--role",
+                        "module",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertIn("directory:", stdout.getvalue())
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--workspace", str(workspace.root), "directories", "list", "--project", "motionx"])
+            self.assertEqual(code, 0)
+            listed_dirs = stdout.getvalue()
+            self.assertIn(str(project_dir.resolve()), listed_dirs)
+            self.assertIn(str(module_dir.resolve()), listed_dirs)
+            directory_id = re.search(r"(dir-\S+)", listed_dirs).group(1)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--workspace", str(workspace.root), "directories", "show", directory_id])
+            self.assertEqual(code, 0)
+            shown_directory = json.loads(stdout.getvalue())
+            self.assertEqual(shown_directory["project_id"], "motionx")
+
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
                 code = main(

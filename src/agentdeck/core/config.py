@@ -78,6 +78,10 @@ class Workspace:
         return self.root / "projects"
 
     @property
+    def directories_dir(self) -> Path:
+        return self.root / "directories"
+
+    @property
     def approvals_dir(self) -> Path:
         return self.root / "approvals"
 
@@ -124,6 +128,7 @@ class Workspace:
             self.sessions_dir,
             self.agents_dir,
             self.projects_dir,
+            self.directories_dir,
             self.approvals_dir,
             self.jobs_dir,
             self.journal_dir,
@@ -153,6 +158,7 @@ class Workspace:
             "sessions": str(self.sessions_dir),
             "agents": str(self.agents_dir),
             "projects": str(self.projects_dir),
+            "directories": str(self.directories_dir),
             "approvals": str(self.approvals_dir),
             "jobs": str(self.jobs_dir),
             "journal": str(self.journal_dir),

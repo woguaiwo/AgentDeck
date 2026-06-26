@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from agentdeck.core.config import Workspace
+from agentdeck.storage.directories import DirectoryRegistry
 
 
 @dataclass
@@ -85,7 +86,14 @@ class ProjectRegistry:
         )
         records[project_id] = record
         self._write(records)
-        return record
+        DirectoryRegistry(self.workspace).upsert(
+            path=record.project_dir,
+            project_id=record.project_id,
+            title=record.title,
+            role="primary",
+            metadata={"source": "project"},
+        )
+        return self.add_directory(record.project_id, record.project_dir) or record
 
     def get(self, project_id: str) -> ProjectRecord | None:
         return self._read().get(_maybe_normalize_id(project_id))
@@ -118,6 +126,17 @@ class ProjectRegistry:
         if resolved not in directories:
             directories.append(resolved)
         record.metadata["directories"] = directories
+        directory = DirectoryRegistry(self.workspace).upsert(
+            path=resolved,
+            project_id=record.project_id,
+            title=Path(resolved).name or record.title,
+            role="workspace",
+            metadata={"source": "project-directory"},
+        )
+        record.metadata.setdefault("directory_ids", [])
+        directory_ids = record.metadata["directory_ids"]
+        if isinstance(directory_ids, list) and directory.directory_id not in directory_ids:
+            directory_ids.append(directory.directory_id)
         if not record.project_dir:
             record.project_dir = resolved
         record.updated_at = time.time()

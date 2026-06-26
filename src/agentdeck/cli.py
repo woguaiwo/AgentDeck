@@ -21,6 +21,7 @@ from agentdeck.storage.approvals import APPROVAL_STATUSES, ApprovalRecord, Appro
 from agentdeck.storage.event_log import EventLog
 from agentdeck.storage.errors import ErrorIncidentStore
 from agentdeck.storage.agents import ASSISTANT_AGENT_ID, DEFAULT_ASSISTANT_TEMPLATE, AgentRecord, AgentRegistry
+from agentdeck.storage.directories import DirectoryRecord, DirectoryRegistry
 from agentdeck.storage.focus import FOCUS_STATUSES, FocusRecord, FocusRegistry
 from agentdeck.storage.jobs import JobRecord, JobRegistry
 from agentdeck.storage.memory import MarkdownMemoryStore
@@ -274,6 +275,21 @@ def build_parser() -> argparse.ArgumentParser:
     project_remove_dir = project_sub.add_parser("remove-dir", help="Remove a directory from one project")
     project_remove_dir.add_argument("project")
     project_remove_dir.add_argument("directory")
+
+    directories = sub.add_parser("directories", help="Manage directory registry")
+    directory_sub = directories.add_subparsers(dest="directories_command", required=True)
+    directory_list = directory_sub.add_parser("list", help="List managed directories")
+    directory_list.add_argument("--project")
+    directory_list.add_argument("--status")
+    directory_add = directory_sub.add_parser("add", help="Add or update one managed directory")
+    directory_add.add_argument("path")
+    directory_add.add_argument("--project")
+    directory_add.add_argument("--title", default="")
+    directory_add.add_argument("--parent", default="")
+    directory_add.add_argument("--role", default="workspace")
+    directory_add.add_argument("--status", default="active")
+    directory_show = directory_sub.add_parser("show", help="Show one directory as JSON")
+    directory_show.add_argument("directory")
 
     focus = sub.add_parser("focus", help="Manage session-first focus records")
     focus_sub = focus.add_subparsers(dest="focus_command", required=True)
@@ -772,6 +788,45 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             print(f"project: {record.title} ({record.project_id})")
             print(f"directories: {len(record.metadata.get('directories') or [])}")
+            return 0
+
+    if args.command == "directories":
+        workspace.ensure()
+        registry = DirectoryRegistry(workspace)
+        if args.directories_command == "list":
+            _print_directories(registry.list(project_id=args.project, status=args.status))
+            return 0
+        if args.directories_command == "add":
+            project = ProjectRegistry(workspace).resolve(args.project) if args.project else None
+            if args.project and project is None:
+                print(f"project not found: {args.project}", file=sys.stderr)
+                return 2
+            parent_id = ""
+            if args.parent:
+                parent = registry.resolve(args.parent)
+                if parent is None:
+                    parent = registry.upsert(path=args.parent, project_id=project.project_id if project else "")
+                parent_id = parent.directory_id
+            record = registry.upsert(
+                path=args.path,
+                project_id=project.project_id if project is not None else (args.project or ""),
+                title=args.title,
+                parent=args.parent,
+                role=args.role,
+                status=args.status,
+                metadata={"source": "cli", "parent_directory_id": parent_id} if parent_id else {"source": "cli"},
+            )
+            if project is not None:
+                ProjectRegistry(workspace).add_directory(project.project_id, record.path)
+            print(f"directory: {record.title} ({record.directory_id})")
+            print(f"path: {record.path}")
+            return 0
+        if args.directories_command == "show":
+            record = registry.resolve(args.directory)
+            if record is None:
+                print(f"directory not found: {args.directory}", file=sys.stderr)
+                return 2
+            print(json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
             return 0
 
     if args.command == "focus":
@@ -1422,6 +1477,27 @@ def _print_projects(records: list[ProjectRecord]) -> None:
                     record.status,
                     str(len(record.metadata.get("directories") or ([record.project_dir] if record.project_dir else []))),
                     record.project_dir,
+                ]
+            )
+        )
+
+
+def _print_directories(records: list[DirectoryRecord]) -> None:
+    if not records:
+        print("no directories")
+        return
+    print("title\tdirectory_id\tproject\trole\tstatus\tparent\tpath")
+    for record in records:
+        print(
+            "\t".join(
+                [
+                    record.title,
+                    record.directory_id,
+                    record.project_id or "-",
+                    record.role,
+                    record.status,
+                    record.parent_directory_id or "-",
+                    record.path,
                 ]
             )
         )

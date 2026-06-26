@@ -5,6 +5,7 @@ from pathlib import Path
 
 from agentdeck.core.config import Workspace, default_workspace_root, find_project_local_config, project_local_config_path
 from agentdeck.core.run_service import build_agentdeck_context
+from agentdeck.storage.directories import DirectoryRegistry
 from agentdeck.storage.focus import FocusRegistry
 from agentdeck.storage.memory import MarkdownMemoryStore
 from agentdeck.storage.projects import ProjectRegistry
@@ -56,6 +57,7 @@ class CoreStorageTests(unittest.TestCase):
             self.assertTrue(workspace.config_path.exists())
             self.assertTrue(workspace.agents_dir.is_dir())
             self.assertTrue(workspace.projects_dir.is_dir())
+            self.assertTrue(workspace.directories_dir.is_dir())
             self.assertTrue(workspace.approvals_dir.is_dir())
             self.assertTrue(workspace.journal_dir.is_dir())
             self.assertTrue(workspace.session_state_dir.is_dir())
@@ -214,6 +216,33 @@ Server: Minsys
             self.assertIn("Explore model handoff", context)
             self.assertIn(str(project_dir.resolve()), context)
             self.assertIn("Keep the session-first design.", context)
+
+    def test_directory_registry_tracks_project_paths_and_hierarchy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            project_dir = tmp / "project"
+            child_dir = project_dir / "src"
+            child_dir.mkdir(parents=True)
+
+            project = ProjectRegistry(workspace).upsert(project_id="proj", title="Project", project_dir=project_dir)
+            child = DirectoryRegistry(workspace).upsert(
+                path=child_dir,
+                project_id=project.project_id,
+                parent=project_dir,
+                role="module",
+            )
+            ProjectRegistry(workspace).add_directory(project.project_id, child_dir)
+
+            records = DirectoryRegistry(workspace).list(project_id="proj")
+            paths = {record.path for record in records}
+            self.assertIn(str(project_dir.resolve()), paths)
+            self.assertIn(str(child_dir.resolve()), paths)
+            self.assertEqual(DirectoryRegistry(workspace).resolve(child.directory_id).path, str(child_dir.resolve()))
+
+            refreshed = ProjectRegistry(workspace).get("proj")
+            assert refreshed is not None
+            self.assertIn(str(child_dir.resolve()), refreshed.metadata["directories"])
 
     def test_session_tracks_current_focus_history(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
