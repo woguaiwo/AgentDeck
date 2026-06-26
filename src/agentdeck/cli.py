@@ -21,6 +21,7 @@ from agentdeck.storage.approvals import APPROVAL_STATUSES, ApprovalRecord, Appro
 from agentdeck.storage.event_log import EventLog
 from agentdeck.storage.errors import ErrorIncidentStore
 from agentdeck.storage.agents import ASSISTANT_AGENT_ID, DEFAULT_ASSISTANT_TEMPLATE, AgentRecord, AgentRegistry
+from agentdeck.storage.focus import FOCUS_STATUSES, FocusRecord, FocusRegistry
 from agentdeck.storage.jobs import JobRecord, JobRegistry
 from agentdeck.storage.memory import MarkdownMemoryStore
 from agentdeck.storage.progress import ProgressJournal, format_handoff, format_review
@@ -58,6 +59,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--adapter", choices=["echo", "codex", "codex-exec", "kimi", "kimi-print"])
     run.add_argument("--project", help="Project id or title")
     run.add_argument("--task", help="Task id or title")
+    run.add_argument("--focus", help="Focus id or title")
     run.add_argument("--agent")
     run.add_argument("--session", help="Resume an AgentDeck session id, agent id, or provider session id")
     run.add_argument("--title", help="Human-readable title for a new or resumed AgentDeck session")
@@ -193,6 +195,7 @@ def build_parser() -> argparse.ArgumentParser:
     sess_import.add_argument("--provider-session", required=True, help="Codex thread id or Kimi session id")
     sess_import.add_argument("--project", help="Project id or title")
     sess_import.add_argument("--task", help="Optional task id or title to attach to the imported session")
+    sess_import.add_argument("--focus", help="Optional focus id or title to attach to the imported session")
     sess_import.add_argument("--agent", help="Agent id")
     sess_import.add_argument("--adapter", choices=["codex", "codex-exec", "kimi", "kimi-print"])
     sess_import.add_argument("--cwd", help="Provider working directory")
@@ -265,6 +268,42 @@ def build_parser() -> argparse.ArgumentParser:
     project_decisions = project_sub.add_parser("decisions", help="List recent project decisions")
     project_decisions.add_argument("project")
     project_decisions.add_argument("--limit", type=int, default=10)
+    project_add_dir = project_sub.add_parser("add-dir", help="Add a directory to one project")
+    project_add_dir.add_argument("project")
+    project_add_dir.add_argument("directory")
+    project_remove_dir = project_sub.add_parser("remove-dir", help="Remove a directory from one project")
+    project_remove_dir.add_argument("project")
+    project_remove_dir.add_argument("directory")
+
+    focus = sub.add_parser("focus", help="Manage session-first focus records")
+    focus_sub = focus.add_subparsers(dest="focus_command", required=True)
+    focus_create = focus_sub.add_parser("create", help="Create a focus")
+    focus_create.add_argument("title")
+    focus_create.add_argument("--description", default="")
+    focus_create.add_argument("--project")
+    focus_create.add_argument("--agent")
+    focus_create.add_argument("--cwd", help="Directory this focus runs in; defaults to agent or project directory")
+    focus_create.add_argument("--session", help="Existing AgentDeck session id")
+    focus_create.add_argument("--status", default="active", choices=sorted(FOCUS_STATUSES))
+    focus_list = focus_sub.add_parser("list", help="List focus records")
+    focus_list.add_argument("--project")
+    focus_list.add_argument("--agent")
+    focus_list.add_argument("--cwd")
+    focus_list.add_argument("--status", choices=sorted(FOCUS_STATUSES))
+    focus_show = focus_sub.add_parser("show", help="Show one focus as JSON")
+    focus_show.add_argument("focus")
+    focus_context = focus_sub.add_parser("context", help="Show the AgentDeck context injected for one focus")
+    focus_context.add_argument("focus")
+    focus_note = focus_sub.add_parser("note", help="Append a focus note")
+    focus_note.add_argument("focus")
+    focus_note.add_argument("note")
+    focus_status = focus_sub.add_parser("status", help="Set focus status")
+    focus_status.add_argument("focus")
+    focus_status.add_argument("status", choices=sorted(FOCUS_STATUSES))
+    focus_status.add_argument("note", nargs="?")
+    focus_attach = focus_sub.add_parser("attach-session", help="Attach a session to a focus")
+    focus_attach.add_argument("focus")
+    focus_attach.add_argument("session")
 
     tasks = sub.add_parser("tasks", help="Manage task board")
     task_sub = tasks.add_subparsers(dest="tasks_command", required=True)
@@ -413,6 +452,7 @@ async def _run_prompt(args: argparse.Namespace, workspace: Workspace) -> int:
         adapter=args.adapter,
         project=args.project,
         task=args.task,
+        focus=args.focus,
         agent=args.agent,
         session=args.session,
         title=args.title,
@@ -621,6 +661,11 @@ def main(argv: list[str] | None = None) -> int:
                 if task is None:
                     print(f"task not found: {args.task}", file=sys.stderr)
                     return 2
+            if args.focus:
+                focus = FocusRegistry(workspace).attach_session(args.focus, record.session_id)
+                if focus is None:
+                    print(f"focus not found: {args.focus}", file=sys.stderr)
+                    return 2
             print(f"imported: {record.title} ({record.session_id})")
             print(f"provider_session_id: {record.provider_session_id}")
             return 0
@@ -688,6 +733,7 @@ def main(argv: list[str] | None = None) -> int:
             except ValueError as exc:
                 print(str(exc), file=sys.stderr)
                 return 2
+            ProjectRegistry(workspace).add_directory(record.project_id, record.project_dir)
             print(f"project: {record.title} ({record.project_id})")
             return 0
         if args.projects_command == "list":
@@ -708,6 +754,77 @@ def main(argv: list[str] | None = None) -> int:
             return _record_project_decision(workspace, registry, args)
         if args.projects_command == "decisions":
             return _print_project_decisions(workspace, registry, args.project, limit=args.limit)
+        if args.projects_command == "add-dir":
+            record = registry.add_directory(args.project, args.directory)
+            if record is None:
+                print(f"project not found: {args.project}", file=sys.stderr)
+                return 2
+            print(f"project: {record.title} ({record.project_id})")
+            print(f"directories: {len(record.metadata.get('directories') or [])}")
+            return 0
+        if args.projects_command == "remove-dir":
+            record = registry.remove_directory(args.project, args.directory)
+            if record is None:
+                print(f"project not found: {args.project}", file=sys.stderr)
+                return 2
+            print(f"project: {record.title} ({record.project_id})")
+            print(f"directories: {len(record.metadata.get('directories') or [])}")
+            return 0
+
+    if args.command == "focus":
+        workspace.ensure()
+        registry = FocusRegistry(workspace)
+        if args.focus_command == "create":
+            project = ProjectRegistry(workspace).resolve(args.project) if args.project else None
+            if args.project and project is None:
+                print(f"project not found: {args.project}", file=sys.stderr)
+                return 2
+            agent = AgentRegistry(workspace).resolve(args.agent) if args.agent else None
+            if args.agent and agent is None:
+                print(f"agent not found: {args.agent}", file=sys.stderr)
+                return 2
+            directory = args.cwd or (agent.project_dir if agent is not None else "") or (
+                project.project_dir if project is not None else "."
+            )
+            try:
+                record = registry.create(
+                    title=args.title,
+                    description=args.description,
+                    project_id=project.project_id if project is not None else (args.project or ""),
+                    agent_id=agent.agent_id if agent is not None else (args.agent or ""),
+                    directory=directory,
+                    session_id=args.session or "",
+                    status=args.status,
+                )
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
+            print(f"focus: {record.title} ({record.focus_id})")
+            print(f"directory: {record.directory or '-'}")
+            return 0
+        if args.focus_command == "list":
+            _print_focus(registry.list(project_id=args.project, agent_id=args.agent, directory=args.cwd, status=args.status))
+            return 0
+        if args.focus_command == "show":
+            record = registry.resolve(args.focus)
+            if record is None:
+                print(f"focus not found: {args.focus}", file=sys.stderr)
+                return 2
+            print(json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+        if args.focus_command == "context":
+            return _print_focus_context(workspace, registry, args.focus)
+        if args.focus_command == "note":
+            return _update_focus_note(registry, args.focus, args.note)
+        if args.focus_command == "status":
+            return _update_focus_status(registry, args.focus, args.status, note=args.note or "")
+        if args.focus_command == "attach-session":
+            record = registry.attach_session(args.focus, args.session)
+            if record is None:
+                print(f"focus not found: {args.focus}", file=sys.stderr)
+                return 2
+            print(f"focus: {record.title} ({record.focus_id}) session={record.session_id}")
+            return 0
 
     if args.command == "tasks":
         workspace.ensure()
@@ -1282,7 +1399,7 @@ def _print_projects(records: list[ProjectRecord]) -> None:
     if not records:
         print("no projects")
         return
-    print("title\tproject_id\tteam\tdefault_agent\tstatus\tproject_dir")
+    print("title\tproject_id\tteam\tdefault_agent\tstatus\tdirs\tprimary_dir")
     for record in records:
         print(
             "\t".join(
@@ -1292,6 +1409,7 @@ def _print_projects(records: list[ProjectRecord]) -> None:
                     record.team_id,
                     record.default_agent_id,
                     record.status,
+                    str(len(record.metadata.get("directories") or ([record.project_dir] if record.project_dir else []))),
                     record.project_dir,
                 ]
             )
@@ -1415,6 +1533,27 @@ def _print_tasks(records: list[TaskRecord]) -> None:
                     record.project_id or "-",
                     record.agent_id,
                     record.session_id or "-",
+                ]
+            )
+        )
+
+
+def _print_focus(records: list[FocusRecord]) -> None:
+    if not records:
+        print("no focus")
+        return
+    print("title\tfocus_id\tstatus\tproject\tagent\tsession\tdirectory")
+    for record in records:
+        print(
+            "\t".join(
+                [
+                    record.title,
+                    record.focus_id,
+                    record.status,
+                    record.project_id or "-",
+                    record.agent_id or "-",
+                    record.session_id or "-",
+                    record.directory or "-",
                 ]
             )
         )
@@ -1635,6 +1774,28 @@ def _update_task_note(board: TaskBoard, task: str, note: str) -> int:
     return 0
 
 
+def _update_focus_status(registry: FocusRegistry, focus: str, status: str, *, note: str = "") -> int:
+    try:
+        record = registry.set_status(focus, status, note=note)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if record is None:
+        print(f"focus not found: {focus}", file=sys.stderr)
+        return 2
+    print(f"focus: {record.title} ({record.focus_id}) status={record.status}")
+    return 0
+
+
+def _update_focus_note(registry: FocusRegistry, focus: str, note: str) -> int:
+    record = registry.add_note(focus, note)
+    if record is None:
+        print(f"focus not found: {focus}", file=sys.stderr)
+        return 2
+    print(f"focus: {record.title} ({record.focus_id}) notes={len(record.notes)}")
+    return 0
+
+
 def _print_task_context(workspace: Workspace, board: TaskBoard, task: str, *, session_id: str = "") -> int:
     record = board.resolve(task)
     if record is None:
@@ -1648,6 +1809,25 @@ def _print_task_context(workspace: Workspace, board: TaskBoard, task: str, *, se
     )
     if not context:
         print(f"no AgentDeck context for task: {record.title} ({record.task_id})")
+        return 0
+    print(context)
+    return 0
+
+
+def _print_focus_context(workspace: Workspace, registry: FocusRegistry, focus: str) -> int:
+    record = registry.resolve(focus)
+    if record is None:
+        print(f"focus not found: {focus}", file=sys.stderr)
+        return 2
+    context = build_agentdeck_context(
+        workspace,
+        task=None,
+        focus=record,
+        session_id=record.session_id,
+        max_chars=8000,
+    )
+    if not context:
+        print(f"no AgentDeck context for focus: {record.title} ({record.focus_id})")
         return 0
     print(context)
     return 0

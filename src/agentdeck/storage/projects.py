@@ -108,6 +108,36 @@ class ProjectRegistry:
             records = [record for record in records if record.status == status]
         return sorted(records, key=lambda item: item.project_id)
 
+    def add_directory(self, project: str, directory: str | Path) -> ProjectRecord | None:
+        records = self._read()
+        record = self.resolve(project)
+        if record is None:
+            return None
+        directories = _project_directories(record)
+        resolved = str(Path(directory).expanduser().resolve())
+        if resolved not in directories:
+            directories.append(resolved)
+        record.metadata["directories"] = directories
+        if not record.project_dir:
+            record.project_dir = resolved
+        record.updated_at = time.time()
+        records[record.project_id] = record
+        self._write(records)
+        return record
+
+    def remove_directory(self, project: str, directory: str | Path) -> ProjectRecord | None:
+        records = self._read()
+        record = self.resolve(project)
+        if record is None:
+            return None
+        resolved = str(Path(directory).expanduser().resolve())
+        directories = [item for item in _project_directories(record) if item != resolved]
+        record.metadata["directories"] = directories
+        record.updated_at = time.time()
+        records[record.project_id] = record
+        self._write(records)
+        return record
+
     def _read(self) -> dict[str, ProjectRecord]:
         if not self.path.exists():
             return {}
@@ -164,3 +194,11 @@ def _title_from_id(value: str) -> str:
 
 def _clean_title(value: str) -> str:
     return " ".join(value.strip().split())
+
+
+def _project_directories(record: ProjectRecord) -> list[str]:
+    raw = record.metadata.get("directories")
+    directories = [str(item) for item in raw if str(item).strip()] if isinstance(raw, list) else []
+    if record.project_dir and record.project_dir not in directories:
+        directories.insert(0, record.project_dir)
+    return directories

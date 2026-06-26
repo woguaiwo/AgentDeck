@@ -4,7 +4,10 @@ import unittest
 from pathlib import Path
 
 from agentdeck.core.config import Workspace, default_workspace_root, find_project_local_config, project_local_config_path
+from agentdeck.core.run_service import build_agentdeck_context
+from agentdeck.storage.focus import FocusRegistry
 from agentdeck.storage.memory import MarkdownMemoryStore
+from agentdeck.storage.projects import ProjectRegistry
 from agentdeck.storage.telegram_bots import TelegramBotRegistry, current_server_id, redacted_token
 
 
@@ -58,6 +61,7 @@ class CoreStorageTests(unittest.TestCase):
             self.assertTrue(workspace.project_state_dir.is_dir())
             self.assertTrue(workspace.errors_dir.is_dir())
             self.assertTrue(workspace.board_dir.is_dir())
+            self.assertTrue(workspace.focus_dir.is_dir())
             self.assertTrue((workspace.memory_dir / "user").is_dir())
             self.assertTrue((workspace.memory_dir / "projects").is_dir())
             self.assertTrue((workspace.memory_dir / "teams").is_dir())
@@ -179,6 +183,36 @@ Server: Minsys
             self.assertEqual(record.server_id, current_server_id())
             self.assertEqual(record.metadata["source_server"], "Minsys")
             self.assertIsNone(registry.get("bot-1"))
+
+    def test_focus_registry_tracks_directory_session_and_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            project_dir = tmp / "project"
+            project_dir.mkdir()
+            project = ProjectRegistry(workspace).upsert(project_id="proj", project_dir=project_dir)
+            ProjectRegistry(workspace).add_directory(project.project_id, project_dir / "sub")
+
+            focus = FocusRegistry(workspace).create(
+                title="Explore model handoff",
+                description="Understand how sessions can migrate.",
+                project_id=project.project_id,
+                agent_id="owner",
+                directory=project_dir,
+                session_id="session-a",
+            )
+            FocusRegistry(workspace).add_note(focus.focus_id, "Keep the session-first design.")
+
+            resolved = FocusRegistry(workspace).resolve("Explore model handoff")
+            assert resolved is not None
+            self.assertEqual(resolved.directory, str(project_dir.resolve()))
+            self.assertEqual(resolved.session_id, "session-a")
+
+            context = build_agentdeck_context(workspace, task=None, focus=resolved, session_id="session-a")
+            self.assertIn("Focus:", context)
+            self.assertIn("Explore model handoff", context)
+            self.assertIn(str(project_dir.resolve()), context)
+            self.assertIn("Keep the session-first design.", context)
 
 
 if __name__ == "__main__":

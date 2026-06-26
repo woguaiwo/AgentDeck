@@ -38,6 +38,7 @@ from agentdeck.core.run_service import (
 )
 from agentdeck.storage.approvals import ApprovalRecord, ApprovalRegistry
 from agentdeck.storage.agents import ASSISTANT_AGENT_ID, AgentRecord, AgentRegistry
+from agentdeck.storage.focus import FOCUS_STATUSES, FocusRecord, FocusRegistry
 from agentdeck.storage.jobs import JobRecord, JobRegistry
 from agentdeck.storage.memory import MemoryDocument, MarkdownMemoryStore
 from agentdeck.storage.progress import ProgressJournal, format_review
@@ -56,15 +57,16 @@ HUMAN_AUTO_APPROVAL_MODE = "fail"
 ASSISTANT_ACTION_PREFIX = "AGENTDECK_ACTION:"
 MAX_ASSISTANT_ACTIONS = 3
 DEFAULT_AUTO_PROMPT = (
-    "请继续推进当前任务。要求：主动完成下一步；如果取得阶段性进展、"
+    "请继续推进当前 Focus。要求：主动完成下一步；如果取得阶段性进展、"
     "做出重要决定或遇到阻塞，请用简短要点记录到项目日志或任务备注里；"
     "如果需要用户决策、权限或外部信息，请停止并明确说明。"
 )
+AUTO_FOCUS_DONE_MARKER = "AGENTDECK_AUTO_FOCUS_DONE"
 AUTO_TASK_DONE_MARKER = "AGENTDECK_AUTO_TASK_DONE"
-DEFAULT_AUTO_TASK_PROMPT = (
-    "请自动推进当前任务。每一轮主动完成下一步，并记录重要进展、决定、证据或阻塞。"
-    "如果你判断当前 task 的范围和细节已经基本充分完成，请在回复最后单独一行输出 "
-    f"{AUTO_TASK_DONE_MARKER}，并给出简短完成摘要；否则不要输出这个标记，继续说明下一步。"
+DEFAULT_AUTO_FOCUS_PROMPT = (
+    "请自动推进当前 Focus。每一轮主动完成下一步，并记录重要进展、决定、证据或阻塞。"
+    "如果你判断当前 Focus 的范围和细节已经基本充分完成，请在回复最后单独一行输出 "
+    f"{AUTO_FOCUS_DONE_MARKER}，并给出简短完成摘要；否则不要输出这个标记，继续说明下一步。"
 )
 ACTIVE_JOB_STATUSES = {"queued", "running", "cancel_requested"}
 _RESTART_LOCK = threading.Lock()
@@ -161,6 +163,20 @@ class TelegramChatStateStore:
             data[key] = chat
             self._write(data)
 
+    def current_focus(self, chat_id: int) -> str:
+        with self._lock:
+            data = self._read()
+            return str(data.get(self._chat_key(chat_id), {}).get("current_focus_id") or "")
+
+    def set_current_focus(self, chat_id: int, focus_id: str) -> None:
+        with self._lock:
+            data = self._read()
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
+            chat["current_focus_id"] = focus_id
+            data[key] = chat
+            self._write(data)
+
     def current_session(self, chat_id: int) -> str:
         with self._lock:
             data = self._read()
@@ -215,6 +231,7 @@ class TelegramChatStateStore:
         *,
         enabled: bool,
         task_id: str = "",
+        focus_id: str = "",
         prompt: str = DEFAULT_AUTO_PROMPT,
         until: float = 0.0,
         turns_started: int = 0,
@@ -229,6 +246,7 @@ class TelegramChatStateStore:
             chat["auto"] = {
                 "enabled": enabled,
                 "task_id": task_id,
+                "focus_id": focus_id,
                 "prompt": prompt,
                 "until": until,
                 "turns_started": turns_started,
@@ -250,7 +268,7 @@ class TelegramChatStateStore:
             data[key] = chat
             self._write(data)
 
-    def mark_auto_job(self, chat_id: int, *, job_id: str, task_id: str) -> dict[str, Any]:
+    def mark_auto_job(self, chat_id: int, *, job_id: str, task_id: str = "", focus_id: str = "") -> dict[str, Any]:
         with self._lock:
             data = self._read()
             key = self._chat_key(chat_id)
@@ -258,6 +276,7 @@ class TelegramChatStateStore:
             state = dict(chat.get("auto") or {})
             state["last_job_id"] = job_id
             state["task_id"] = task_id or str(state.get("task_id") or "")
+            state["focus_id"] = focus_id or str(state.get("focus_id") or "")
             state["turns_started"] = int(state.get("turns_started") or 0) + 1
             chat["auto"] = state
             data[key] = chat
@@ -337,6 +356,15 @@ class TelegramChatStateStore:
             data[key] = chat
             self._write(data)
 
+    def set_recent_focus(self, chat_id: int, focus_ids: list[str]) -> None:
+        with self._lock:
+            data = self._read()
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
+            chat["recent_focus_ids"] = focus_ids
+            data[key] = chat
+            self._write(data)
+
     def set_recent_jobs(self, chat_id: int, job_ids: list[str]) -> None:
         with self._lock:
             data = self._read()
@@ -353,6 +381,14 @@ class TelegramChatStateStore:
             if not isinstance(task_ids, list) or index < 1 or index > len(task_ids):
                 return ""
             return str(task_ids[index - 1])
+
+    def recent_focus_id(self, chat_id: int, index: int) -> str:
+        with self._lock:
+            data = self._read()
+            focus_ids = data.get(self._chat_key(chat_id), {}).get("recent_focus_ids") or []
+            if not isinstance(focus_ids, list) or index < 1 or index > len(focus_ids):
+                return ""
+            return str(focus_ids[index - 1])
 
     def recent_project_id(self, chat_id: int, index: int) -> str:
         with self._lock:
@@ -714,6 +750,7 @@ class TelegramJobQueue:
                     RunRequest(
                         prompt=job.prompt,
                         task=job.task_id or None,
+                        focus=str(metadata.get("focus_id") or "") or None,
                         agent=str(metadata.get("agent_id") or "") or None,
                         session=str(metadata.get("session_id") or "") or None,
                         approval_mode=str(metadata.get("approval_mode") or "") or None,
@@ -790,6 +827,8 @@ class TelegramJobQueue:
             finished_job = finished or job
             if result.session_id and not _is_assistant_job(finished_job):
                 self.chat_state.set_current_session(job.chat_id, result.session_id)
+                if result.focus_id:
+                    self.chat_state.set_current_focus(job.chat_id, result.focus_id)
             self._send(job.chat_id, _format_job_completion(finished_job, result.approval_requested))
             if _is_assistant_job(finished_job):
                 for reply in self._assistant_action_replies(finished_job.chat_id, finished_job.final_text):
@@ -861,7 +900,7 @@ class TelegramJobQueue:
         return [warning] if warning else []
 
     def _continue_auto_if_needed(self, job: JobRecord, approval_requested: bool) -> None:
-        if not job.chat_id or not job.task_id:
+        if not job.chat_id:
             return
         state = self.chat_state.auto_state(job.chat_id)
         if not _auto_enabled_for_job(state, job):
@@ -880,20 +919,22 @@ class TelegramJobQueue:
             self.chat_state.disable_auto(job.chat_id)
             self._send(job.chat_id, f"Auto mode stopped: {_one_line(job.error, 180)}")
             return
-        if _auto_mode(state) == "task" and _auto_task_completed(job.final_text):
+        if _auto_mode(state) == "focus" and _auto_focus_completed(job.final_text):
             self.chat_state.disable_auto(job.chat_id)
-            TaskBoard(self.workspace).set_status(
-                job.task_id,
-                "review",
-                note="Auto by task stopped after the agent reported task completion.",
-            )
+            focus_id = str(state.get("focus_id") or (job.metadata or {}).get("focus_id") or "")
+            if focus_id:
+                FocusRegistry(self.workspace).set_status(
+                    focus_id,
+                    "review",
+                    note="Auto by focus stopped after the agent reported focus completion.",
+                )
             self._send(
                 job.chat_id,
                 "\n".join(
                     [
-                        "Auto by task stopped: task judged complete.",
+                        "Auto by focus stopped: focus judged complete.",
                         "status: review",
-                        "Use /tasks or /context to inspect before marking done.",
+                        "Use /focus or /context to inspect before marking done.",
                     ]
                 ),
             )
@@ -912,6 +953,12 @@ class TelegramJobQueue:
         session_id = _safe_session_id_for_resume(self.workspace, job.session_id)
         if session_id:
             metadata["session_id"] = session_id
+        focus_id = str(state.get("focus_id") or (job.metadata or {}).get("focus_id") or "")
+        if focus_id:
+            metadata["focus_id"] = focus_id
+            focus = FocusRegistry(self.workspace).resolve(focus_id)
+            if focus is not None and focus.agent_id:
+                metadata.setdefault("agent_id", focus.agent_id)
 
         def enqueue_next() -> None:
             current = self.chat_state.auto_state(job.chat_id)
@@ -921,7 +968,12 @@ class TelegramJobQueue:
                     self._send(job.chat_id, "Auto mode ended: timer expired.")
                 return
             next_job = self.start(chat_id=job.chat_id, task_id=job.task_id, prompt=prompt, metadata=metadata)
-            self.chat_state.mark_auto_job(job.chat_id, job_id=next_job.job_id, task_id=job.task_id)
+            self.chat_state.mark_auto_job(
+                job.chat_id,
+                job_id=next_job.job_id,
+                task_id=job.task_id,
+                focus_id=focus_id,
+            )
             self._send(
                 job.chat_id,
                 "\n".join(
@@ -937,7 +989,7 @@ class TelegramJobQueue:
         timer.start()
 
     def _stop_auto_after_failure(self, job: JobRecord, reason: str) -> None:
-        if not job.chat_id or not job.task_id:
+        if not job.chat_id:
             return
         state = self.chat_state.auto_state(job.chat_id)
         if not _auto_enabled_for_job(state, job):
@@ -1007,6 +1059,8 @@ class TelegramCommandHandler:
             return [self._task(rest, chat_id=chat_id)]
         if command in {"/newtask", "newtask"}:
             return [self._newtask(rest, chat_id=chat_id)]
+        if command in {"/focus", "focus"}:
+            return [self._focus(rest, chat_id=chat_id)]
         if command in {"/use", "use"}:
             return [self._use(rest, chat_id=chat_id)]
         if command in {"/assistant", "assistant", "/home", "home"}:
@@ -1095,6 +1149,9 @@ class TelegramCommandHandler:
         current_task_id = self.chat_state.current_task(chat_id)
         if current_task_id and self._resolve_task(current_task_id) is not None:
             return False
+        current_focus_id = self.chat_state.current_focus(chat_id)
+        if current_focus_id and self._resolve_focus(current_focus_id) is not None:
+            return False
         current_session_id = self.chat_state.current_session(chat_id)
         if current_session_id and SessionRegistry(self.workspace).resolve(current_session_id) is not None:
             return False
@@ -1106,6 +1163,10 @@ class TelegramCommandHandler:
         current_task_id = self.chat_state.current_task(chat_id)
         task = self._resolve_task(current_task_id) if current_task_id else None
         if task is None:
+            current_focus_id = self.chat_state.current_focus(chat_id)
+            focus = self._resolve_focus(current_focus_id) if current_focus_id else None
+            if focus is not None:
+                return await self._run_focus_prompt(focus, text, chat_id=chat_id)
             current_session_id = self.chat_state.current_session(chat_id)
             session = SessionRegistry(self.workspace).resolve(current_session_id) if current_session_id else None
             if session is not None:
@@ -1130,11 +1191,12 @@ class TelegramCommandHandler:
         if chat_id is None:
             return "This command requires a Telegram chat."
         self.chat_state.set_current_task(chat_id, "")
+        self.chat_state.set_current_focus(chat_id, "")
         self.chat_state.set_current_session(chat_id, "")
         assistant = self._assistant_agent()
         lines = [
             "Assistant mode enabled.",
-            "Current task/session cleared. Plain text messages will go to the assistant until you /use task <ref> or /use session <ref>.",
+            "Current focus/session cleared. Plain text messages will go to the assistant until you /use focus <ref> or /use session <ref>.",
         ]
         if assistant is not None:
             lines.append(f"assistant: {assistant.title} ({assistant.agent_id})")
@@ -1200,8 +1262,8 @@ class TelegramCommandHandler:
     def _plain_text_setup_hint(self) -> str:
         return "\n".join(
             [
-                "No current task is selected, so this message was not sent to an agent.",
-                "Use /tasks and /use task <ref>, or create one with /task new <title>.",
+                "No current focus is selected, so this message was not sent to an agent.",
+                "Use /focus and /use focus <ref>, or create one with /focus new <title>.",
                 "Or configure a default assistant with: agentdeck assistant setup --adapter <echo|codex|kimi>",
             ]
         )
@@ -1341,7 +1403,7 @@ class TelegramCommandHandler:
             f"status: {project.status}",
         ]
         lines.append("")
-        lines.append("Use /project use <id or list #>, /agents, /tasks, or /task new <title>.")
+        lines.append("Use /project use <id or list #>, /agents, /focus, or /focus new <title>.")
         return "\n".join(lines)
 
     def _new_project(self, rest: str, *, chat_id: int | None) -> str:
@@ -1370,7 +1432,7 @@ class TelegramCommandHandler:
                 f"id: {project.project_id}",
                 f"cwd: {project.project_dir}",
                 f"default agent: {project.default_agent_id}",
-                "Next: /agent new owner codex owner, or /task new <title>",
+                "Next: /agent new owner codex owner, or /focus new <title>",
             ]
         )
 
@@ -1521,6 +1583,117 @@ class TelegramCommandHandler:
         lines.append("Now you can send a plain message, or /run <message>.")
         return "\n".join(lines)
 
+    def _focus(self, rest: str, *, chat_id: int | None) -> str:
+        command, tail = _split_once(rest.strip())
+        lowered = command.lower()
+        if lowered in {"new", "create"}:
+            return self._new_focus(tail, chat_id=chat_id)
+        if lowered in {"use", "select"}:
+            return self._use_focus(tail, chat_id=chat_id)
+        if lowered == "note":
+            focus_ref, note = _split_once(tail)
+            if not focus_ref or not note:
+                return "Usage: /focus note <focus_id or list #> <note>"
+            focus = self._resolve_focus(focus_ref, chat_id=chat_id)
+            if focus is None:
+                return f"Focus not found: {focus_ref}"
+            record = FocusRegistry(self.workspace).add_note(focus.focus_id, note)
+            return f"Focus note recorded: {record.title} ({len(record.notes)} notes)" if record is not None else "Focus not found."
+        if lowered == "status":
+            focus_ref, tail2 = _split_once(tail)
+            status, note = _split_once(tail2)
+            if not focus_ref or not status:
+                return f"Usage: /focus status <focus_id or list #> <{'|'.join(sorted(FOCUS_STATUSES))}> [note]"
+            focus = self._resolve_focus(focus_ref, chat_id=chat_id)
+            if focus is None:
+                return f"Focus not found: {focus_ref}"
+            try:
+                record = FocusRegistry(self.workspace).set_status(focus.focus_id, status, note=note)
+            except ValueError as exc:
+                return str(exc)
+            return f"Focus status updated: {record.title} status={record.status}" if record is not None else "Focus not found."
+        if command:
+            focus = self._resolve_focus(rest, chat_id=chat_id)
+            if focus is not None:
+                return self._format_focus_detail(focus)
+            project = self._resolve_project(rest, chat_id=chat_id)
+        else:
+            project = self._default_project(chat_id=chat_id)
+        records = FocusRegistry(self.workspace).list(project_id=project.project_id if project is not None else None)
+        if not records:
+            return "No focus records. Use /focus new <title>."
+        if chat_id is not None:
+            self.chat_state.set_recent_focus(chat_id, [record.focus_id for record in records])
+        current_focus_id = self.chat_state.current_focus(chat_id) if chat_id is not None else ""
+        heading = f"Focus ({project.title}):" if project is not None else "Focus:"
+        lines = [heading]
+        for index, record in enumerate(records, 1):
+            marker = " [current]" if record.focus_id == current_focus_id else ""
+            lines.append(f"{index}. {record.title}{marker}")
+            lines.append(f"   id: {record.focus_id}")
+            lines.append(f"   status: {record.status}  agent: {record.agent_id or '-'}")
+            lines.append(f"   session: {record.session_id or '-'}")
+            if record.directory:
+                lines.append(f"   dir: {record.directory}")
+        lines.append("")
+        lines.append("Use /use focus <list #>, /focus use <list #>, or /focus new <title>.")
+        return "\n".join(lines)
+
+    def _new_focus(self, rest: str, *, chat_id: int | None) -> str:
+        title = rest.strip()
+        if not title:
+            return "Usage: /focus new <title>"
+        project = self._default_project(chat_id=chat_id)
+        agent = self._default_agent(chat_id=chat_id, project=project)
+        session_id = self.chat_state.current_session(chat_id) if chat_id is not None else ""
+        session = SessionRegistry(self.workspace).resolve(session_id) if session_id else None
+        directory = (
+            session.project_dir
+            if session is not None
+            else (agent.project_dir if agent is not None else (project.project_dir if project is not None else "."))
+        )
+        try:
+            record = FocusRegistry(self.workspace).create(
+                title=title,
+                project_id=project.project_id if project is not None else "",
+                agent_id=agent.agent_id if agent is not None else (session.agent_id if session is not None else ""),
+                directory=directory,
+                session_id=session.session_id if session is not None else "",
+            )
+        except ValueError as exc:
+            return str(exc)
+        if chat_id is not None:
+            self._select_focus(chat_id, record)
+        return "\n".join(
+            [
+                "Focus created and selected.",
+                f"focus: {record.title}",
+                f"id: {record.focus_id}",
+                f"agent: {record.agent_id or '-'}",
+                f"session: {record.session_id or '-'}",
+                f"dir: {record.directory or '-'}",
+                "Plain text messages will run against this focus.",
+            ]
+        )
+
+    def _format_focus_detail(self, record: FocusRecord) -> str:
+        lines = [
+            record.title,
+            f"id: {record.focus_id}",
+            f"status: {record.status}",
+            f"project: {record.project_id or '-'}",
+            f"agent: {record.agent_id or '-'}",
+            f"session: {record.session_id or '-'}",
+            f"dir: {record.directory or '-'}",
+        ]
+        if record.description:
+            lines.append(f"description: {record.description}")
+        if record.notes:
+            lines.append("latest notes:")
+            for note in record.notes[-3:]:
+                lines.append(f"- {note.get('text', '')}")
+        return "\n".join(lines)
+
     def _use(self, rest: str, *, chat_id: int | None) -> str:
         if chat_id is None:
             return "This command requires a Telegram chat."
@@ -1532,18 +1705,21 @@ class TelegramCommandHandler:
             return self._use_agent(value, chat_id=chat_id)
         if lowered_kind in {"session", "thread"}:
             return self._use_session(value, chat_id=chat_id)
+        if lowered_kind in {"focus", "objective"}:
+            return self._use_focus(value, chat_id=chat_id)
         if lowered_kind in {"task", "todo"}:
             task_ref = value.strip()
         else:
             task_ref = rest.strip()
         if not task_ref:
-            return "Usage: /use <task>, /use project <project>, /use agent <agent>, or /use session <session>"
+            return "Usage: /use <task>, /use project <project>, /use agent <agent>, /use focus <focus>, or /use session <session>"
         if task_ref.lower() in {"assistant", "home"}:
             return self._assistant_mode(chat_id=chat_id)
         task = self._resolve_task(task_ref, chat_id=chat_id)
         if task is None:
             return f"Task not found: {task_ref}"
         self.chat_state.set_current_task(chat_id, task.task_id)
+        self.chat_state.set_current_focus(chat_id, "")
         self.chat_state.set_current_session(chat_id, task.session_id or "")
         if task.project_id:
             self.chat_state.set_current_project(chat_id, task.project_id)
@@ -1576,7 +1752,7 @@ class TelegramCommandHandler:
                 project.title,
                 f"id: {project.project_id}",
                 f"default agent: {project.default_agent_id}",
-                "Use /tasks, /agents, /task new <title>, or /run after selecting a task.",
+                "Use /focus, /agents, /focus new <title>, or /run after selecting a focus.",
             ]
         )
 
@@ -1616,18 +1792,22 @@ class TelegramCommandHandler:
             lines.append("Current agent: none")
         else:
             lines.append(f"Current agent: {agent.title} ({agent.agent_id})")
+        current_focus_id = self.chat_state.current_focus(chat_id)
+        focus = self._resolve_focus(current_focus_id) if current_focus_id else None
         current_task_id = self.chat_state.current_task(chat_id)
         task = self._resolve_task(current_task_id) if current_task_id else None
         current_session_id = self.chat_state.current_session(chat_id)
         session = SessionRegistry(self.workspace).resolve(current_session_id) if current_session_id else None
-        if task is None:
-            lines.append("Current task: none")
-            lines.append("Use /use task <task>, /tasks, or /task new <title>")
+        if focus is None:
+            lines.append("Current focus: none")
+            lines.append("Use /focus new <title>, /focus, or /use focus <ref>")
         else:
-            lines.append("Current task:")
-            lines.append(task.title)
-            lines.append(f"id: {task.task_id}")
-            lines.append(f"status: {task.status}")
+            lines.append("Current focus:")
+            lines.append(focus.title)
+            lines.append(f"id: {focus.focus_id}")
+            lines.append(f"status: {focus.status}")
+        if task is not None:
+            lines.append(f"Legacy task: {task.title} ({task.task_id})")
         if session is None:
             lines.append("Current session: none")
         else:
@@ -1655,15 +1835,19 @@ class TelegramCommandHandler:
         lines.append(f"Agent: {agent.title if agent is not None else '-'}")
         if agent is not None:
             lines.append(f"Agent id: {agent.agent_id}  adapter: {agent.adapter}  role: {agent.role}")
+        current_focus_id = self.chat_state.current_focus(chat_id) if chat_id is not None else ""
+        current_focus = self._resolve_focus(current_focus_id) if current_focus_id else None
         current_task_id = self.chat_state.current_task(chat_id) if chat_id is not None else ""
         current_task = self._resolve_task(current_task_id) if current_task_id else None
         current_session_id = self.chat_state.current_session(chat_id) if chat_id is not None else ""
         current_session = SessionRegistry(self.workspace).resolve(current_session_id) if current_session_id else None
-        if current_task is None:
-            lines.append("Current task: -")
+        if current_focus is None:
+            lines.append("Current focus: -")
         else:
-            lines.append(f"Current task: {current_task.title}")
-            lines.append(f"Task status: {current_task.status}  priority: {current_task.priority}")
+            lines.append(f"Current focus: {current_focus.title}")
+            lines.append(f"Focus status: {current_focus.status}")
+        if current_task is not None:
+            lines.append(f"Legacy task: {current_task.title}")
         if current_session is None:
             lines.append("Current session: -")
         else:
@@ -1678,7 +1862,11 @@ class TelegramCommandHandler:
                 task = self._resolve_task(latest.task_id)
                 task_title = task.title if task is not None else (latest.task_id or "-")
                 lines.append(f"Job: {latest.status}  {latest.job_id}")
-                lines.append(f"Job task: {task_title}")
+                focus = self._resolve_focus(str((latest.metadata or {}).get("focus_id") or ""))
+                if focus is not None:
+                    lines.append(f"Job focus: {focus.title}")
+                elif latest.task_id:
+                    lines.append(f"Job legacy task: {task_title}")
 
         pending = ApprovalRegistry(self.workspace).list(status="pending")
         lines.append(f"Pending approvals: {len(pending)}")
@@ -1703,9 +1891,9 @@ class TelegramCommandHandler:
 
         lines.append("")
         lines.append("Next:")
-        lines.append("- /projects, /agents, /tasks")
-        lines.append("- /use project <list #>, /use agent <list #>, /use task <list #>")
-        lines.append("- /projectstate, /decisions, /context, /memories, /compact, /handoffs, /reviews")
+        lines.append("- /projects, /agents, /focus")
+        lines.append("- /use project <list #>, /use agent <list #>, /use focus <list #>")
+        lines.append("- /projectstate, /decisions, /context, /memories, /compact")
         lines.append("- send plain text, /run <message>, /auto start")
         return "\n".join(lines)
 
@@ -1714,12 +1902,16 @@ class TelegramCommandHandler:
         current_project_id = self.chat_state.current_project(chat_id) if chat_id is not None else ""
         scoped_project = self._resolve_project(current_project_id) if current_project_id else None
         agents = AgentRegistry(self.workspace).list(project_id=scoped_project.project_id if scoped_project is not None else None)[:8]
+        focus_records = FocusRegistry(self.workspace).list(
+            project_id=scoped_project.project_id if scoped_project is not None else None
+        )[:8]
         tasks = TaskBoard(self.workspace).list()[:8]
         jobs = self.job_queue.list(chat_id=chat_id, limit=8) if self.job_queue is not None else []
         sessions = SessionRegistry(self.workspace).list()[:8]
         if chat_id is not None:
             self.chat_state.set_recent_projects(chat_id, [project.project_id for project in projects])
             self.chat_state.set_recent_agents(chat_id, [agent.agent_id for agent in agents])
+            self.chat_state.set_recent_focus(chat_id, [focus.focus_id for focus in focus_records])
             self.chat_state.set_recent(
                 chat_id,
                 task_ids=[task.task_id for task in tasks],
@@ -1727,6 +1919,7 @@ class TelegramCommandHandler:
             )
             self.chat_state.set_recent_sessions(chat_id, [session.session_id for session in sessions])
 
+        current_focus_id = self.chat_state.current_focus(chat_id) if chat_id is not None else ""
         current_task_id = self.chat_state.current_task(chat_id) if chat_id is not None else ""
         lines: list[str] = ["Recent:"]
         if not projects:
@@ -1750,13 +1943,21 @@ class TelegramCommandHandler:
                 lines.append(f"{index}. {agent.title}{marker}")
                 lines.append(f"   id: {agent.agent_id}  adapter: {agent.adapter}  role: {agent.role}")
 
-        if not tasks:
+        if not focus_records:
             lines.append("")
-            lines.append("Tasks: none")
+            lines.append("Focus: none")
         else:
             lines.append("")
-            lines.append("Tasks:")
-            for index, task in enumerate(tasks, 1):
+            lines.append("Focus:")
+            for index, focus in enumerate(focus_records, 1):
+                marker = " [current]" if focus.focus_id == current_focus_id else ""
+                lines.append(f"{index}. {focus.title}{marker}")
+                lines.append(f"   status: {focus.status}  agent: {focus.agent_id or '-'}")
+
+        if tasks:
+            lines.append("")
+            lines.append("Legacy tasks:")
+            for index, task in enumerate(tasks[:5], 1):
                 marker = " [current]" if task.task_id == current_task_id else ""
                 lines.append(f"{index}. {task.title}{marker}")
                 lines.append(f"   status: {task.status}  project: {task.project_id or '-'}")
@@ -1786,13 +1987,37 @@ class TelegramCommandHandler:
                 lines.append(f"   status: {session.status}  agent: {session.agent_id}")
 
         lines.append("")
-        lines.append("Use /use project <list #>, /use agent <list #>, /use task <list #>, /run <list #> <message>, /job <list #>, or /resume <list #> <message>.")
+        lines.append("Use /use project <list #>, /use agent <list #>, /use focus <list #>, /run <message>, /job <list #>, or /resume <list #> <message>.")
         return "\n".join(lines)
 
     def _context(self, rest: str, *, chat_id: int | None) -> str:
+        focus_ref = rest.strip()
+        if focus_ref:
+            focus = self._resolve_focus(focus_ref, chat_id=chat_id)
+            if focus is not None:
+                context = build_agentdeck_context(
+                    self.workspace,
+                    task=None,
+                    focus=focus,
+                    session_id=focus.session_id,
+                    max_chars=3400,
+                )
+                return context or f"No AgentDeck context for focus: {focus.title}"
+        elif chat_id is not None:
+            focus_id = self.chat_state.current_focus(chat_id)
+            focus = self._resolve_focus(focus_id) if focus_id else None
+            if focus is not None:
+                context = build_agentdeck_context(
+                    self.workspace,
+                    task=None,
+                    focus=focus,
+                    session_id=focus.session_id,
+                    max_chars=3400,
+                )
+                return context or f"No AgentDeck context for focus: {focus.title}"
         task, error = self._resolve_task_or_current(rest, chat_id=chat_id, usage="Usage: /context [task]")
         if error:
-            return error
+            return "No current focus. Use /focus new <title>, /use focus <ref>, or pass a legacy task id."
         assert task is not None
         context = build_agentdeck_context(
             self.workspace,
@@ -1805,9 +2030,31 @@ class TelegramCommandHandler:
         return context
 
     def _memories(self, rest: str, *, chat_id: int | None) -> str:
+        focus_ref = rest.strip()
+        focus = self._resolve_focus(focus_ref, chat_id=chat_id) if focus_ref else None
+        if focus is None and chat_id is not None and not focus_ref:
+            focus_id = self.chat_state.current_focus(chat_id)
+            focus = self._resolve_focus(focus_id) if focus_id else None
+        if focus is not None:
+            memories = collect_relevant_memories(self.workspace, None, focus=focus)
+            if chat_id is not None:
+                self.chat_state.set_recent_memories(chat_id, [str(memory.path) for memory in memories])
+            if not memories:
+                return "\n".join(
+                    [
+                        f"No durable memories for focus: {focus.title}",
+                        "Use /compact [--pin] [title] to save the current structured focus context.",
+                    ]
+                )
+            lines = [f"Durable memories: {focus.title}"]
+            for index, memory in enumerate(memories, 1):
+                lines.extend(_format_memory_document(index, memory))
+            lines.append("")
+            lines.append("Use /compact [--pin] [title] to save a fresh focus context snapshot.")
+            return "\n".join(lines)
         task, error = self._resolve_task_or_current(rest, chat_id=chat_id, usage="Usage: /memories [task]")
         if error:
-            return error
+            return "No current focus. Use /focus new <title>, /use focus <ref>, or pass a legacy task id."
         assert task is not None
         memories = collect_relevant_memories(self.workspace, task)
         if chat_id is not None:
@@ -1816,14 +2063,14 @@ class TelegramCommandHandler:
             return "\n".join(
                 [
                     f"No durable memories for task: {task.title}",
-                    "Use /compact [--pin] [title] to save the current structured task context.",
+                    "Use /compact [--pin] [title] to save the current structured context.",
                 ]
             )
         lines = [f"Durable memories: {task.title}"]
         for index, memory in enumerate(memories, 1):
             lines.extend(_format_memory_document(index, memory))
         lines.append("")
-        lines.append("Use /compact [--pin] [title] to save a fresh task context snapshot.")
+        lines.append("Use /compact [--pin] [title] to save a fresh context snapshot.")
         return "\n".join(lines)
 
     def _set_memory_disabled(self, rest: str, *, disabled: bool, chat_id: int | None) -> str:
@@ -1844,9 +2091,9 @@ class TelegramCommandHandler:
         if document.pinned:
             lines.append("pinned: yes")
         if disabled:
-            lines.append("It will no longer be injected into task context.")
+            lines.append("It will no longer be injected into focus context.")
         else:
-            lines.append("It can be retrieved into future task context again.")
+            lines.append("It can be retrieved into future focus context again.")
         return "\n".join(lines)
 
     def _resolve_memory_ref(self, rest: str, *, chat_id: int | None) -> str:
@@ -1858,9 +2105,56 @@ class TelegramCommandHandler:
         return ref
 
     def _compact(self, rest: str, *, chat_id: int | None) -> str:
+        focus = None
+        if chat_id is not None:
+            focus_id = self.chat_state.current_focus(chat_id)
+            focus = self._resolve_focus(focus_id) if focus_id else None
+        if focus is not None:
+            title, pinned = _parse_compact_options(rest, default_title=f"{focus.title} context snapshot")
+            context = build_agentdeck_context(
+                self.workspace,
+                task=None,
+                focus=focus,
+                session_id=focus.session_id,
+                max_chars=6000,
+                include_memories=False,
+            )
+            if not context:
+                return f"No focus context to compact: {focus.title}"
+            owner = focus.project_id
+            content = "\n".join(
+                [
+                    f"# {title}",
+                    "",
+                    "This memory was generated from structured AgentDeck state, not a raw chat transcript.",
+                    "",
+                    context,
+                ]
+            )
+            try:
+                entry = MarkdownMemoryStore(self.workspace).add(
+                    title,
+                    content,
+                    scope="project",
+                    owner=owner,
+                    memory_type="focus-context",
+                    source="telegram-compact",
+                    pinned=pinned,
+                    tags=["agentdeck", "focus-context", "telegram"],
+                )
+            except ValueError as exc:
+                return str(exc)
+            lines = [
+                "Memory saved.",
+                f"title: {entry.title}",
+                f"id: {entry.memory_id}",
+                f"scope: {entry.scope}{':' + entry.owner if entry.owner else ''}",
+                f"pinned: {'yes' if entry.pinned else 'no'}",
+            ]
+            return "\n".join(lines)
         task, error = self._resolve_task_or_current("", chat_id=chat_id, usage="Usage: /compact [--pin] [title]")
         if error:
-            return error
+            return "No current focus. Use /focus new <title>, /use focus <ref>, or pass a legacy task id."
         assert task is not None
         title, pinned = _parse_compact_options(rest, default_title=f"{task.title} context snapshot")
         context = build_agentdeck_context(
@@ -2106,6 +2400,23 @@ class TelegramCommandHandler:
         if not clean:
             return None
         matches = [record for record in board.list() if record.title.lower() == clean]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    def _resolve_focus(self, value: str, *, chat_id: int | None = None) -> FocusRecord | None:
+        if chat_id is not None and value.strip().isdigit():
+            mapped = self.chat_state.recent_focus_id(chat_id, int(value.strip()))
+            if mapped:
+                value = mapped
+        registry = FocusRegistry(self.workspace)
+        focus = registry.resolve(value)
+        if focus is not None:
+            return focus
+        clean = " ".join(value.strip().split()).lower()
+        if not clean:
+            return None
+        matches = [record for record in registry.list() if record.title.lower() == clean]
         if len(matches) == 1:
             return matches[0]
         return None
@@ -2378,6 +2689,37 @@ class TelegramCommandHandler:
         lines = [result.final_text or "Run finished without a final text response.", "", f"session: {result.session_id}"]
         return "\n".join(lines)
 
+    async def _run_focus_prompt(self, focus: FocusRecord, prompt: str, *, chat_id: int) -> str:
+        self._select_focus(chat_id, focus)
+        metadata = {"focus_id": focus.focus_id}
+        if focus.agent_id:
+            metadata["agent_id"] = focus.agent_id
+        if focus.session_id:
+            metadata["session_id"] = focus.session_id
+        if self.job_queue is not None:
+            job = self.job_queue.start(chat_id=chat_id, task_id="", prompt=prompt, metadata=metadata)
+            return "\n".join(
+                [
+                    f"Focus job started: {job.job_id}",
+                    f"focus: {focus.title}",
+                    f"agent: {focus.agent_id or '-'}",
+                    f"session: {focus.session_id or '-'}",
+                    "status: queued",
+                    "Use /job to view the latest job",
+                ]
+            )
+        try:
+            result = await self.runner(
+                self.workspace,
+                RunRequest(prompt=prompt, focus=focus.focus_id, agent=focus.agent_id or None, session=focus.session_id or None),
+            )
+        except RunConfigurationError as exc:
+            return str(exc)
+        lines = [result.final_text or "Run finished without a final text response.", "", f"session: {result.session_id}"]
+        if result.focus_id:
+            lines.append(f"focus: {result.focus_id}")
+        return "\n".join(lines)
+
     def _use_session(self, session_ref: str, *, chat_id: int | None) -> str:
         if chat_id is None:
             return "This command requires a Telegram chat."
@@ -2416,6 +2758,7 @@ class TelegramCommandHandler:
         project: ProjectRecord | None = None
         if task is not None:
             self.chat_state.set_current_task(chat_id, task.task_id)
+            self.chat_state.set_current_focus(chat_id, "")
             if task.project_id:
                 project = ProjectRegistry(self.workspace).resolve(task.project_id)
                 self.chat_state.set_current_project(chat_id, task.project_id)
@@ -2426,12 +2769,55 @@ class TelegramCommandHandler:
             return project
 
         self.chat_state.set_current_task(chat_id, "")
+        focus = self._focus_for_session(session.session_id)
+        if focus is not None:
+            self.chat_state.set_current_focus(chat_id, focus.focus_id)
+        else:
+            self.chat_state.set_current_focus(chat_id, "")
         if session.agent_id:
             self.chat_state.set_current_agent(chat_id, session.agent_id)
         project = self._project_for_session(session)
         if project is not None:
             self.chat_state.set_current_project(chat_id, project.project_id)
         return project
+
+    def _use_focus(self, focus_ref: str, *, chat_id: int | None) -> str:
+        if chat_id is None:
+            return "This command requires a Telegram chat."
+        if not focus_ref.strip():
+            return "Usage: /use focus <focus_id, title, or list #>"
+        focus = self._resolve_focus(focus_ref, chat_id=chat_id)
+        if focus is None:
+            return f"Focus not found: {focus_ref}"
+        self._select_focus(chat_id, focus)
+        lines = [
+            "Focus selected.",
+            "Plain text messages will run against this focus.",
+            f"focus: {focus.title}",
+            f"id: {focus.focus_id}",
+            f"project: {focus.project_id or '-'}",
+            f"agent: {focus.agent_id or '-'}",
+            f"session: {focus.session_id or '-'}",
+            f"dir: {focus.directory or '-'}",
+        ]
+        return "\n".join(lines)
+
+    def _select_focus(self, chat_id: int, focus: FocusRecord) -> None:
+        self.chat_state.set_current_focus(chat_id, focus.focus_id)
+        self.chat_state.set_current_task(chat_id, "")
+        self.chat_state.set_current_session(chat_id, focus.session_id or "")
+        if focus.project_id:
+            self.chat_state.set_current_project(chat_id, focus.project_id)
+        if focus.agent_id:
+            self.chat_state.set_current_agent(chat_id, focus.agent_id)
+
+    def _focus_for_session(self, session_id: str) -> FocusRecord | None:
+        if not session_id:
+            return None
+        matches = [focus for focus in FocusRegistry(self.workspace).list() if focus.session_id == session_id]
+        if not matches:
+            return None
+        return sorted(matches, key=lambda item: item.updated_at, reverse=True)[0]
 
     async def _resume_job(self, rest: str, *, chat_id: int | None) -> str:
         if chat_id is None:
@@ -2482,6 +2868,64 @@ class TelegramCommandHandler:
         if not matches:
             return None
         return matches[0]
+
+    def _ensure_focus_for_current_session(self, chat_id: int) -> tuple[FocusRecord | None, bool]:
+        session_id = self.chat_state.current_session(chat_id)
+        session = SessionRegistry(self.workspace).resolve(session_id) if session_id else None
+        if session is None:
+            return None, False
+        existing = self._focus_for_session(session.session_id)
+        if existing is not None:
+            self._select_focus(chat_id, existing)
+            return existing, False
+
+        project = self._project_for_session(session)
+        agent = AgentRegistry(self.workspace).resolve(session.agent_id) if session.agent_id else None
+        project_id = project.project_id if project is not None else (agent.project_id if agent is not None else "")
+        agent_id = session.agent_id or (project.default_agent_id if project is not None else (agent.agent_id if agent else ""))
+        title = session.title.strip() or f"Continue session {session.session_id}"
+        description = "Auto-created from the current Telegram session so AgentDeck can track a mutable focus."
+        focus = FocusRegistry(self.workspace).create(
+            title=title,
+            description=description,
+            project_id=project_id,
+            agent_id=agent_id,
+            directory=session.project_dir,
+            session_id=session.session_id,
+            metadata={"created_from": "telegram_session"},
+        )
+        self._select_focus(chat_id, focus)
+        return focus, True
+
+    def _ensure_focus_for_current_task(self, chat_id: int) -> tuple[FocusRecord | None, bool]:
+        task_id = self.chat_state.current_task(chat_id)
+        task = self._resolve_task(task_id) if task_id else None
+        if task is None:
+            return None, False
+        if task.session_id:
+            existing = self._focus_for_session(task.session_id)
+            if existing is not None:
+                self._select_focus(chat_id, existing)
+                return existing, False
+        project = ProjectRegistry(self.workspace).resolve(task.project_id) if task.project_id else None
+        agent = AgentRegistry(self.workspace).resolve(task.agent_id) if task.agent_id else None
+        session = SessionRegistry(self.workspace).resolve(task.session_id) if task.session_id else None
+        directory = (
+            session.project_dir
+            if session is not None
+            else (agent.project_dir if agent is not None else (project.project_dir if project is not None else "."))
+        )
+        focus = FocusRegistry(self.workspace).create(
+            title=task.title,
+            description=task.description or "Migrated from a legacy task selection.",
+            project_id=task.project_id,
+            agent_id=task.agent_id,
+            directory=directory,
+            session_id=task.session_id,
+            metadata={"created_from": "legacy_task", "task_id": task.task_id},
+        )
+        self._select_focus(chat_id, focus)
+        return focus, True
 
     def _ensure_task_for_current_session(self, chat_id: int) -> tuple[TaskRecord | None, bool]:
         session_id = self.chat_state.current_session(chat_id)
@@ -2809,6 +3253,7 @@ class TelegramCommandHandler:
                 chat_id,
                 enabled=bool(state.get("enabled")),
                 task_id=str(state.get("task_id") or self.chat_state.current_task(chat_id)),
+                focus_id=str(state.get("focus_id") or self.chat_state.current_focus(chat_id)),
                 prompt=prompt,
                 until=float(state.get("until") or 0.0),
                 turns_started=int(state.get("turns_started") or 0),
@@ -2817,22 +3262,24 @@ class TelegramCommandHandler:
                 mode=_auto_mode(state),
             )
             return f"Auto prompt updated:\n{prompt}"
-        if action in {"task", "by-task", "bytask"}:
-            return self._auto_start(tail, chat_id=chat_id, approval_mode=approval_mode, mode="task")
+        if action in {"focus", "by-focus", "byfocus", "task", "by-task", "bytask"}:
+            return self._auto_start(tail, chat_id=chat_id, approval_mode=approval_mode, mode="focus")
         if action == "start" or action == "on":
             return self._auto_start(tail, chat_id=chat_id, approval_mode=approval_mode, mode="loop")
         if _looks_like_float(action):
             return self._auto_start(clean, chat_id=chat_id, approval_mode=approval_mode, mode="loop")
-        return "Usage: /auto start [hours], /auto task [hours], /auto <hours>, /auto -h start, /auto status, /auto prompt <message>, or /auto end"
+        return "Usage: /auto start [hours], /auto focus [hours], /auto <hours>, /auto -h start, /auto status, /auto prompt <message>, or /auto end"
 
     def _auto_start(self, rest: str, *, chat_id: int, approval_mode: str, mode: str) -> str:
-        task_id = self.chat_state.current_task(chat_id)
-        task = self._resolve_task(task_id) if task_id else None
-        created_task = False
-        if task is None:
-            task, created_task = self._ensure_task_for_current_session(chat_id)
-        if task is None:
-            return "No current task. Use /use <task_id or title>, /use session <ref>, or /task new <title>, then /auto start."
+        focus_id = self.chat_state.current_focus(chat_id)
+        focus = self._resolve_focus(focus_id) if focus_id else None
+        created_focus = False
+        if focus is None:
+            focus, created_focus = self._ensure_focus_for_current_session(chat_id)
+        if focus is None:
+            focus, created_focus = self._ensure_focus_for_current_task(chat_id)
+        if focus is None:
+            return "No current focus. Use /focus new <title>, /use focus <ref>, or /use session <ref>, then /auto start."
         duration_text, prompt_override = _split_once(rest.strip())
         until = 0.0
         if duration_text:
@@ -2845,15 +3292,16 @@ class TelegramCommandHandler:
                 until = time.time() + hours * 3600.0
         state = self.chat_state.auto_state(chat_id)
         normalized_mode = _normalize_auto_mode(mode)
-        default_prompt = DEFAULT_AUTO_TASK_PROMPT if normalized_mode == "task" else DEFAULT_AUTO_PROMPT
+        default_prompt = DEFAULT_AUTO_FOCUS_PROMPT if normalized_mode == "focus" else DEFAULT_AUTO_PROMPT
         prompt = prompt_override.strip() or str(state.get("prompt") or default_prompt)
-        if normalized_mode == "task" and not prompt_override.strip():
-            prompt = DEFAULT_AUTO_TASK_PROMPT
+        if normalized_mode == "focus" and not prompt_override.strip():
+            prompt = DEFAULT_AUTO_FOCUS_PROMPT
         normalized_approval_mode = _normalize_auto_approval_mode(approval_mode)
         self.chat_state.set_auto_state(
             chat_id,
             enabled=True,
-            task_id=task.task_id,
+            task_id="",
+            focus_id=focus.focus_id,
             prompt=prompt,
             until=until,
             turns_started=0,
@@ -2863,13 +3311,13 @@ class TelegramCommandHandler:
         )
         lines = [
             "Auto mode enabled.",
-            f"task: {task.title}",
+            f"focus: {focus.title}",
             f"timer: {_format_auto_until(until)}",
             f"approval: {_format_auto_approval_mode(normalized_approval_mode)}",
             f"mode: {normalized_mode}",
         ]
-        if created_task:
-            lines.insert(1, f"Created task from current session: {task.task_id}")
+        if created_focus:
+            lines.insert(1, f"Created focus from current session: {focus.focus_id}")
         if self.job_queue is None:
             lines.append("Jobs are not enabled for this interface.")
             return "\n".join(lines)
@@ -2880,12 +3328,19 @@ class TelegramCommandHandler:
             lines.append("Auto will continue after the active job finishes.")
             return "\n".join(lines)
 
-        metadata = {"auto": True, "approval_mode": normalized_approval_mode, "auto_mode": normalized_mode}
-        session_id = self._safe_session_id_for_resume(task.session_id)
+        metadata = {
+            "auto": True,
+            "approval_mode": normalized_approval_mode,
+            "auto_mode": normalized_mode,
+            "focus_id": focus.focus_id,
+        }
+        if focus.agent_id:
+            metadata["agent_id"] = focus.agent_id
+        session_id = self._safe_session_id_for_resume(focus.session_id)
         if session_id:
             metadata["session_id"] = session_id
-        job = self.job_queue.start(chat_id=chat_id, task_id=task.task_id, prompt=prompt, metadata=metadata)
-        self.chat_state.mark_auto_job(chat_id, job_id=job.job_id, task_id=task.task_id)
+        job = self.job_queue.start(chat_id=chat_id, task_id="", prompt=prompt, metadata=metadata)
+        self.chat_state.mark_auto_job(chat_id, job_id=job.job_id, focus_id=focus.focus_id)
         lines.append(f"Job started: {job.job_id}")
         lines.append("Use /auto status or /auto end.")
         return "\n".join(lines)
@@ -2893,16 +3348,19 @@ class TelegramCommandHandler:
     def _auto_status(self, chat_id: int) -> str:
         state = self.chat_state.auto_state(chat_id)
         if not bool(state.get("enabled")):
-            return "Auto mode: off\nUse /auto start after selecting a task with /use."
+            return "Auto mode: off\nUse /auto start after selecting a focus with /use focus or /focus new."
+        focus = self._resolve_focus(str(state.get("focus_id") or ""))
         task = self._resolve_task(str(state.get("task_id") or ""))
         lines = [
             "Auto mode: on",
-            f"task: {task.title if task is not None else str(state.get('task_id') or '-')}",
+            f"focus: {focus.title if focus is not None else str(state.get('focus_id') or '-')}",
             f"timer: {_format_auto_until(float(state.get('until') or 0.0))}",
             f"approval: {_format_auto_approval_mode(_auto_approval_mode(state))}",
             f"mode: {_auto_mode(state)}",
             f"turns started: {int(state.get('turns_started') or 0)}",
         ]
+        if task is not None:
+            lines.append(f"legacy task: {task.title}")
         if state.get("last_job_id"):
             lines.append(f"last auto job: {state['last_job_id']}")
         prompt = str(state.get("prompt") or DEFAULT_AUTO_PROMPT)
@@ -2913,10 +3371,16 @@ class TelegramCommandHandler:
     async def _run(self, rest: str, *, chat_id: int | None = None) -> str:
         task, prompt, error = self._resolve_run_target(rest, chat_id=chat_id)
         if error:
+            if chat_id is not None and rest.strip():
+                current_focus_id = self.chat_state.current_focus(chat_id)
+                focus = self._resolve_focus(current_focus_id) if current_focus_id else None
+                if focus is not None:
+                    return await self._run_focus_prompt(focus, rest.strip(), chat_id=chat_id)
             return error
         assert task is not None
         if chat_id is not None:
             self.chat_state.set_current_task(chat_id, task.task_id)
+            self.chat_state.set_current_focus(chat_id, "")
         if self.job_queue is not None and chat_id is not None:
             job = self.job_queue.start(chat_id=chat_id, task_id=task.task_id, prompt=prompt)
             return "\n".join(
@@ -3419,8 +3883,8 @@ def _auto_approval_mode(state: dict[str, Any]) -> str:
 
 def _normalize_auto_mode(value: str) -> str:
     clean = (value or "").strip().lower().replace("_", "-")
-    if clean in {"task", "by-task", "bytask", "until-task-done"}:
-        return "task"
+    if clean in {"focus", "by-focus", "byfocus", "until-focus-done", "task", "by-task", "bytask", "until-task-done"}:
+        return "focus"
     return "loop"
 
 
@@ -3444,6 +3908,10 @@ def _safe_session_id_for_resume(workspace: Workspace, session_id: str) -> str:
 def _auto_enabled_for_job(state: dict[str, Any], job: JobRecord) -> bool:
     if not bool(state.get("enabled")):
         return False
+    focus_id = str(state.get("focus_id") or "")
+    job_focus_id = str((job.metadata or {}).get("focus_id") or "")
+    if focus_id:
+        return bool(job_focus_id) and focus_id == job_focus_id
     task_id = str(state.get("task_id") or "")
     return bool(job.task_id) and task_id == job.task_id
 
@@ -3507,8 +3975,12 @@ def _format_job_completion(job: JobRecord, approval_requested: bool) -> str:
         heading = "Job done"
     lines = [
         f"{heading}: {job.job_id}",
-        f"task: {job.task_id or '-'}",
     ]
+    focus_id = str((job.metadata or {}).get("focus_id") or "")
+    if focus_id:
+        lines.append(f"focus: {focus_id}")
+    else:
+        lines.append(f"task: {job.task_id or '-'}")
     if job.session_id:
         lines.append(f"session: {job.session_id}")
     if approval_requested:
@@ -3528,12 +4000,16 @@ def _clean_job_final_text(text: str) -> str:
     return _strip_assistant_actions(_strip_auto_task_marker(text))
 
 
-def _auto_task_completed(text: str) -> bool:
-    return AUTO_TASK_DONE_MARKER in text
+def _auto_focus_completed(text: str) -> bool:
+    return AUTO_FOCUS_DONE_MARKER in text or AUTO_TASK_DONE_MARKER in text
 
 
 def _strip_auto_task_marker(text: str) -> str:
-    lines = [line for line in text.splitlines() if line.strip() != AUTO_TASK_DONE_MARKER]
+    lines = [
+        line
+        for line in text.splitlines()
+        if line.strip() not in {AUTO_FOCUS_DONE_MARKER, AUTO_TASK_DONE_MARKER}
+    ]
     return "\n".join(lines).strip()
 
 

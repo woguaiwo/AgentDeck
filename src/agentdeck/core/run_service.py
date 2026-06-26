@@ -17,6 +17,7 @@ from agentdeck.core.events import AgentEvent, EventKind
 from agentdeck.core.runtime import AgentRuntime
 from agentdeck.storage.approvals import ApprovalRecord, ApprovalRegistry
 from agentdeck.storage.agents import AgentRecord, AgentRegistry, role_template_for_agent
+from agentdeck.storage.focus import FocusRecord, FocusRegistry
 from agentdeck.storage.memory import MemoryDocument, MemoryScope, MarkdownMemoryStore
 from agentdeck.storage.progress import ProgressEntry, ProgressJournal
 from agentdeck.storage.projects import ProjectRecord, ProjectRegistry
@@ -27,7 +28,7 @@ from agentdeck.storage.tasks import TaskBoard, TaskRecord
 
 
 class RunConfigurationError(ValueError):
-    """Raised when a run request references missing project/task/session state."""
+    """Raised when a run request references missing project/focus/session state."""
 
 
 @dataclass
@@ -36,6 +37,7 @@ class RunRequest:
     adapter: str | None = None
     project: str | None = None
     task: str | None = None
+    focus: str | None = None
     agent: str | None = None
     session: str | None = None
     title: str | None = None
@@ -61,12 +63,13 @@ class RunServiceResult:
     adapter: str
     project_id: str = ""
     task_id: str = ""
+    focus_id: str = ""
     approval_requested: bool = False
     pending_approvals: list[ApprovalRecord] = field(default_factory=list)
 
 
 async def run_agent_prompt(workspace: Workspace, request: RunRequest) -> RunServiceResult:
-    """Run a prompt using project/task/agent/session defaults."""
+    """Run a prompt using project/focus/agent/session defaults."""
 
     workspace.ensure()
     explicit_session = bool(request.session)
@@ -74,6 +77,7 @@ async def run_agent_prompt(workspace: Workspace, request: RunRequest) -> RunServ
     agent_registry = AgentRegistry(workspace)
     project_registry = ProjectRegistry(workspace)
     task_board = TaskBoard(workspace)
+    focus_registry = FocusRegistry(workspace)
     approval_registry = ApprovalRegistry(workspace)
 
     task = task_board.resolve(request.task) if request.task else None
@@ -81,6 +85,12 @@ async def run_agent_prompt(workspace: Workspace, request: RunRequest) -> RunServ
         raise RunConfigurationError(f"task not found: {request.task}")
     if task is not None:
         _apply_task_defaults(request, task)
+
+    focus = focus_registry.resolve(request.focus) if request.focus else None
+    if request.focus and focus is None:
+        raise RunConfigurationError(f"focus not found: {request.focus}")
+    if focus is not None:
+        _apply_focus_defaults(request, focus)
 
     project = project_registry.resolve(request.project) if request.project else None
     if request.project and project is None:
@@ -130,8 +140,11 @@ async def run_agent_prompt(workspace: Workspace, request: RunRequest) -> RunServ
         workspace,
         request.prompt,
         task=active_task,
+        focus=focus,
         agent=saved_agent,
-        session_id=session_id or (active_task.session_id if active_task is not None else ""),
+        session_id=session_id
+        or (active_task.session_id if active_task is not None else "")
+        or (focus.session_id if focus is not None else ""),
     )
 
     runtime = AgentRuntime(
@@ -170,6 +183,16 @@ async def run_agent_prompt(workspace: Workspace, request: RunRequest) -> RunServ
                 approval_text += f"; approval_id: {pending_approvals[0].approval_id}"
             task_board.set_status(active_task.task_id, "blocked", note=approval_text)
 
+    if focus is not None:
+        refreshed_focus = focus_registry.resolve(focus.focus_id)
+        if refreshed_focus is not None and refreshed_focus.session_id != result.session_id:
+            focus_registry.attach_session(refreshed_focus.focus_id, result.session_id)
+        focus_registry.add_note(
+            focus.focus_id,
+            f"Ran prompt with agent {request.agent}; session_id: {result.session_id}",
+            kind="run",
+        )
+
     return RunServiceResult(
         session_id=result.session_id,
         final_text=result.final_text,
@@ -178,6 +201,7 @@ async def run_agent_prompt(workspace: Workspace, request: RunRequest) -> RunServ
         adapter=request.adapter,
         project_id=request.project or "",
         task_id=active_task.task_id if active_task is not None else "",
+        focus_id=focus.focus_id if focus is not None else "",
         approval_requested=approval_requested,
         pending_approvals=pending_approvals,
     )
@@ -217,10 +241,11 @@ def _inject_agentdeck_context(
     prompt: str,
     *,
     task: TaskRecord | None,
+    focus: FocusRecord | None = None,
     agent: AgentRecord | None = None,
     session_id: str = "",
 ) -> str:
-    context = build_agentdeck_context(workspace, task=task, agent=agent, session_id=session_id)
+    context = build_agentdeck_context(workspace, task=task, focus=focus, agent=agent, session_id=session_id)
     if not context:
         return prompt
     return f"{prompt.rstrip()}\n\n---\n{context}"
@@ -230,19 +255,24 @@ def build_agentdeck_context(
     workspace: Workspace,
     *,
     task: TaskRecord | None,
+    focus: FocusRecord | None = None,
     agent: AgentRecord | None = None,
     session_id: str = "",
     max_chars: int = 5000,
     include_memories: bool = True,
 ) -> str:
-    state_id = session_id or (task.session_id if task is not None else "")
-    project_id = task.project_id if task is not None else ""
+    state_id = session_id or (task.session_id if task is not None else "") or (focus.session_id if focus is not None else "")
+    project_id = task.project_id if task is not None else (focus.project_id if focus is not None else "")
     project_state = ProjectStateStore(workspace).get(project_id) if project_id else None
     project_decisions = ProjectStateStore(workspace).decisions(project_id, limit=5) if project_id else []
     state = SessionStateStore(workspace).get(state_id) if state_id else None
-    active_agent = agent or (AgentRegistry(workspace).resolve(task.agent_id) if task is not None and task.agent_id else None)
+    active_agent = agent
+    if active_agent is None and task is not None and task.agent_id:
+        active_agent = AgentRegistry(workspace).resolve(task.agent_id)
+    if active_agent is None and focus is not None and focus.agent_id:
+        active_agent = AgentRegistry(workspace).resolve(focus.agent_id)
     agent_role_template = role_template_for_agent(active_agent) if active_agent is not None else ""
-    memories = collect_relevant_memories(workspace, task) if include_memories else []
+    memories = collect_relevant_memories(workspace, task, focus=focus) if include_memories else []
     handoffs = ProgressJournal(workspace).list(
         kind="handoff",
         task_id=task.task_id if task is not None else None,
@@ -258,6 +288,7 @@ def build_agentdeck_context(
 
     if (
         task is None
+        and focus is None
         and project_state is None
         and not project_decisions
         and state is None
@@ -270,7 +301,7 @@ def build_agentdeck_context(
 
     lines = [
         "AgentDeck context:",
-        "Use this as compact project/task state. The user request is above this block.",
+        "Use this as compact project/focus/session state. The user request is above this block.",
     ]
     if project_state is not None:
         _append_project_state_context(lines, project_state)
@@ -278,6 +309,8 @@ def build_agentdeck_context(
         _append_project_decisions_context(lines, project_decisions)
     if task is not None:
         _append_task_context(lines, task)
+    if focus is not None:
+        _append_focus_context(lines, focus)
     if active_agent is not None and agent_role_template:
         _append_agent_role_context(lines, active_agent, agent_role_template)
     if state is not None:
@@ -291,18 +324,26 @@ def build_agentdeck_context(
     return _limit_text("\n".join(lines), max_chars=max_chars)
 
 
-def collect_relevant_memories(workspace: Workspace, task: TaskRecord | None) -> list[MemoryDocument]:
-    if task is None:
+def collect_relevant_memories(
+    workspace: Workspace,
+    task: TaskRecord | None,
+    *,
+    focus: FocusRecord | None = None,
+) -> list[MemoryDocument]:
+    if task is None and focus is None:
         return []
     store = MarkdownMemoryStore(workspace)
     targets: list[tuple[MemoryScope, str | None, int]] = [("project", None, 2)]
-    if task.project_id:
-        targets.append(("project", task.project_id, 3))
-    if task.team_id:
+    project_id = task.project_id if task is not None else (focus.project_id if focus is not None else "")
+    agent_id = task.agent_id if task is not None else (focus.agent_id if focus is not None else "")
+    if project_id:
+        targets.append(("project", project_id, 3))
+    if task is not None and task.team_id:
         targets.append(("team", task.team_id, 2))
-    if task.agent_id:
-        targets.append(("agent", task.agent_id, 2))
-    targets.append(("task", task.task_id, 3))
+    if agent_id:
+        targets.append(("agent", agent_id, 2))
+    if task is not None:
+        targets.append(("task", task.task_id, 3))
 
     memories: list[MemoryDocument] = []
     seen: set[Path] = set()
@@ -313,18 +354,20 @@ def collect_relevant_memories(workspace: Workspace, task: TaskRecord | None) -> 
                 continue
             seen.add(resolved)
             memories.append(document)
-    memories.sort(key=lambda item: (not item.pinned, _memory_relevance_rank(item, task), -item.modified_at))
+    memories.sort(key=lambda item: (not item.pinned, _memory_relevance_rank(item, task, focus), -item.modified_at))
     return memories[:6]
 
 
-def _memory_relevance_rank(memory: MemoryDocument, task: TaskRecord) -> int:
-    if memory.scope == "task" and memory.owner == task.task_id:
+def _memory_relevance_rank(memory: MemoryDocument, task: TaskRecord | None, focus: FocusRecord | None = None) -> int:
+    project_id = task.project_id if task is not None else (focus.project_id if focus is not None else "")
+    agent_id = task.agent_id if task is not None else (focus.agent_id if focus is not None else "")
+    if task is not None and memory.scope == "task" and memory.owner == task.task_id:
         return 0
-    if memory.scope == "project" and memory.owner == task.project_id:
+    if memory.scope == "project" and memory.owner == project_id:
         return 1
-    if memory.scope == "team" and memory.owner == task.team_id:
+    if task is not None and memory.scope == "team" and memory.owner == task.team_id:
         return 2
-    if memory.scope == "agent" and memory.owner == task.agent_id:
+    if memory.scope == "agent" and memory.owner == agent_id:
         return 3
     if memory.scope == "project" and not memory.owner:
         return 4
@@ -366,6 +409,26 @@ def _append_task_context(lines: list[str], task: TaskRecord) -> None:
         lines.append(f"- owner agent: {task.agent_id}")
     if task.description:
         lines.append(f"- objective: {_one_line(task.description, 360)}")
+
+
+def _append_focus_context(lines: list[str], focus: FocusRecord) -> None:
+    lines.append("")
+    lines.append("Focus:")
+    lines.append(f"- title: {_one_line(focus.title, 160)}")
+    lines.append(f"- id: {focus.focus_id}")
+    lines.append(f"- status: {focus.status}")
+    if focus.project_id:
+        lines.append(f"- project: {focus.project_id}")
+    if focus.agent_id:
+        lines.append(f"- agent: {focus.agent_id}")
+    if focus.directory:
+        lines.append(f"- directory: {focus.directory}")
+    if focus.session_id:
+        lines.append(f"- session: {focus.session_id}")
+    if focus.description:
+        lines.append(f"- objective: {_one_line(focus.description, 360)}")
+    recent_notes = [str(note.get("text") or "") for note in focus.notes[-3:] if isinstance(note, dict)]
+    _append_list(lines, "recent notes", recent_notes, max_items=3)
 
 
 def _append_agent_role_context(lines: list[str], agent: AgentRecord, template: str) -> None:
@@ -496,6 +559,14 @@ def _apply_task_defaults(request: RunRequest, task: TaskRecord) -> None:
     request.agent = request.agent or task.agent_id
     request.session = request.session or task.session_id or None
     request.title = request.title or task.title
+
+
+def _apply_focus_defaults(request: RunRequest, focus: FocusRecord) -> None:
+    request.project = request.project or focus.project_id or None
+    request.agent = request.agent or focus.agent_id or None
+    request.session = request.session or focus.session_id or None
+    request.cwd = request.cwd or focus.directory or None
+    request.title = request.title or focus.title
 
 
 def _apply_project_defaults(request: RunRequest, project: ProjectRecord) -> None:

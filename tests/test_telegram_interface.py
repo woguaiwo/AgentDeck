@@ -30,6 +30,7 @@ from agentdeck.interfaces.telegram import (
 from agentdeck.storage.approvals import ApprovalRegistry
 from agentdeck.storage.agents import DEFAULT_ASSISTANT_TEMPLATE, AgentRegistry, role_template_for_agent
 from agentdeck.storage.errors import ErrorIncidentStore
+from agentdeck.storage.focus import FocusRegistry
 from agentdeck.storage.jobs import JobRegistry
 from agentdeck.storage.progress import ProgressJournal
 from agentdeck.storage.projects import ProjectRegistry
@@ -77,6 +78,81 @@ class TelegramInterfaceTests(unittest.TestCase):
             session = SessionRegistry(workspace).get(task.session_id)
             assert session is not None
             self.assertEqual(session.agent_id, "owner")
+
+    def test_handler_creates_focus_and_routes_plain_text_to_focus(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            project = tmp / "project"
+            project.mkdir()
+            ProjectRegistry(workspace).upsert(project_id="proj", project_dir=project)
+            AgentRegistry(workspace).upsert(agent_id="owner", project_id="proj", adapter="echo", project_dir=project)
+            seen: list[RunRequest] = []
+
+            async def runner(workspace_arg: Workspace, request: RunRequest) -> RunServiceResult:
+                seen.append(request)
+                return RunServiceResult(
+                    session_id="session-focus",
+                    final_text=f"done: {request.prompt}",
+                    events=[],
+                    agent_id=request.agent or "owner",
+                    adapter="echo",
+                    focus_id=request.focus or "",
+                )
+
+            handler = TelegramCommandHandler(workspace, runner=runner)
+
+            created = asyncio.run(handler.handle_text("/focus new Explore handoff", chat_id=42))[0]
+            self.assertIn("Focus created and selected", created)
+            focus_id = TelegramChatStateStore(workspace).current_focus(42)
+            self.assertTrue(focus_id)
+
+            reply = asyncio.run(handler.handle_text("continue this", chat_id=42))[0]
+            self.assertIn("done: continue this", reply)
+            self.assertEqual(seen[-1].focus, focus_id)
+            self.assertEqual(seen[-1].agent, "owner")
+
+    def test_auto_start_uses_current_focus_without_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            project = tmp / "project"
+            project.mkdir()
+            ProjectRegistry(workspace).upsert(project_id="proj", project_dir=project)
+            AgentRegistry(workspace).upsert(agent_id="owner", project_id="proj", adapter="echo", project_dir=project)
+            focus = FocusRegistry(workspace).create(
+                title="Focus auto",
+                project_id="proj",
+                agent_id="owner",
+                directory=project,
+            )
+            seen: list[RunRequest] = []
+
+            async def runner(workspace_arg: Workspace, request: RunRequest) -> RunServiceResult:
+                seen.append(request)
+                return RunServiceResult(
+                    session_id="session-auto-focus",
+                    final_text="auto done",
+                    events=[],
+                    agent_id=request.agent or "owner",
+                    adapter="echo",
+                    focus_id=request.focus or "",
+                )
+
+            queue = TelegramJobQueue(workspace, sender=lambda chat_id, text: None, runner=runner)
+            handler = TelegramCommandHandler(workspace, job_queue=queue)
+            TelegramChatStateStore(workspace).set_current_focus(42, focus.focus_id)
+
+            reply = asyncio.run(handler.handle_text("/auto start", chat_id=42))[0]
+            self.assertIn("Auto mode enabled", reply)
+            self.assertIn("focus: Focus auto", reply)
+            job_id = re.search(r"Job started: (job-\S+)", reply).group(1)
+            queue.wait(job_id, timeout=2)
+            self.assertEqual(seen[-1].focus, focus.focus_id)
+            job = JobRegistry(workspace).get(job_id)
+            assert job is not None
+            self.assertEqual(job.task_id, "")
+            self.assertEqual(job.metadata.get("focus_id"), focus.focus_id)
 
     def test_handler_lists_and_resolves_approvals(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -158,7 +234,7 @@ class TelegramInterfaceTests(unittest.TestCase):
             self.assertIn("Current task set", selected)
 
             status = asyncio.run(handler.handle_text("/status", chat_id=42))[0]
-            self.assertIn("Current task: Phone control task", status)
+            self.assertIn("Legacy task: Phone control task", status)
             self.assertIn("Pending approvals: 1", status)
             self.assertIn("Phone session", status)
 
@@ -419,7 +495,7 @@ class TelegramInterfaceTests(unittest.TestCase):
             handler = TelegramCommandHandler(workspace, job_queue=queue)
 
             hint = asyncio.run(handler.handle_text("continue before selecting", chat_id=42))[0]
-            self.assertIn("No current task is selected", hint)
+            self.assertIn("No current focus is selected", hint)
             self.assertEqual(seen, [])
 
             AgentRegistry(workspace).upsert(
@@ -1299,20 +1375,20 @@ class TelegramInterfaceTests(unittest.TestCase):
 
             disabled = asyncio.run(handler.handle_text("/memory disable 1", chat_id=42))[0]
             self.assertIn("Memory disabled: Phone snapshot", disabled)
-            self.assertIn("It will no longer be injected into task context.", disabled)
+            self.assertIn("It will no longer be injected into focus context.", disabled)
 
             context_without_memory = asyncio.run(handler.handle_text("/context", chat_id=42))[0]
             self.assertNotIn("Phone snapshot [project:proj]", context_without_memory)
 
             enabled = asyncio.run(handler.handle_text("/memory enable 1", chat_id=42))[0]
             self.assertIn("Memory enabled: Phone snapshot", enabled)
-            self.assertIn("It can be retrieved into future task context again.", enabled)
+            self.assertIn("It can be retrieved into future focus context again.", enabled)
 
             context_after_enable = asyncio.run(handler.handle_text("/context", chat_id=42))[0]
             self.assertIn("Phone snapshot [project:proj] pinned", context_after_enable)
 
             missing = asyncio.run(handler.handle_text("/context missing-task", chat_id=42))[0]
-            self.assertIn("Task not found", missing)
+            self.assertIn("No current focus", missing)
 
     def test_project_state_and_decisions_are_visible_from_telegram(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1391,7 +1467,7 @@ class TelegramInterfaceTests(unittest.TestCase):
             status = asyncio.run(handler.handle_text("/status", chat_id=42))[0]
             self.assertIn("Project: Beta", status)
             self.assertIn("Agent: Beta Owner", status)
-            self.assertIn("Current task: Beta task", status)
+            self.assertIn("Legacy task: Beta task", status)
 
     def test_phone_console_creates_project_agent_and_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -1476,11 +1552,12 @@ class TelegramInterfaceTests(unittest.TestCase):
                 first_job = re.search(r"Job started: (job-\S+)", reply).group(1)
                 queue.wait(first_job, timeout=2)
                 self.assertTrue(second_started.wait(timeout=2))
-                self.assertEqual(seen[0].task, task.task_id)
+                self.assertIsNone(seen[0].task)
+                self.assertTrue(seen[0].focus)
                 self.assertEqual(seen[0].approval_mode, "bypass")
                 self.assertEqual(seen[1].approval_mode, "bypass")
-                self.assertIn("请继续推进当前任务", seen[0].prompt)
-                self.assertIn("请继续推进当前任务", seen[1].prompt)
+                self.assertIn("请继续推进当前 Focus", seen[0].prompt)
+                self.assertIn("请继续推进当前 Focus", seen[1].prompt)
 
                 status = asyncio.run(handler.handle_text("/auto status", chat_id=42))[0]
                 self.assertIn("Auto mode: on", status)
@@ -1565,18 +1642,19 @@ class TelegramInterfaceTests(unittest.TestCase):
 
                 reply = asyncio.run(handler.handle_text("/auto start", chat_id=42))[0]
                 self.assertIn("Auto mode enabled.", reply)
-                self.assertIn("Created task from current session:", reply)
+                self.assertIn("Created focus from current session:", reply)
                 self.assertIn("IMU Generation Owner", reply)
                 job_id = re.search(r"Job started: (job-\S+)", reply).group(1)
                 queue.wait(job_id, timeout=2)
 
-                current_task_id = TelegramChatStateStore(workspace).current_task(42)
-                task = TaskBoard(workspace).get(current_task_id)
-                assert task is not None
-                self.assertEqual(task.session_id, session.session_id)
-                self.assertEqual(task.project_id, "imu-generation")
-                self.assertEqual(task.agent_id, "imu-generation-owner")
-                self.assertEqual(seen[0].task, task.task_id)
+                current_focus_id = TelegramChatStateStore(workspace).current_focus(42)
+                focus = FocusRegistry(workspace).get(current_focus_id)
+                assert focus is not None
+                self.assertEqual(focus.session_id, session.session_id)
+                self.assertEqual(focus.project_id, "imu-generation")
+                self.assertEqual(focus.agent_id, "imu-generation-owner")
+                self.assertIsNone(seen[0].task)
+                self.assertTrue(seen[0].focus)
                 self.assertEqual(seen[0].session, session.session_id)
                 asyncio.run(handler.handle_text("/auto end", chat_id=42))
             finally:
@@ -1718,7 +1796,7 @@ class TelegramInterfaceTests(unittest.TestCase):
                 seen.append(request)
                 return RunServiceResult(
                     session_id="session-auto-task",
-                    final_text="The task is sufficiently complete.\nAGENTDECK_AUTO_TASK_DONE",
+                    final_text="The focus is sufficiently complete.\nAGENTDECK_AUTO_FOCUS_DONE",
                     events=[],
                     agent_id="owner",
                     adapter="echo",
@@ -1733,16 +1811,17 @@ class TelegramInterfaceTests(unittest.TestCase):
 
                 asyncio.run(handler.handle_text(f"/use {task.task_id}", chat_id=42))
                 reply = asyncio.run(handler.handle_text("/auto task", chat_id=42))[0]
-                self.assertIn("mode: task", reply)
+                self.assertIn("mode: focus", reply)
                 first_job = re.search(r"Job started: (job-\S+)", reply).group(1)
                 queue.wait(first_job, timeout=2)
                 time.sleep(0.05)
 
                 self.assertEqual(len(seen), 1)
-                self.assertIn("AGENTDECK_AUTO_TASK_DONE", seen[0].prompt)
-                self.assertTrue(any("Auto by task stopped: task judged complete." in text for _, text in sent))
-                self.assertTrue(all("AGENTDECK_AUTO_TASK_DONE" not in text for _, text in sent))
-                updated = TaskBoard(workspace).get(task.task_id)
+                self.assertIn("AGENTDECK_AUTO_FOCUS_DONE", seen[0].prompt)
+                self.assertTrue(any("Auto by focus stopped: focus judged complete." in text for _, text in sent))
+                self.assertTrue(all("AGENTDECK_AUTO_FOCUS_DONE" not in text for _, text in sent))
+                current_focus_id = TelegramChatStateStore(workspace).current_focus(42)
+                updated = FocusRegistry(workspace).get(current_focus_id)
                 assert updated is not None
                 self.assertEqual(updated.status, "review")
                 status = asyncio.run(handler.handle_text("/auto status", chat_id=42))[0]
