@@ -36,7 +36,7 @@ class AgentRegistryTests(unittest.TestCase):
             self.assertEqual(record.team_id, "motion-x")
             self.assertEqual(registry.resolve("Motion-X Owner").agent_id, "motion-x-owner")
             self.assertEqual(registry.list(team_id="motion-x")[0].title, "Motion-X Owner")
-            self.assertIn("Coordinate the current task", role_template_for_agent(record))
+            self.assertIn("Coordinate the current focus", role_template_for_agent(record))
             directory = DirectoryRegistry(workspace).resolve(tmpdir)
             assert directory is not None
             self.assertEqual(record.metadata["directory_id"], directory.directory_id)
@@ -211,6 +211,7 @@ class AgentRegistryTests(unittest.TestCase):
             assistant = AgentRegistry(workspace).resolve(assistant_id)
             assert assistant is not None
             self.assertIn("You are the user's AgentDeck assistant", role_template_for_agent(assistant))
+            self.assertIn("/use focus", role_template_for_agent(assistant))
             self.assertIn("/use session", role_template_for_agent(assistant))
             self.assertIn("do not merely describe or claim", role_template_for_agent(assistant))
 
@@ -237,6 +238,7 @@ class AgentRegistryTests(unittest.TestCase):
             self.assertIn(f"refreshed Minsys Bot 3 Assistant ({assistant_id})", stdout.getvalue())
             refreshed = AgentRegistry(workspace).resolve(assistant_id)
             assert refreshed is not None
+            self.assertIn("/use focus", role_template_for_agent(refreshed))
             self.assertIn("/use session", role_template_for_agent(refreshed))
 
 

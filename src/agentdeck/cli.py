@@ -400,7 +400,7 @@ def build_parser() -> argparse.ArgumentParser:
     telegram_sub = telegram.add_subparsers(dest="telegram_command", required=True)
     telegram_serve = telegram_sub.add_parser("serve", help="Start Telegram long-polling service")
     telegram_serve.add_argument("--bot", help="Only serve one saved bot id from telegram bots registry")
-    telegram_serve.add_argument("--assistant-agent", help="Assistant agent used before a task is selected")
+    telegram_serve.add_argument("--assistant-agent", help="Assistant agent used before a focus or session is selected")
     telegram_serve.add_argument("--token", help="Telegram bot token; defaults to AGENTDECK_TELEGRAM_TOKEN")
     telegram_serve.add_argument(
         "--allowed-chat-id",
@@ -412,7 +412,7 @@ def build_parser() -> argparse.ArgumentParser:
     telegram_serve.add_argument("--once", action="store_true", help="Process one polling response and exit")
     telegram_start = telegram_sub.add_parser("start", help="Start Telegram service as a detached background process")
     telegram_start.add_argument("--bot", help="Only serve one saved bot id from telegram bots registry")
-    telegram_start.add_argument("--assistant-agent", help="Assistant agent used before a task is selected")
+    telegram_start.add_argument("--assistant-agent", help="Assistant agent used before a focus or session is selected")
     telegram_start.add_argument("--token", help="Telegram bot token; defaults to AGENTDECK_TELEGRAM_TOKEN")
     telegram_start.add_argument(
         "--allowed-chat-id",
@@ -425,7 +425,7 @@ def build_parser() -> argparse.ArgumentParser:
     telegram_stop.add_argument("--force", action="store_true", help="Send SIGKILL if SIGTERM does not stop the bot")
     telegram_restart = telegram_sub.add_parser("restart", help="Restart detached Telegram bot service")
     telegram_restart.add_argument("--bot", help="Only serve one saved bot id from telegram bots registry")
-    telegram_restart.add_argument("--assistant-agent", help="Assistant agent used before a task is selected")
+    telegram_restart.add_argument("--assistant-agent", help="Assistant agent used before a focus or session is selected")
     telegram_restart.add_argument("--token", help="Telegram bot token; defaults to AGENTDECK_TELEGRAM_TOKEN")
     telegram_restart.add_argument(
         "--allowed-chat-id",

@@ -3504,7 +3504,7 @@ class TelegramCommandHandler:
                 f"Agent template set: {updated.title}",
                 str(updated.metadata.get("role_template") or ""),
                 "",
-                "Future task runs for this agent will include this guidance.",
+                "Future focus and session runs for this agent will include this guidance.",
             ]
         )
 
@@ -3549,7 +3549,7 @@ class TelegramCommandHandler:
                 f"project: {agent.project_id or '-'}",
                 f"role: {agent.role}",
                 f"adapter: {agent.adapter}",
-                "Next: /task new <title> or /tasks",
+                "Next: /focus new <title>, /session scan <cwd>, or /sessions",
             ]
         )
 
@@ -4490,7 +4490,7 @@ def _assistant_action_allowed(action: str) -> tuple[bool, str]:
     if command == "/restart":
         return (True, "") if not rest.strip() else (False, "/restart does not accept arguments")
     if command == "/use":
-        return (True, "") if rest.strip() else (False, "/use requires a project, agent, or task reference")
+        return (True, "") if rest.strip() else (False, "/use requires a project, directory, agent, focus, session, or legacy task reference")
     if command == "/project":
         if not rest.strip() or lowered_sub in {"new", "create", "use", "select"}:
             return True, ""
@@ -4523,8 +4523,8 @@ def _assistant_unverified_state_change_warning(text: str) -> str:
     if not clean:
         return ""
     patterns = [
-        r"(已|已经|currently|now)\s*.*(进入|切换|选中|选择|selected|switched|entered)\s*.*(session|任务|项目|agent|task|project)",
-        r"(进入|切换到|选中|选择了)\s*.*(session|任务|项目|agent|task|project)",
+        r"(已|已经|currently|now)\s*.*(进入|切换|选中|选择|selected|switched|entered)\s*.*(session|focus|directory|目录|焦点|任务|项目|agent|task|project)",
+        r"(进入|切换到|选中|选择了)\s*.*(session|focus|directory|目录|焦点|任务|项目|agent|task|project)",
     ]
     if not any(re.search(pattern, clean, flags=re.IGNORECASE) for pattern in patterns):
         return ""
@@ -4532,7 +4532,7 @@ def _assistant_unverified_state_change_warning(text: str) -> str:
         [
             "State change was not verified.",
             "The assistant did not execute an AGENTDECK_ACTION, so AgentDeck may not have actually switched context.",
-            "Use /current to confirm, or send /use session <list #> / /use task <list #> directly.",
+            "Use /current to confirm, or send /use session <list #>, /use focus <list #>, or /use directory <list #> directly.",
         ]
     )
 

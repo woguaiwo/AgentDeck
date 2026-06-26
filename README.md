@@ -18,24 +18,25 @@ AgentDeck is organized around five layers:
    - Keeps room for Claude Code, DeepSeek HTTP mode, and legacy TUI adapters.
 
 2. **Project Control Plane**
-   - Manages projects, agents, tasks, sessions, jobs, approvals, events, and
-     workspace state.
-   - Turns one-off terminal sessions into traceable project workflows.
+   - Manages projects, directories, agents, sessions, focus records, jobs,
+     approvals, events, and workspace state.
+   - Turns one-off provider sessions into traceable, directory-bound work.
 
 3. **Multi-Agent Collaboration**
    - Models project roles such as owner, manager, planner, developer, tester,
      executor, and reviewer.
-   - Supports task boards, handoff notes, manager reviews, decision logs,
-     project state cards, and session state cards.
+   - Supports focus history, handoff notes, manager reviews, decision logs,
+     project state cards, session state cards, and legacy task boards.
 
 4. **Remote Interface And Navigation Assistant**
    - Exposes Telegram and local Web control surfaces, with CLI and future TUI
      interfaces sharing the same state model.
-   - Lets each Telegram bot use its own assistant before a chat selects a task.
+   - Lets each Telegram bot use its own assistant before a chat selects a
+     directory, session, or focus.
    - Allows the assistant to execute a narrow whitelist of safe routing commands.
 
 5. **Autonomous Progress Engine**
-   - Supports auto loop mode and auto-by-task mode.
+   - Supports auto loop mode and auto-until-focus-done mode.
    - Can keep background jobs moving after SSH disconnects.
    - Records progress and stops for explicit human input when needed.
 
@@ -107,8 +108,9 @@ workspace inside the AgentDeck install/source directory:
 <AgentDeck>/.agentdeck/
 ```
 
-That workspace stores projects, agents, tasks, sessions, Telegram bot configs,
-jobs, approvals, memory, handoffs, and decisions. The directory where you run
+That workspace stores projects, directories, agents, focus records, sessions,
+Telegram bot configs, jobs, approvals, memory, handoffs, decisions, and legacy
+tasks. The directory where you run
 `agentdeck` is treated as a project working directory only when you register it
 with `projects create --cwd ...` or pass it as an adapter `--cwd`.
 
@@ -125,11 +127,11 @@ agentdeck init
 agentdeck doctor
 agentdeck projects create motionx --title "Motion-X" --cwd "$PWD" --default-agent owner
 agentdeck agents create owner --title "Motion-X Owner" --project motionx --adapter codex --cwd "$PWD"
-agentdeck tasks create "Summarize repository" --project motionx
+agentdeck focus create "Summarize repository" --project motionx --agent owner --cwd "$PWD"
 agentdeck run --project motionx "Summarize this repository"
-agentdeck run --task <task_id> "Continue"
 agentdeck projects list
-agentdeck tasks list
+agentdeck directories list --project motionx
+agentdeck focus list --project motionx
 agentdeck sessions list
 agentdeck approvals list
 ```
@@ -146,8 +148,9 @@ agentdeck sessions scan --provider codex --cwd /old/project/path
 agentdeck sessions scan --provider kimi --cwd /old/project/path
 ```
 
-Then bind the chosen provider session to an AgentDeck project, agent, and
-optional task:
+Then bind the chosen provider session to an AgentDeck project and agent. The
+imported session is also bound to a stable directory id through
+`DirectoryRegistry`:
 
 ```bash
 agentdeck sessions import \
@@ -161,7 +164,7 @@ agentdeck sessions import \
   --provider kimi \
   --provider-session <kimi_session_id> \
   --project <project_id> \
-  --task <task_id>
+  --agent <agent_id>
 ```
 
 After import, `agentdeck run --session <provider_session_id> "Continue"` resumes
@@ -211,7 +214,9 @@ http://127.0.0.1:8765
 ```
 
 The Web console shows projects, tasks, agents, sessions, recent jobs, and
-pending approvals, plus JSON endpoints for future frontends:
+pending approvals, plus JSON endpoints for future frontends. It still has more
+task-first UI than Telegram; the next UI pass should expose directories and
+focus records as first-class navigation objects.
 
 ```text
 /
@@ -261,8 +266,8 @@ agentdeck telegram serve
 
 When saved bots exist for the current server, `telegram serve` and
 `telegram start` serve all of them by default. Each bot uses its own assistant
-before a chat selects a task. Pass `--bot <bot_id>` only when you want to debug
-or run one bot.
+before a chat selects a directory, session, or focus. Pass `--bot <bot_id>` only
+when you want to debug or run one bot.
 
 `telegram serve` is foreground mode for debugging. To keep the Telegram
 controller alive after disconnecting SSH, start it as a detached workspace
@@ -289,29 +294,36 @@ Supported commands:
 /projects
 /project <project_id or list #>
 /project new <project_id> <cwd> [title]
+/directories [project]
+/directory <directory_id, path, title, or list #>
+/directory add <path> [project]
 /projectstate [project]
 /decisions [project]
 /decide <decision text>
 /use project <project_id or list #>
+/use directory <directory_id or list #>
 /agents [project]
 /agent <agent_id or list #>
 /agent new <agent_id> [adapter] [role] [title]
+/agent template <prompt>
+/agent template clear [agent]
 /use agent <agent_id or list #>
-/tasks [project]
-/task <task_id>
-/task new <task title>
-/newtask <task title>
-/use <task_id or exact task title>
-/use task <task_id or list #>
+/focus [project]
+/focus new <title>
+/focus set [focus #] <paragraph>
+/focus note <focus #> <note>
+/focus status <focus #> <status> [note]
+/use focus <focus_id or list #>
 /use session <session_id or list #>
 /assistant
 /current
 /status
 /restart
 /restart force
+/video <path> [caption]
 /list
-/context [task]
-/memories [task]
+/context [focus]
+/memories [focus]
 /memory disable <memory #, id, title, or path>
 /memory enable <memory #, id, title, or path>
 /compact [--pin] [title]
@@ -321,9 +333,11 @@ Supported commands:
 /sessions [agent]
 /session <session_id or list #>
 /session use <session_id or list #>
+/session scan [codex|kimi] <old cwd>
+/session import <scan #> [project <project>] [task <task>] [agent <agent>]
 /resume <session_id or list #> <message>
 /auto start [hours]
-/auto task [hours]
+/auto focus [hours]
 /auto -h start [hours]
 /auto --human start [hours]
 /auto <hours>
@@ -332,7 +346,6 @@ Supported commands:
 /auto end
 <plain text message>
 /run <task_id> <message>
-/run <list #> <message>
 /run <message>
 /jobs
 /job <job_id>
@@ -346,18 +359,22 @@ Supported commands:
 /approval <approval_id or list #>
 /approve <approval_id or list #> [note]
 /reject <approval_id or list #> [note]
+Legacy task commands: /tasks, /task, /task new, /newtask, /use task
 ```
 
-`/run` starts a background job and returns immediately with a job id. After a
-task is selected, plain text messages are treated the same as `/run <message>`.
-After a session is selected with `/use session <list #>` or
-`/session use <list #>`, plain text messages resume that session even when the
-session has no linked task. The success reply and `/current` both show the
-selected session so phone users can see whether they are talking to the
-assistant or a project agent. If no task or session is selected and a default
+`/run` starts a background job and returns immediately with a job id. The
+preferred flow is to select or create a focus, or to select an existing session.
+After a focus is selected with `/use focus <list #>` or created with
+`/focus new <title>`, plain text messages run against that focus. After a
+session is selected with `/use session <list #>` or `/session use <list #>`,
+plain text messages resume that session even when the session has no linked
+legacy task. The success reply and `/current` both show the selected directory,
+focus, and session so phone users can see whether they are talking to the
+assistant or a project agent. If no focus or session is selected and a default
 assistant exists, plain text messages are sent to that assistant so it can help
-route the user to the right project, agent, task, or session. If no assistant
-exists, the bot returns a setup hint instead of sending the text to an agent.
+route the user to the right project, directory, agent, focus, or session. If no
+assistant exists, the bot returns a setup hint instead of sending the text to an
+agent.
 The bot continues receiving Telegram messages while the backend agent runs, then
 sends the final result back to the chat when the job finishes. Job records are
 stored under `.agentdeck/jobs/`; if AgentDeck restarts while a job is still
@@ -383,65 +400,72 @@ It receives AgentDeck context and can suggest exact CLI or Telegram commands.
 When the assistant is confident, it may place safe Telegram control commands on
 their own final lines as `AGENTDECK_ACTION: /command ...`. AgentDeck strips
 those marker lines from the user-visible reply and executes only a small
-whitelist of routing commands, such as `/projects`, `/tasks`, `/status`,
-`/use project`, `/use agent`, `/use task`, `/use session`, `/project new`,
-`/agent new`, `/task new`, and `/restart`. `/restart` refuses to reload while
-Telegram jobs are active, and assistant actions cannot force it. It will not
+whitelist of routing commands, such as `/projects`, `/directories`, `/agents`,
+`/focus`, `/sessions`, `/status`, `/use project`, `/use directory`,
+`/use agent`, `/use focus`, `/use session`, `/project new`, `/directory add`,
+`/agent new`, `/session scan`, `/session import`, and `/restart`. `/restart`
+refuses to reload while Telegram jobs are active, and assistant actions cannot
+force it. It will not
 execute `/run`, `/auto`, approval, cancellation, shell, destructive, or
 secret-revealing commands from assistant output. If an assistant claims that it
-switched project, task, agent, or session without emitting an executable
-`AGENTDECK_ACTION`, Telegram sends an extra warning telling the user to confirm
-with `/current`. Use `agentdeck assistant refresh` after upgrading AgentDeck to
-update saved assistant prompts to the latest routing rules.
+switched project, directory, focus, agent, or session without emitting an
+executable `AGENTDECK_ACTION`, Telegram sends an extra warning telling the user
+to confirm with `/current`. Use `agentdeck assistant refresh` after upgrading
+AgentDeck to update saved assistant prompts to the latest routing rules.
 
 Bot records are scoped to the server where they are imported or added. Use
 `assistant setup-bots` to create and bind one assistant per saved bot on the
 current server. Starting Telegram with `telegram start` serves all current
-server bots and uses each bot's assistant before a task is selected, falling
-back to the default `assistant` only when the bot has no assistant binding.
+server bots and uses each bot's assistant before a focus or session is selected,
+falling back to the default `assistant` only when the bot has no assistant
+binding.
 
 For phone use, `/status` is the main control panel. It shows the current
-project, agent, task, latest job, auto mode, pending approvals, and recent
-sessions. `/projects`, `/agents`, `/tasks`, `/jobs`, `/sessions`, and
-`/approvals` store numbered lists for the current chat, so commands like
-`/use project <list #>`, `/use agent <list #>`, `/use task <list #>`,
-`/use session <list #>`, `/run <list #> <message>`, `/job <list #>`,
+project, directory, agent, focus, session, latest job, auto mode, pending
+approvals, and recent sessions. `/projects`, `/directories`, `/agents`,
+`/focus`, `/jobs`, `/sessions`, and `/approvals` store numbered lists for the
+current chat, so commands like `/use project <list #>`,
+`/use directory <list #>`, `/use agent <list #>`, `/use focus <list #>`,
+`/use session <list #>`, `/job <list #>`,
 `/job resume <list #>`, `/cancel <list #>`, and `/resume <list #> <message>`
 avoid copying long ids.
 
-Projects, agents, and tasks can also be created from Telegram:
+Projects, directories, agents, and focus records can also be created from
+Telegram:
 
 ```text
 /project new motionx /data/lyxie/Motion-X Motion-X
+/directory add /data/lyxie/Motion-X/src motionx
 /agent new developer codex developer Motion-X Developer
-/task new Fix data loading
+/focus new Fix data loading
 ```
 
-After selecting a task once with `/use task <list #>` or creating one with
-`/task new <title>`, you can send a plain text message to the current agent.
+After selecting a focus once with `/use focus <list #>` or creating one with
+`/focus new <title>`, you can send a plain text message to the current agent.
 After selecting a session with `/use session <list #>`, plain text messages
-resume that session. `/sessions` shows the linked task title under each session
-when AgentDeck can find one, so a renamed task and an older session title remain
-distinguishable. `/run <message>` is still supported. `/job` shows the latest job
-in the chat, and `/cancel` cancels the latest queued or running job.
-Use `/assistant` or `/use assistant` to clear the current task and route plain
-text messages back to the assistant. Selecting a different project or agent with
-`/use project ...` or `/use agent ...` also clears the current task/session, so
-the next plain message goes through the assistant until you select or create a
-task or select a session.
+resume that session. `/sessions` shows focus and legacy task links under each
+session when AgentDeck can find them, so a renamed focus/task and an older
+provider session title remain distinguishable. `/run <message>` is still
+supported. `/job` shows the latest job in the chat, and `/cancel` cancels the
+latest queued or running job.
+Use `/assistant` or `/use assistant` to clear the current focus/session and
+route plain text messages back to the assistant. Selecting a different project
+or agent with `/use project ...` or `/use agent ...` also clears the current
+task/session in legacy compatibility mode, so select or create a focus or
+session before sending work messages.
 
-Auto mode is a task-level job loop. After selecting a task with `/use`, send
+Auto mode is a focus-level job loop. After selecting or creating a focus, send
 `/auto start` to start one run immediately and then keep starting the next run
 after each successful completion. `/auto 7.5` enables the same loop for 7.5
 hours. `/auto end` stops future automatic jobs; it does not kill a job already
 running, so use `/cancel` for that. The default auto prompt asks the agent to
-continue useful work and record important progress in project logs or task
+continue useful work and record important progress in project logs or focus
 notes. Use `/auto prompt <message>` to replace that instruction.
 
-Use `/auto task [hours]` when the loop should stop once the agent judges the
-current task to be sufficiently complete. AgentDeck injects a completion marker
+Use `/auto focus [hours]` when the loop should stop once the agent judges the
+current focus to be sufficiently complete. AgentDeck injects a completion marker
 into that auto prompt; if the backend returns the marker, AgentDeck strips it
-from the user-visible reply, stops auto mode, and moves the task to `review`.
+from the user-visible reply and stops auto mode.
 
 Auto mode defaults to automatic approval: auto-created jobs run with
 `approval_mode=bypass`, so they do not stop on backend approval prompts. Use
@@ -518,7 +542,7 @@ cancellation yet may still finish normally after `cancel_requested`.
 Agents should not share raw chat transcripts as memory. They should share:
 
 - concise durable facts
-- task state
+- focus and session state
 - handoff artifacts
 - evidence
 - structured events
@@ -527,10 +551,11 @@ Agents should not share raw chat transcripts as memory. They should share:
 Raw transcripts remain available for audit, but runtime prompts should receive
 bounded, relevant memory only.
 
-Use `memory compact-task <task_id>` to turn structured task context into a
-durable Markdown memory snapshot. It uses project state, session state,
-handoffs, and manager reviews; it does not copy raw chat transcripts or
-recursively copy older durable memory snapshots:
+Use `memory compact-task <task_id>` to turn structured legacy task context into
+a durable Markdown memory snapshot. The next memory pass should add the matching
+focus/session compact command. The existing compaction uses project state,
+session state, handoffs, and manager reviews; it does not copy raw chat
+transcripts or recursively copy older durable memory snapshots:
 
 ```bash
 agentdeck memory compact-task <task_id> \
@@ -542,10 +567,11 @@ agentdeck memory enable <memory_id_or_path>
 ```
 
 Telegram supports the same phone workflow with `/compact [--pin] [title]` for
-the current task and `/memories` to inspect the durable memories that future
-task runs will retrieve. Use `/compact --pin <title>` when a memory should be
-prioritized in future retrieval. Pinned memories are injected before ordinary
-recent memories; `disabled: true` memories are skipped. Use
+the current focus when available, falling back to legacy task context when
+needed. `/memories` inspects the durable memories that future runs will
+retrieve. Use `/compact --pin <title>` when a memory should be prioritized in
+future retrieval. Pinned memories are injected before ordinary recent memories;
+`disabled: true` memories are skipped. Use
 `/memory disable 1` after `/memories` to soft-prune a noisy memory without
 deleting its Markdown file, and `/memory enable 1` to restore it while the
 recent list is still active.
@@ -570,10 +596,10 @@ Use `projects state <project>` and `projects decisions <project>` to inspect
 the project state and decision log. Telegram supports `/projectstate`,
 `/decisions`, and `/decide <decision text>` for phone control.
 
-`tasks handoff` records compact progress for manager/executor workflows. It
-writes a phone-readable handoff note back to the task, appends a structured
-entry to `.agentdeck/journal/progress.jsonl`, and updates the attached session
-state card when the task has a session:
+`tasks handoff` records compact progress for the legacy manager/executor task
+workflow. It writes a phone-readable handoff note back to the task, appends a
+structured entry to `.agentdeck/journal/progress.jsonl`, and updates the
+attached session state card when the task has a session:
 
 ```bash
 agentdeck tasks handoff <task_id> \
@@ -585,12 +611,11 @@ agentdeck tasks handoff <task_id> \
   --artifact "src/agentdeck/storage/session_state.py"
 ```
 
-Use `agentdeck sessions state <session_id>` to inspect the compact
-state card used for resume and future auto-mode context. Use
-`agentdeck tasks context <task_id>` to see the bounded context block
-that will be injected into the next task run, and
-`agentdeck tasks handoffs <task_id>` to inspect recent handoff
-summaries.
+Use `agentdeck sessions state <session_id>` to inspect the compact state card
+used for resume and future auto-mode context. Use `agentdeck focus context
+<focus_id>` to see the bounded context block for focus-first runs. Legacy
+commands such as `agentdeck tasks context <task_id>` and `agentdeck tasks
+handoffs <task_id>` remain available for older task-based workflows.
 
 `tasks manager-review` records the manager side of the loop. Handoffs are
 executor reports; manager reviews are compact direction, approval, or requested
@@ -604,17 +629,15 @@ agentdeck tasks manager-review <task_id> \
 agentdeck tasks reviews <task_id>
 ```
 
-When a run is attached to a task, AgentDeck appends a bounded context block to
+When a run is attached to a focus, AgentDeck appends a bounded context block to
 the adapter prompt. The block includes project state, recent project decisions,
-the task objective, the attached session state card, recent handoffs, and recent
-manager reviews. It also retrieves recent durable Markdown memories from the
-task's project, team, agent, and task scopes. The original user prompt remains
-the prompt stored in the event log and session registry, so operational context
-does not pollute user-visible history.
-Telegram `/run`, plain text messages after `/use`, and auto-created jobs all
-use this same run path. On Telegram, `/context` shows the current task's
-injected context, `/handoffs` shows executor reports, and `/review` plus
-`/reviews` records and lists manager feedback.
+focus text, the attached session state card, recent handoffs, and relevant
+durable Markdown memories. The original user prompt remains the prompt stored
+in the event log and session registry, so operational context does not pollute
+user-visible history. Telegram `/run`, plain text messages after `/use focus`,
+and auto-created jobs all use this focus-first run path. On Telegram,
+`/context` shows the current focus context, while task review and handoff
+commands remain available for compatibility.
 
 ## Agent Model
 
@@ -634,9 +657,17 @@ agentdeck agents template <agent_id> --clear
 Telegram supports `/agent template <prompt>` for the current agent and
 `/agent template clear` to restore the role default.
 
-## Project And Task Model
+## Project, Directory, Session, And Focus Model
 
-Projects represent source directories such as `Motion-X`, `ReID`, or `WHAM`.
-Tasks represent units of work inside a project. `agentdeck run --task <task>`
-uses the task's project and agent defaults, then attaches the resulting session
-back to the task so later runs can continue the same work.
+Projects are high-level work domains such as `Motion-X`, `ReID`, or `WHAM`.
+They may contain multiple directories. Directories are stable control-plane
+records for concrete filesystem paths. Agents and provider sessions are bound
+to concrete directories, and sessions store stable `directory_id` metadata so
+future migration, import, clone, and UI workflows do not depend only on path
+strings.
+
+Focus records are mutable paragraphs of current intent owned by a session or
+agent. A focus can change over time while the underlying provider session and
+directory-bound agent remain durable. Legacy tasks still exist as compatibility
+records for older workflows, handoffs, and reviews, but new remote-control work
+should prefer directory + session + focus routing.
