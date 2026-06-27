@@ -210,6 +210,36 @@ def build_parser() -> argparse.ArgumentParser:
     sess_import.add_argument("--session-id", help="Explicit AgentDeck session id")
     sess_import.add_argument("--kind", help="Provider session kind override")
 
+    workers = sub.add_parser("workers", help="Manage session-agent workers")
+    worker_sub = workers.add_subparsers(dest="workers_command", required=True)
+    worker_list = worker_sub.add_parser("list", help="List session-agent workers")
+    worker_list.add_argument("--agent")
+    worker_show = worker_sub.add_parser("show", help="Show one session-agent worker as JSON")
+    worker_show.add_argument("session")
+    worker_state = worker_sub.add_parser("state", help="Show one worker state card as JSON")
+    worker_state.add_argument("session")
+    worker_rename = worker_sub.add_parser("rename", help="Rename one session-agent worker")
+    worker_rename.add_argument("session")
+    worker_rename.add_argument("title")
+    worker_scan = worker_sub.add_parser("scan", help="Find provider sessions that can be imported as workers")
+    worker_scan.add_argument("--provider", choices=["codex", "kimi"])
+    worker_scan.add_argument("--cwd", help="Only show sessions whose provider cwd matches this directory")
+    worker_scan.add_argument("--home", help="Home directory containing .codex/.kimi")
+    worker_scan.add_argument("--limit", type=int, default=20)
+    worker_scan.add_argument("--json", action="store_true", help="Print raw JSON")
+    worker_import = worker_sub.add_parser("import", help="Bind an existing provider session as a worker")
+    worker_import.add_argument("--provider", required=True, choices=["codex", "kimi"])
+    worker_import.add_argument("--provider-session", required=True, help="Codex thread id or Kimi session id")
+    worker_import.add_argument("--project", help="Project id or title")
+    worker_import.add_argument("--task", help="Optional legacy task id or title to attach to the imported worker")
+    worker_import.add_argument("--focus", help="Optional focus id or title to attach to the imported worker")
+    worker_import.add_argument("--agent", help="Identity id")
+    worker_import.add_argument("--adapter", choices=["codex", "codex-exec", "kimi", "kimi-print"])
+    worker_import.add_argument("--cwd", help="Provider working directory")
+    worker_import.add_argument("--title", help="Human-readable title")
+    worker_import.add_argument("--session-id", help="Explicit AgentDeck session-agent id")
+    worker_import.add_argument("--kind", help="Provider session kind override")
+
     agents = sub.add_parser("agents", help="Manage project agents")
     agent_sub = agents.add_subparsers(dest="agents_command", required=True)
     agent_create = agent_sub.add_parser("create", help="Create or replace one agent")
@@ -658,79 +688,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.approvals_command == "reject":
             return _resolve_approval(registry, TaskBoard(workspace), args.approval, "rejected", note=args.note or "")
 
-    if args.command == "sessions":
-        workspace.ensure()
-        registry = SessionRegistry(workspace)
-        if args.sessions_command == "list":
-            _print_sessions(registry.list(agent_id=args.agent))
-            return 0
-        if args.sessions_command == "show":
-            record = registry.resolve(args.session)
-            if record is None:
-                print(f"session not found: {args.session}", file=sys.stderr)
-                return 2
-            print(json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
-            return 0
-        if args.sessions_command == "state":
-            card = SessionStateStore(workspace).get(args.session)
-            if card is None:
-                print(f"session state not found: {args.session}", file=sys.stderr)
-                return 2
-            print(json.dumps(card.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
-            return 0
-        if args.sessions_command == "rename":
-            record = registry.rename(args.session, args.title)
-            if record is None:
-                print(f"session not found: {args.session}", file=sys.stderr)
-                return 2
-            print(f"renamed: {record.title} ({record.session_id})")
-            return 0
-        if args.sessions_command == "scan":
-            candidates = scan_provider_sessions(provider=args.provider, project_dir=args.cwd, home=args.home)
-            if args.limit and args.limit > 0:
-                candidates = candidates[: args.limit]
-            if args.json:
-                print(json.dumps([item.to_dict() for item in candidates], ensure_ascii=False, indent=2, sort_keys=True))
-            else:
-                _print_provider_sessions(candidates)
-            return 0
-        if args.sessions_command == "import":
-            project = ProjectRegistry(workspace).resolve(args.project) if args.project else None
-            if args.project and project is None:
-                print(f"project not found: {args.project}", file=sys.stderr)
-                return 2
-            project_dir = args.cwd or (project.project_dir if project is not None else ".")
-            agent_id = args.agent or (project.default_agent_id if project is not None else "default")
-            adapter = args.adapter or ("codex" if args.provider == "codex" else "kimi")
-            kind = args.kind or ("codex_thread" if args.provider == "codex" else "kimi_session")
-            try:
-                record = registry.import_provider_session(
-                    provider_session_id=args.provider_session,
-                    provider_session_kind=kind,
-                    agent_id=agent_id,
-                    adapter=adapter,
-                    project_dir=project_dir,
-                    title=args.title or "",
-                    session_id=args.session_id,
-                    project_id=project.project_id if project is not None else "",
-                    metadata={"provider": args.provider, "imported_by": "cli"},
-                )
-            except ValueError as exc:
-                print(str(exc), file=sys.stderr)
-                return 2
-            if args.task:
-                task = TaskBoard(workspace).attach_session(args.task, record.session_id)
-                if task is None:
-                    print(f"task not found: {args.task}", file=sys.stderr)
-                    return 2
-            if args.focus:
-                focus = FocusRegistry(workspace).attach_session(args.focus, record.session_id)
-                if focus is None:
-                    print(f"focus not found: {args.focus}", file=sys.stderr)
-                    return 2
-            print(f"imported: {record.title} ({record.session_id})")
-            print(f"provider_session_id: {record.provider_session_id}")
-            return 0
+    if args.command in {"sessions", "workers"}:
+        return _handle_session_agent_command(workspace, args)
 
     if args.command == "agents":
         workspace.ensure()
@@ -1448,6 +1407,85 @@ def _normalize_argv(argv: list[str] | None) -> list[str]:
     if workspace:
         return ["--workspace", workspace, *normalized]
     return normalized
+
+
+def _handle_session_agent_command(workspace: Workspace, args: argparse.Namespace) -> int:
+    workspace.ensure()
+    command = getattr(args, "sessions_command", None) or getattr(args, "workers_command", "")
+    registry = SessionRegistry(workspace)
+    entity_label = "worker" if args.command == "workers" else "session"
+
+    if command == "list":
+        _print_sessions(registry.list(agent_id=args.agent))
+        return 0
+    if command == "show":
+        record = registry.resolve(args.session)
+        if record is None:
+            print(f"{entity_label} not found: {args.session}", file=sys.stderr)
+            return 2
+        print(json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if command == "state":
+        card = SessionStateStore(workspace).get(args.session)
+        if card is None:
+            print(f"{entity_label} state not found: {args.session}", file=sys.stderr)
+            return 2
+        print(json.dumps(card.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if command == "rename":
+        record = registry.rename(args.session, args.title)
+        if record is None:
+            print(f"{entity_label} not found: {args.session}", file=sys.stderr)
+            return 2
+        print(f"renamed: {record.title} ({record.session_id})")
+        return 0
+    if command == "scan":
+        candidates = scan_provider_sessions(provider=args.provider, project_dir=args.cwd, home=args.home)
+        if args.limit and args.limit > 0:
+            candidates = candidates[: args.limit]
+        if args.json:
+            print(json.dumps([item.to_dict() for item in candidates], ensure_ascii=False, indent=2, sort_keys=True))
+        else:
+            _print_provider_sessions(candidates)
+        return 0
+    if command == "import":
+        project = ProjectRegistry(workspace).resolve(args.project) if args.project else None
+        if args.project and project is None:
+            print(f"project not found: {args.project}", file=sys.stderr)
+            return 2
+        project_dir = args.cwd or (project.project_dir if project is not None else ".")
+        agent_id = args.agent or (project.default_agent_id if project is not None else "default")
+        adapter = args.adapter or ("codex" if args.provider == "codex" else "kimi")
+        kind = args.kind or ("codex_thread" if args.provider == "codex" else "kimi_session")
+        try:
+            record = registry.import_provider_session(
+                provider_session_id=args.provider_session,
+                provider_session_kind=kind,
+                agent_id=agent_id,
+                adapter=adapter,
+                project_dir=project_dir,
+                title=args.title or "",
+                session_id=args.session_id,
+                project_id=project.project_id if project is not None else "",
+                metadata={"provider": args.provider, "imported_by": "cli", "entity": entity_label},
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if args.task:
+            task = TaskBoard(workspace).attach_session(args.task, record.session_id)
+            if task is None:
+                print(f"task not found: {args.task}", file=sys.stderr)
+                return 2
+        if args.focus:
+            focus = FocusRegistry(workspace).attach_session(args.focus, record.session_id)
+            if focus is None:
+                print(f"focus not found: {args.focus}", file=sys.stderr)
+                return 2
+        print(f"{'worker' if args.command == 'workers' else 'imported'}: {record.title} ({record.session_id})")
+        print(f"provider_session_id: {record.provider_session_id}")
+        return 0
+    return 0
 
 
 def _print_sessions(records: list[SessionRecord]) -> None:

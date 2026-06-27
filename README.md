@@ -132,35 +132,37 @@ agentdeck run --project motionx "Summarize this repository"
 agentdeck projects list
 agentdeck directories list --project motionx
 agentdeck focus list --project motionx
-agentdeck sessions list
+agentdeck workers list
 agentdeck approvals list
 ```
 
 ## Import Existing Provider Sessions
 
 AgentDeck can adopt Codex/Kimi sessions that were created before AgentDeck
-managed the project. First scan local provider state by the original provider
-working directory:
+managed the project. In the current model, an imported provider session becomes
+one session-agent worker. First scan local provider state by the original
+provider working directory:
 
 ```bash
-agentdeck sessions scan --cwd /old/project/path
-agentdeck sessions scan --provider codex --cwd /old/project/path
-agentdeck sessions scan --provider kimi --cwd /old/project/path
+agentdeck workers scan --cwd /old/project/path
+agentdeck workers scan --provider codex --cwd /old/project/path
+agentdeck workers scan --provider kimi --cwd /old/project/path
 ```
 
-Then bind the chosen provider session to an AgentDeck project and agent. The
-imported session is also bound to a stable directory id through
-`DirectoryRegistry`:
+Then bind the chosen provider session to an AgentDeck project and identity. The
+imported worker is also bound to a stable directory id through
+`DirectoryRegistry`. The older `agentdeck sessions ...` command remains as a
+compatibility alias for the same registry:
 
 ```bash
-agentdeck sessions import \
+agentdeck workers import \
   --provider codex \
   --provider-session <codex_thread_id> \
   --project <project_id> \
   --agent <agent_id> \
   --title "Imported Codex session"
 
-agentdeck sessions import \
+agentdeck workers import \
   --provider kimi \
   --provider-session <kimi_session_id> \
   --project <project_id> \

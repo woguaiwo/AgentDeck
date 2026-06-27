@@ -96,6 +96,14 @@ class SessionRegistryTests(unittest.TestCase):
 
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
+                code = main(["--workspace", str(workspace.root), "workers", "list"])
+            self.assertEqual(code, 0)
+            workers = stdout.getvalue()
+            self.assertIn("title\tsession_agent_id\tidentity", workers)
+            self.assertIn("Build planner", workers)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
                 code = main(
                     [
                         "--workspace",
@@ -110,11 +118,17 @@ class SessionRegistryTests(unittest.TestCase):
 
             stdout = io.StringIO()
             with contextlib.redirect_stdout(stdout):
-                code = main(["--workspace", str(workspace.root), "sessions", "show", "Planner review"])
+                code = main(["--workspace", str(workspace.root), "workers", "show", "Planner review"])
             self.assertEqual(code, 0)
             shown = json.loads(stdout.getvalue())
             self.assertEqual(shown["session_id"], session_id)
             self.assertEqual(shown["title"], "Planner review")
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(["--workspace", str(workspace.root), "workers", "rename", session_id, "Worker review"])
+            self.assertEqual(code, 0)
+            self.assertIn("renamed: Worker review", stdout.getvalue())
             self.assertTrue(shown["metadata"].get("directory_id"))
 
             stdout = io.StringIO()
@@ -126,7 +140,7 @@ class SessionRegistryTests(unittest.TestCase):
                         "run",
                         "next",
                         "--session",
-                        "Planner review",
+                        "Worker review",
                     ]
                 )
             self.assertEqual(code, 0)
