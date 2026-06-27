@@ -1070,6 +1070,9 @@ class TelegramCommandHandler:
         if rest and not command.startswith("/") and self._should_route_bare_text_to_assistant(chat_id):
             return [await self._plain_text(clean, chat_id=chat_id)]
 
+        if rest and not command.startswith("/"):
+            return [await self._plain_text(clean, chat_id=chat_id)]
+
         if command in {"/start", "/help", "help"}:
             return [_help_text()]
         if command in {"/projects", "projects"}:

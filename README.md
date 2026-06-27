@@ -683,17 +683,17 @@ agentdeck agents template <agent_id> --clear
 Telegram supports `/agent template <prompt>` for the current agent and
 `/agent template clear` to restore the role default.
 
-## Project, Directory, Session, And Focus Model
+## Project, Directory, Session-Agent, And Focus Model
 
 Projects are high-level work domains such as `Motion-X`, `ReID`, or `WHAM`.
 They may contain multiple directories. Directories are stable control-plane
-records for concrete filesystem paths. Agents and provider sessions are bound
-to concrete directories, and sessions store stable `directory_id` metadata so
-future migration, import, clone, and UI workflows do not depend only on path
-strings.
+records for concrete filesystem paths. A session-agent identity is the durable
+worker in one directory: one imported or created provider session corresponds
+to one AgentDeck agent identity. Role, title, and guidance are mutable
+properties of that identity, not separate permanent hierarchy.
 
-Focus records are mutable paragraphs of current intent owned by a session or
-agent. A focus can change over time while the underlying provider session and
-directory-bound agent remain durable. Legacy tasks still exist as compatibility
+Focus records are mutable paragraphs of current intent owned by a session-agent.
+A focus can change over time while the underlying provider session, directory
+binding, and identity remain durable. Legacy tasks still exist as compatibility
 records for older workflows, handoffs, and reviews, but new remote-control work
-should prefer directory + session + focus routing.
+should prefer directory + session-agent + focus routing.

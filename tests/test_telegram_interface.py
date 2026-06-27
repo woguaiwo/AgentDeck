@@ -113,6 +113,12 @@ class TelegramInterfaceTests(unittest.TestCase):
             self.assertEqual(seen[-1].focus, focus_id)
             self.assertEqual(seen[-1].agent, "owner")
 
+            natural_agent_text = "agent 和 session 应该是等价的，我不喜欢这部分过于复杂化"
+            reply = asyncio.run(handler.handle_text(natural_agent_text, chat_id=42))[0]
+            self.assertIn(f"done: {natural_agent_text}", reply)
+            self.assertEqual(seen[-1].prompt, natural_agent_text)
+            self.assertEqual(seen[-1].focus, focus_id)
+
     def test_handler_lists_uses_and_reports_directories(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
