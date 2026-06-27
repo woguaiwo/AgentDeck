@@ -1140,7 +1140,7 @@ class TelegramCommandHandler:
             return [self._review(rest, chat_id=chat_id)]
         if command in {"/reviews", "reviews"}:
             return [self._reviews(rest, chat_id=chat_id)]
-        if command in {"/sessions", "sessions"}:
+        if command in {"/sessions", "sessions", "/workers", "workers"}:
             return [self._sessions(rest, chat_id=chat_id)]
         if command in {"/session", "session"}:
             return [self._session(rest, chat_id=chat_id)]
@@ -2853,16 +2853,16 @@ class TelegramCommandHandler:
         agent_id = rest.strip() or None
         records = SessionRegistry(self.workspace).list(agent_id=agent_id)
         if not records:
-            return "No sessions."
+            return "No session-agents."
         records = records[:10]
         current_session_id = self.chat_state.current_session(chat_id) if chat_id is not None else ""
         if chat_id is not None:
             self.chat_state.set_recent_sessions(chat_id, [record.session_id for record in records])
-        lines = ["Sessions:"]
+        lines = ["Session-agents:"]
         for index, record in enumerate(records, 1):
             marker = " [current]" if record.session_id == current_session_id else ""
             lines.append(f"{index}. {record.title}{marker}")
-            lines.append(f"   status: {record.status}  agent: {record.agent_id}  adapter: {record.adapter}")
+            lines.append(f"   status: {record.status}  identity: {record.agent_id}  adapter: {record.adapter}")
             directory = self._directory_for_session(record)
             if directory is not None:
                 lines.append(f"   directory: {directory.title} ({directory.directory_id})")
@@ -4552,6 +4552,7 @@ def _assistant_action_allowed(action: str) -> tuple[bool, str]:
         "/directories",
         "/agents",
         "/tasks",
+        "/workers",
         "/sessions",
         "/current",
         "/status",
@@ -4723,6 +4724,7 @@ def _help_text() -> str:
             "/handoffs [focus or legacy task]",
             "/review <manager review summary>",
             "/reviews [focus or legacy task]",
+            "/workers [agent]",
             "/sessions [agent]",
             "/session <session_id or list #>",
             "/session use <session_id or list #>",

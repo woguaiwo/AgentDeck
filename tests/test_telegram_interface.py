@@ -350,8 +350,14 @@ class TelegramInterfaceTests(unittest.TestCase):
             handler = TelegramCommandHandler(workspace, job_queue=queue)
 
             sessions = asyncio.run(handler.handle_text("/sessions", chat_id=42))[0]
+            self.assertIn("Session-agents:", sessions)
             self.assertIn("1. Old session title", sessions)
-            self.assertIn("task: Renamed task", sessions)
+            self.assertIn("legacy task: Renamed task", sessions)
+
+            workers = asyncio.run(handler.handle_text("/workers", chat_id=42))[0]
+            self.assertIn("Session-agents:", workers)
+            self.assertIn("identity: owner", workers)
+            self.assertIn("legacy task: Renamed task", workers)
 
             selected = asyncio.run(handler.handle_text("/use session 1", chat_id=42))[0]
             self.assertIn("Session selected.", selected)

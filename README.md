@@ -330,6 +330,7 @@ Supported commands:
 /handoffs [focus or legacy task]
 /review <manager review summary>
 /reviews [focus or legacy task]
+/workers [agent]
 /sessions [agent]
 /session <session_id or list #>
 /session use <session_id or list #>
@@ -401,7 +402,7 @@ When the assistant is confident, it may place safe Telegram control commands on
 their own final lines as `AGENTDECK_ACTION: /command ...`. AgentDeck strips
 those marker lines from the user-visible reply and executes only a small
 whitelist of routing commands, such as `/projects`, `/directories`, `/agents`,
-`/focus`, `/sessions`, `/status`, `/use project`, `/use directory`,
+`/focus`, `/workers`, `/sessions`, `/status`, `/use project`, `/use directory`,
 `/use agent`, `/use focus`, `/use session`, `/project new`, `/directory add`,
 `/agent new`, `/session scan`, `/session import`, and `/restart`. `/restart`
 refuses to reload while Telegram jobs are active, and assistant actions cannot
@@ -423,7 +424,7 @@ binding.
 For phone use, `/status` is the main control panel. It shows the current
 project, directory, agent, focus, session, latest job, auto mode, pending
 approvals, and recent sessions. `/projects`, `/directories`, `/agents`,
-`/focus`, `/jobs`, `/sessions`, and `/approvals` store numbered lists for the
+`/focus`, `/jobs`, `/workers`, `/sessions`, and `/approvals` store numbered lists for the
 current chat, so commands like `/use project <list #>`,
 `/use directory <list #>`, `/use agent <list #>`, `/use focus <list #>`,
 `/use session <list #>`, `/job <list #>`,
@@ -443,7 +444,7 @@ Telegram:
 After selecting a focus once with `/use focus <list #>` or creating one with
 `/focus new <title>`, you can send a plain text message to the current agent.
 After selecting a session with `/use session <list #>`, plain text messages
-resume that session. `/sessions` shows focus and legacy task links under each
+resume that session. `/workers` or `/sessions` shows focus and legacy task links under each
 session when AgentDeck can find them, so a renamed focus/task and an older
 provider session title remain distinguishable. `/run <message>` is still
 supported. `/job` shows the latest job in the chat, and `/cancel` cancels the

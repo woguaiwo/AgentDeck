@@ -89,7 +89,7 @@ class SessionRegistryTests(unittest.TestCase):
                 code = main(["--workspace", str(workspace.root), "sessions", "list"])
             self.assertEqual(code, 0)
             listed = stdout.getvalue()
-            self.assertIn("title\tsession_id", listed)
+            self.assertIn("title\tsession_agent_id\tidentity", listed)
             self.assertIn("directory_id", listed)
             self.assertIn("Build planner", listed)
             self.assertNotIn("provider_session_id", listed)

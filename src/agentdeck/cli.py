@@ -1452,9 +1452,9 @@ def _normalize_argv(argv: list[str] | None) -> list[str]:
 
 def _print_sessions(records: list[SessionRecord]) -> None:
     if not records:
-        print("no sessions")
+        print("no session-agents")
         return
-    print("title\tsession_id\tagent\tadapter\tstatus\tupdated_at\tdirectory_id\tproject_dir")
+    print("title\tsession_agent_id\tidentity\tadapter\tstatus\tupdated_at\tdirectory_id\tproject_dir")
     for record in records:
         print(
             "\t".join(
