@@ -52,6 +52,7 @@ class DashboardLimits:
     focus: int = 18
     tasks: int = 18
     agents: int = 12
+    workers: int = 12
     sessions: int = 12
     jobs: int = 12
     approvals: int = 12
@@ -266,6 +267,7 @@ def build_dashboard_snapshot(workspace: Workspace, *, limits: DashboardLimits | 
             "tasks": len(tasks),
             "active_tasks": len(active_tasks),
             "agents": len(agents),
+            "workers": len(sessions),
             "sessions": len(sessions),
             "jobs": len(jobs),
             "active_jobs": len(active_jobs),
@@ -278,6 +280,7 @@ def build_dashboard_snapshot(workspace: Workspace, *, limits: DashboardLimits | 
         "focus": [_focus_summary(focus) for focus in focus_records[: limits.focus]],
         "tasks": [_task_summary(task, auto_states=auto_states) for task in tasks[: limits.tasks]],
         "agents": [_agent_summary(agent) for agent in agents[: limits.agents]],
+        "workers": [_worker_summary(session, focus_records, directories) for session in sessions[: limits.workers]],
         "sessions": [_session_summary(session) for session in sessions[: limits.sessions]],
         "jobs": [_job_summary(job) for job in jobs[: limits.jobs]],
         "approvals": [_approval_summary(approval) for approval in approvals[: limits.approvals]],
@@ -493,7 +496,7 @@ def render_dashboard_html(snapshot: dict[str, Any], *, notice: str = "", error: 
             _panel("Focus", _focus_cards(snapshot.get("focus", []))),
             _panel("Tasks", _task_cards(snapshot.get("tasks", []))),
             _panel("Agents", _agent_cards(snapshot.get("agents", []))),
-            _panel("Sessions", _session_cards(snapshot.get("sessions", []))),
+            _panel("Workers", _worker_cards(snapshot.get("workers", []))),
             _panel("Jobs", _job_cards(snapshot.get("jobs", []))),
             _panel("Approvals", _approval_cards(snapshot.get("approvals", []))),
             "</section>",
@@ -620,6 +623,50 @@ def _session_summary(session: Any) -> dict[str, Any]:
         "last_user_message": _preview(session.last_user_message, 160),
         "last_assistant_final": _preview(session.last_assistant_final, 220),
     }
+
+
+def _worker_summary(session: Any, focus_records: list[Any], directories: list[Any]) -> dict[str, Any]:
+    focus = _focus_for_session(session, focus_records)
+    directory = _directory_for_session_summary(session, directories)
+    return {
+        **_session_summary(session),
+        "session_agent_id": session.session_id,
+        "identity": session.agent_id,
+        "focus_id": focus.focus_id if focus is not None else "",
+        "focus_title": focus.title if focus is not None else "",
+        "focus_text": _preview(focus.description, 180) if focus is not None else "",
+        "directory_id": directory.directory_id if directory is not None else str(session.metadata.get("directory_id") or ""),
+        "directory_title": directory.title if directory is not None else "",
+        "directory_path": directory.path if directory is not None else session.project_dir,
+    }
+
+
+def _focus_for_session(session: Any, focus_records: list[Any]) -> Any | None:
+    current_focus_id = str(session.metadata.get("current_focus_id") or "")
+    if current_focus_id:
+        for focus in focus_records:
+            if focus.focus_id == current_focus_id:
+                return focus
+    matches = [focus for focus in focus_records if focus.session_id == session.session_id]
+    if not matches:
+        return None
+    return sorted(matches, key=lambda item: item.updated_at, reverse=True)[0]
+
+
+def _directory_for_session_summary(session: Any, directories: list[Any]) -> Any | None:
+    directory_id = str(session.metadata.get("directory_id") or "")
+    if directory_id:
+        for directory in directories:
+            if directory.directory_id == directory_id:
+                return directory
+    try:
+        session_dir = str(Path(session.project_dir).expanduser().resolve())
+    except OSError:
+        session_dir = session.project_dir
+    for directory in directories:
+        if directory.path == session_dir:
+            return directory
+    return None
 
 
 def _job_summary(job: Any) -> dict[str, Any]:
@@ -895,6 +942,29 @@ def _session_cards(records: list[dict[str, Any]]) -> str:
             rows=[
                 ("agent", record.get("agent_id", "")),
                 ("provider", record.get("provider_session_id", "")),
+                ("last", record.get("last_assistant_final", "")),
+            ],
+        )
+        for record in records
+    )
+
+
+def _worker_cards(records: list[dict[str, Any]]) -> str:
+    if not records:
+        return _empty("No workers")
+    return "".join(
+        _card(
+            title=str(record.get("title") or record.get("session_agent_id") or ""),
+            meta=[
+                _badge(str(record.get("status") or "")),
+                f"id {record.get('session_agent_id') or ''}",
+                f"{record.get('adapter') or ''}",
+            ],
+            rows=[
+                ("identity", record.get("identity", "")),
+                ("focus", record.get("focus_title", "")),
+                ("directory", record.get("directory_title", "") or record.get("directory_path", "")),
+                ("provider", record.get("provider_session_kind", "")),
                 ("last", record.get("last_assistant_final", "")),
             ],
         )
