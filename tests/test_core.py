@@ -4,7 +4,8 @@ import unittest
 from pathlib import Path
 
 from agentdeck.core.config import Workspace, default_workspace_root, find_project_local_config, project_local_config_path
-from agentdeck.core.run_service import build_agentdeck_context
+from agentdeck.core.run_service import RunRequest, _apply_agent_defaults, build_agentdeck_context
+from agentdeck.storage.agents import AgentRegistry
 from agentdeck.storage.directories import DirectoryRegistry
 from agentdeck.storage.focus import FocusRegistry
 from agentdeck.storage.memory import MarkdownMemoryStore
@@ -68,6 +69,34 @@ class CoreStorageTests(unittest.TestCase):
             self.assertTrue((workspace.memory_dir / "user").is_dir())
             self.assertTrue((workspace.memory_dir / "projects").is_dir())
             self.assertTrue((workspace.memory_dir / "teams").is_dir())
+
+    def test_agent_defaults_select_clone_prepared_provider_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            workspace.ensure()
+            project = tmp / "project"
+            project.mkdir()
+            agent = AgentRegistry(workspace).upsert(
+                agent_id="clone-worker",
+                title="Clone Worker",
+                adapter="codex",
+                project_dir=project,
+            )
+            sessions = SessionRegistry(workspace)
+            sessions.create_prepared_session(
+                session_id="clone-worker-session",
+                agent_id="clone-worker",
+                adapter="codex",
+                project_dir=project,
+                title="Clone Worker Session",
+                metadata={"clone_prepared": True, "clone_id": "clone-1"},
+            )
+
+            request = RunRequest(prompt="continue", agent="clone-worker")
+            _apply_agent_defaults(request, agent, sessions)
+
+            self.assertEqual(request.session, "clone-worker-session")
 
     def test_memory_add_updates_index(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -9,14 +9,17 @@ import tempfile
 import threading
 import time
 import unittest
+import urllib.error
 from pathlib import Path
 
 import agentdeck.interfaces.telegram as telegram_module
-from agentdeck.cli import _telegram_configs_from_args, main
+from agentdeck.cli import _telegram_configs_from_args, _wait_for_telegram_idle, main
 from agentdeck.core.config import Workspace
 from agentdeck.core.events import AgentEvent, EventKind
 from agentdeck.core.run_service import RunRequest, RunServiceResult
 from agentdeck.interfaces.telegram import (
+    AUTO_CONTINUE_DELAY_SECONDS,
+    TelegramBotApi,
     TelegramChatStateStore,
     TelegramCommandHandler,
     TelegramConfig,
@@ -26,11 +29,14 @@ from agentdeck.interfaces.telegram import (
     TelegramUpdateOffsetStore,
     config_from_env,
     split_message,
+    _telegram_http_error_message,
 )
 from agentdeck.storage.approvals import ApprovalRegistry
 from agentdeck.storage.agents import DEFAULT_ASSISTANT_TEMPLATE, AgentRegistry, role_template_for_agent
+from agentdeck.storage.clones import CloneCapsule, CloneStore
 from agentdeck.storage.directories import DirectoryRegistry
 from agentdeck.storage.errors import ErrorIncidentStore
+from agentdeck.storage.experience import ExperienceStore
 from agentdeck.storage.focus import FocusRegistry
 from agentdeck.storage.jobs import JobRegistry
 from agentdeck.storage.progress import ProgressJournal
@@ -43,6 +49,45 @@ from agentdeck.storage.telegram_bots import TelegramBotRegistry, assistant_agent
 
 
 class TelegramInterfaceTests(unittest.TestCase):
+    def test_concurrent_bot_state_and_job_registry_writes_do_not_collide(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            workspace.ensure()
+            start = threading.Barrier(10)
+            errors: list[BaseException] = []
+
+            def worker(index: int) -> None:
+                try:
+                    start.wait(timeout=2)
+                    JobRegistry(workspace).create(
+                        interface="telegram",
+                        chat_id=42,
+                        task_id=f"task-{index}",
+                        prompt=f"prompt {index}",
+                        metadata={"bot_id": f"minsys-bot{index}"},
+                    )
+                    TelegramChatStateStore(workspace, scope=f"minsys-bot{index}").set_current_task(
+                        42,
+                        f"task-{index}",
+                    )
+                except BaseException as exc:  # pragma: no cover - surfaced by assertion below
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=worker, args=(index,)) for index in range(10)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+            self.assertEqual(errors, [])
+            jobs = JobRegistry(workspace).list(interface="telegram")
+            self.assertEqual(len(jobs), 10)
+            state = json.loads((workspace.root / "telegram" / "state.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                set(state["chats"]),
+                {f"minsys-bot{index}:42" for index in range(10)},
+            )
+
     def test_handler_lists_projects_tasks_and_runs_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -118,6 +163,236 @@ class TelegramInterfaceTests(unittest.TestCase):
             self.assertIn(f"done: {natural_agent_text}", reply)
             self.assertEqual(seen[-1].prompt, natural_agent_text)
             self.assertEqual(seen[-1].focus, focus_id)
+
+    def test_experience_phone_workflow_records_lists_shows_and_links_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            project = tmp / "project"
+            project.mkdir()
+            ProjectRegistry(workspace).upsert(project_id="proj", project_dir=project)
+            AgentRegistry(workspace).upsert(agent_id="owner", project_id="proj", adapter="echo", project_dir=project)
+            focus = FocusRegistry(workspace).create(
+                title="Clone memory design",
+                project_id="proj",
+                agent_id="owner",
+                directory=project,
+            )
+            state = TelegramChatStateStore(workspace)
+            state.set_current_project(42, "proj")
+            state.set_current_agent(42, "owner")
+            state.set_current_focus(42, focus.focus_id)
+            handler = TelegramCommandHandler(workspace)
+
+            created = asyncio.run(
+                handler.handle_text(
+                    "/experience new research IMU clone memory | purpose: Separate cloneable experience from random Q&A",
+                    chat_id=42,
+                )
+            )[0]
+            self.assertIn("Experience collection created and selected", created)
+            self.assertIn("kind: research_exploration", created)
+
+            collection_id = TelegramChatStateStore(workspace).current_experience_collection(42)
+            collection = ExperienceStore(workspace).resolve_collection(collection_id)
+            assert collection is not None
+            self.assertEqual(collection.project_id, "proj")
+            self.assertEqual(collection.agent_id, "owner")
+            self.assertEqual(collection.focus_id, focus.focus_id)
+
+            first = asyncio.run(
+                handler.handle_text(
+                    "/experience record Add collections above event graphs | result: retrieval stays task-nature scoped | "
+                    "decision: clone inherits selected collections | tag: clone",
+                    chat_id=42,
+                )
+            )[0]
+            self.assertIn("Experience event recorded", first)
+            self.assertIn("retrieval stays task-nature scoped", first)
+
+            second = asyncio.run(
+                handler.handle_text(
+                    "/event Add manual Telegram experience workflow | result: phone users can curate events before daemon automation",
+                    chat_id=42,
+                )
+            )[0]
+            self.assertIn("Experience event recorded", second)
+
+            events = asyncio.run(handler.handle_text("/experience events phone", chat_id=42))[0]
+            self.assertIn("Experience events: IMU clone memory", events)
+            self.assertIn("Add manual Telegram experience workflow", events)
+            self.assertIn("Use /experience show <list #>", events)
+
+            detail = asyncio.run(handler.handle_text("/experience show 1", chat_id=42))[0]
+            self.assertIn("phone users can curate events", detail)
+
+            all_events = asyncio.run(handler.handle_text("/experience events", chat_id=42))[0]
+            self.assertIn("Add collections above event graphs", all_events)
+            self.assertIn("Add manual Telegram experience workflow", all_events)
+            link = asyncio.run(handler.handle_text("/experience link 2 led_to 1 enables mobile curation", chat_id=42))[0]
+            self.assertIn("Experience events linked", link)
+            edges = ExperienceStore(workspace).list_edges(relation="led_to")
+            self.assertEqual(len(edges), 1)
+            self.assertEqual(edges[0].relation, "led_to")
+
+            collections = asyncio.run(handler.handle_text("/experience", chat_id=42))[0]
+            self.assertIn("IMU clone memory [current]", collections)
+            self.assertIn("events: 2", collections)
+
+    def test_clone_phone_workflow_lists_shows_and_spawns_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            workspace.ensure()
+            project = tmp / "project"
+            project.mkdir()
+            capsule = CloneCapsule(
+                clone_id="clone-20260701-demo",
+                source_session_id="source-session",
+                source_worker_id="developer",
+                provider="codex",
+                provider_session_id="codex-thread-1",
+                provider_session_kind="codex_thread",
+                project_dir=str(project),
+                title="Clone demo",
+                current={
+                    "objective": "Continue clone design",
+                    "current_state": "Capsule is ready",
+                    "next_step": "Spawn a worker",
+                    "project_id": "agentdeck",
+                    "decisions": ["Do not copy provider internals"],
+                },
+                decisions=["Use prepared workers for clone spawn"],
+                validation={"ok": True},
+            )
+            CloneStore(workspace).write(capsule)
+            handler = TelegramCommandHandler(workspace)
+
+            listed = asyncio.run(handler.handle_text("/clones", chat_id=42))[0]
+            self.assertIn("Clone capsules:", listed)
+            self.assertIn("1. Clone demo", listed)
+
+            shown = asyncio.run(handler.handle_text("/clone show 1", chat_id=42))[0]
+            self.assertIn("Continue clone design", shown)
+            self.assertIn("Use prepared workers", shown)
+
+            spawned = asyncio.run(
+                handler.handle_text("/clone spawn 1 agent cloned-dev title Cloned Developer", chat_id=42)
+            )[0]
+            self.assertIn("Clone worker prepared:", spawned)
+            self.assertIn("worker: cloned-dev", spawned)
+            self.assertIn("Use plain text now", spawned)
+
+            session = SessionRegistry(workspace).resolve("cloned-dev-session")
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session.status, "prepared")
+            self.assertEqual(session.provider_session_id, "")
+            self.assertTrue(session.metadata["clone_prepared"])
+            self.assertEqual(TelegramChatStateStore(workspace).current_session(42), "cloned-dev-session")
+            state = SessionStateStore(workspace).get("cloned-dev-session")
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual(state.objective, "Continue clone design")
+            self.assertIn("Prepared from clone capsule", state.current_state)
+
+    def test_clone_current_creates_capsule_and_spawns_worker_in_one_phone_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            workspace.ensure()
+            project = tmp / "project"
+            home = tmp / "home"
+            project.mkdir()
+            codex_home = home / ".codex"
+            rollout = codex_home / "sessions" / "2026" / "07" / "01" / "rollout.jsonl"
+            rollout.parent.mkdir(parents=True)
+            (codex_home / "session_index.jsonl").write_text(
+                json.dumps(
+                    {
+                        "id": "codex-thread-1",
+                        "thread_name": "Current clone source",
+                        "updated_at": "2026-07-01T00:00:00Z",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            rollout.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": "2026-07-01T00:00:00Z",
+                                "type": "session_meta",
+                                "payload": {"id": "codex-thread-1", "cwd": str(project)},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "event_msg",
+                                "payload": {"role": "user", "text": "clone this worker"},
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "response_item",
+                                "payload": {"role": "assistant", "text": "clone context ready"},
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            SessionRegistry(workspace).import_provider_session(
+                provider_session_id="codex-thread-1",
+                provider_session_kind="codex_thread",
+                agent_id="developer",
+                adapter="codex",
+                project_dir=project,
+                title="Current clone source",
+                session_id="source-session",
+                project_id="agentdeck",
+                metadata={"provider": "codex"},
+            )
+            SessionStateStore(workspace).write(
+                SessionStateCard(
+                    session_id="source-session",
+                    objective="Clone current worker",
+                    current_state="Source worker is ready",
+                    next_step="Create a cloned worker",
+                    project_id="agentdeck",
+                    agent_id="developer",
+                    decisions=["Use one-command phone clone flow"],
+                )
+            )
+            handler = TelegramCommandHandler(workspace)
+            handler.chat_state.set_current_session(42, "source-session")
+
+            reply = asyncio.run(
+                handler.handle_text(
+                    f"/clone current home {home} agent forked-dev title Forked Developer",
+                    chat_id=42,
+                )
+            )[0]
+
+            self.assertIn("Current worker cloned and spawned:", reply)
+            self.assertIn("worker: forked-dev", reply)
+            self.assertIn("source: Current clone source", reply)
+            clones = CloneStore(workspace).list()
+            self.assertEqual(len(clones), 1)
+            self.assertEqual(clones[0].source_session_id, "source-session")
+            session = SessionRegistry(workspace).resolve("forked-dev-session")
+            self.assertIsNotNone(session)
+            assert session is not None
+            self.assertEqual(session.status, "prepared")
+            self.assertEqual(TelegramChatStateStore(workspace).current_session(42), "forked-dev-session")
+            state = SessionStateStore(workspace).get("forked-dev-session")
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual(state.objective, "Clone current worker")
+            self.assertIn("one-command phone clone flow", " ".join(state.decisions))
 
     def test_handler_lists_uses_and_reports_directories(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -201,6 +476,63 @@ class TelegramInterfaceTests(unittest.TestCase):
             assert job is not None
             self.assertEqual(job.task_id, "")
             self.assertEqual(job.metadata.get("focus_id"), focus.focus_id)
+
+    def test_auto_continues_after_nonfatal_adapter_error_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            workspace.ensure()
+            sent: list[tuple[int, str]] = []
+            seen: list[RunRequest] = []
+
+            async def runner(workspace_arg: Workspace, request: RunRequest) -> RunServiceResult:
+                seen.append(request)
+                if len(seen) > 1:
+                    return RunServiceResult(
+                        session_id=request.session or "session-auto",
+                        final_text="approval needed",
+                        events=[],
+                        agent_id="owner",
+                        adapter="codex",
+                        task_id=request.task or "",
+                        approval_requested=True,
+                    )
+                return RunServiceResult(
+                    session_id=request.session or "session-auto",
+                    final_text="completed despite a recovered tool mismatch",
+                    events=[
+                        AgentEvent(
+                            EventKind.ERROR,
+                            "owner",
+                            request.session or "session-auto",
+                            text="apply_patch verification failed: recovered by a later patch",
+                            payload={"error_kind": "unknown", "nonfatal": True},
+                        )
+                    ],
+                    agent_id="owner",
+                    adapter="codex",
+                    task_id=request.task or "",
+                )
+
+            queue = TelegramJobQueue(workspace, sender=lambda chat_id, text: sent.append((chat_id, text)), runner=runner)
+            state = TelegramChatStateStore(workspace)
+            state.set_current_task(42, "task-auto")
+            state.set_auto_state(42, enabled=True, task_id="task-auto", until=time.time() + 60)
+
+            first = queue.start(chat_id=42, task_id="task-auto", prompt="continue")
+            queue.wait(first.job_id, timeout=2)
+            time.sleep(AUTO_CONTINUE_DELAY_SECONDS + 0.2)
+
+            self.assertTrue(state.auto_state(42).get("enabled"))
+            jobs = JobRegistry(workspace).list(chat_id=42)
+            self.assertGreaterEqual(len(jobs), 2)
+            self.assertEqual(jobs[0].metadata.get("auto_parent_job_id"), first.job_id)
+            queue.wait(jobs[0].job_id, timeout=2)
+            finished = JobRegistry(workspace).get(first.job_id)
+            assert finished is not None
+            self.assertEqual(finished.status, "done")
+            self.assertEqual(finished.metadata.get("warning_decision"), "pass")
+            self.assertFalse(any("Auto mode stopped" in text for _, text in sent))
+            self.assertGreaterEqual(len(seen), 1)
 
     def test_handler_lists_and_resolves_approvals(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -474,6 +806,98 @@ class TelegramInterfaceTests(unittest.TestCase):
             detail = asyncio.run(handler.handle_text(f"/job {job_id}", chat_id=42))[0]
             self.assertIn("status: done", detail)
             self.assertIn("done: background work", detail)
+
+    def test_jobs_for_same_provider_session_are_serialized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            project = tmp / "project"
+            project.mkdir()
+            task = TaskBoard(workspace).create(title="Serialized task")
+            session = SessionRegistry(workspace).import_provider_session(
+                provider_session_id="provider-thread-1",
+                provider_session_kind="codex_thread",
+                agent_id="owner",
+                adapter="codex",
+                project_dir=project,
+                title="Provider thread",
+                session_id="session-provider-thread",
+            )
+            TaskBoard(workspace).attach_session(task.task_id, session.session_id)
+            entered: list[str] = []
+            first_entered = threading.Event()
+            release_first = threading.Event()
+
+            async def runner(workspace_arg: Workspace, request: RunRequest) -> RunServiceResult:
+                entered.append(request.prompt)
+                if request.prompt == "first":
+                    first_entered.set()
+                    release_first.wait(timeout=2)
+                return RunServiceResult(
+                    session_id=request.session or session.session_id,
+                    final_text=f"done: {request.prompt}",
+                    events=[],
+                    agent_id="owner",
+                    adapter="codex",
+                    task_id=request.task or "",
+                )
+
+            queue = TelegramJobQueue(workspace, sender=lambda chat_id, text: None, runner=runner)
+
+            first = queue.start(chat_id=42, task_id=task.task_id, prompt="first")
+            self.assertTrue(first_entered.wait(timeout=1))
+            second = queue.start(chat_id=42, task_id=task.task_id, prompt="second")
+            time.sleep(0.2)
+
+            self.assertEqual(entered, ["first"])
+            waiting = JobRegistry(workspace).get(second.job_id)
+            assert waiting is not None
+            self.assertEqual(waiting.status, "queued")
+            self.assertEqual(waiting.metadata.get("provider_lock_state"), "waiting")
+
+            release_first.set()
+            first_done = queue.wait(first.job_id, timeout=2)
+            second_done = queue.wait(second.job_id, timeout=2)
+
+            assert first_done is not None
+            assert second_done is not None
+            self.assertEqual(first_done.status, "done")
+            self.assertEqual(second_done.status, "done")
+            self.assertEqual(entered, ["first", "second"])
+            self.assertEqual(second_done.metadata.get("provider_lock_state"), "released")
+            self.assertEqual(
+                second_done.metadata.get("provider_lock_key"),
+                "provider:codex:codex_thread:provider-thread-1",
+            )
+
+    def test_background_send_failure_is_recorded_on_job(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            workspace.ensure()
+            task = TaskBoard(workspace).create(title="Send failure task")
+
+            async def runner(workspace_arg: Workspace, request: RunRequest) -> RunServiceResult:
+                return RunServiceResult(
+                    session_id="session-send-failure",
+                    final_text="done but send failed",
+                    events=[],
+                    agent_id="owner",
+                    adapter="echo",
+                    task_id=request.task or "",
+                )
+
+            def sender(chat_id: int, text: str) -> None:
+                raise RuntimeError("telegram api timeout")
+
+            queue = TelegramJobQueue(workspace, sender=sender, runner=runner)
+
+            job = queue.start(chat_id=42, task_id=task.task_id, prompt="run")
+            finished = queue.wait(job.job_id, timeout=2)
+
+            assert finished is not None
+            self.assertEqual(finished.status, "done")
+            self.assertEqual(finished.metadata.get("send_error_count"), 1)
+            self.assertIn("telegram api timeout", finished.metadata.get("last_send_error", ""))
 
     def test_current_task_removes_need_to_copy_task_or_job_ids(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -787,6 +1211,62 @@ class TelegramInterfaceTests(unittest.TestCase):
             self.assertEqual(session.provider_session_kind, "kimi_session")
             self.assertEqual(session.project_dir, str(project.resolve()))
 
+    def test_session_scan_codex_index_imports_visible_resume_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            project = tmp / "project"
+            home = tmp / "home"
+            project.mkdir()
+            self._main(["--workspace", str(workspace.root), "projects", "create", "proj", "--title", "Project One", "--cwd", str(project)])
+            self._main(["--workspace", str(workspace.root), "agents", "create", "owner", "--project", "proj", "--adapter", "codex", "--cwd", str(project)])
+
+            codex_home = home / ".codex"
+            rollout = codex_home / "sessions" / "2026" / "06" / "30" / "rollout.jsonl"
+            rollout.parent.mkdir(parents=True)
+            (codex_home / "session_index.jsonl").write_text(
+                json.dumps(
+                    {
+                        "id": "official-thread-1",
+                        "thread_name": "Official visible work",
+                        "updated_at": "2026-06-30T00:00:00Z",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            rollout.write_text(
+                json.dumps(
+                    {
+                        "timestamp": "2026-06-30T00:00:00Z",
+                        "type": "session_meta",
+                        "payload": {"id": "official-thread-1", "cwd": str(project)},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            old_home = os.environ.get("HOME")
+            os.environ["HOME"] = str(home)
+            try:
+                handler = TelegramCommandHandler(workspace)
+                reply = asyncio.run(handler.handle_text("/session scan-codex-index", chat_id=42))[0]
+                self.assertIn("Official visible work", reply)
+                reply = asyncio.run(handler.handle_text("/session import 1 project proj agent owner", chat_id=42))[0]
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
+
+            self.assertIn("Provider session imported:", reply)
+            session = SessionRegistry(workspace).resolve("Official visible work")
+            assert session is not None
+            self.assertEqual(session.provider_session_id, "official-thread-1")
+            self.assertEqual(session.provider_session_kind, "codex_thread")
+            self.assertEqual(session.project_dir, str(project.resolve()))
+
     def test_assistant_blocks_unsafe_marked_action(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -919,6 +1399,78 @@ class TelegramInterfaceTests(unittest.TestCase):
             self.assertIn("AgentDeck restarted.", api.messages[0][1])
             self.assertIn("bot: minsys-bot4", api.messages[0][1])
             self.assertEqual(TelegramRestartNoticeStore(workspace).pop_for_bot("minsys-bot4"), [])
+
+    def test_telegram_server_recovers_enabled_auto_after_restart(self) -> None:
+        class AutoRecoveryApi:
+            def __init__(self) -> None:
+                self.messages: list[tuple[int, str]] = []
+
+            def get_updates(self, *, offset: int | None = None, timeout: int = 30) -> list[dict[str, object]]:
+                return []
+
+            def send_message(self, chat_id: int, text: str) -> None:
+                self.messages.append((chat_id, text))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            project = tmp / "project"
+            project.mkdir()
+            focus = FocusRegistry(workspace).create(
+                title="Recover auto focus",
+                agent_id="owner",
+                directory=project,
+                session_id="session-auto",
+            )
+            SessionRegistry(workspace).upsert_start(
+                session_id="session-auto",
+                agent_id="owner",
+                adapter="echo",
+                project_dir=project,
+                prompt="old auto work",
+            )
+            TelegramChatStateStore(workspace, scope="minsys-bot4").set_auto_state(
+                42,
+                enabled=True,
+                focus_id=focus.focus_id,
+                prompt="continue after restart",
+                approval_mode="bypass",
+                mode="loop",
+            )
+            seen: list[RunRequest] = []
+
+            async def runner(workspace_arg: Workspace, request: RunRequest) -> RunServiceResult:
+                seen.append(request)
+                return RunServiceResult(
+                    session_id=request.session or "session-auto",
+                    final_text="needs approval",
+                    events=[],
+                    agent_id=request.agent or "owner",
+                    adapter="echo",
+                    focus_id=request.focus or "",
+                    approval_requested=True,
+                )
+
+            api = AutoRecoveryApi()
+            server = TelegramServer(
+                workspace,
+                api,
+                TelegramConfig(token="123456:ABC", bot_id="minsys-bot4", poll_timeout=0),
+                restart_callback=None,
+            )
+            server.job_queue.runner = runner
+
+            server.serve_forever(once=True)
+            jobs = server.job_queue.list(chat_id=42)
+            self.assertEqual(len(jobs), 1)
+            server.job_queue.wait(jobs[0].job_id, timeout=2)
+
+            self.assertEqual(seen[0].prompt, "continue after restart")
+            self.assertEqual(seen[0].focus, focus.focus_id)
+            self.assertEqual(seen[0].session, "session-auto")
+            self.assertTrue(any("Auto mode recovered after AgentDeck restart" in text for _, text in api.messages))
+            state = TelegramChatStateStore(workspace, scope="minsys-bot4").auto_state(42)
+            self.assertEqual(state.get("last_job_id"), jobs[0].job_id)
 
     def test_telegram_server_persists_update_offset_before_restart_replay(self) -> None:
         class ReplayApi:
@@ -1066,6 +1618,39 @@ class TelegramInterfaceTests(unittest.TestCase):
             self.assertEqual(calls, ["restart"])
             self.assertIn("Forced restart", forced)
 
+    def test_wait_for_telegram_idle_catches_gap_after_active_job_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            workspace.ensure()
+            registry = JobRegistry(workspace)
+            active = registry.create(interface="telegram", chat_id=42, task_id="task-a", prompt="work")
+            registry.set_status(active.job_id, "running")
+
+            def finish_job() -> None:
+                time.sleep(0.08)
+                JobRegistry(workspace).finish(active.job_id, status="done", final_text="done")
+
+            thread = threading.Thread(target=finish_job)
+            thread.start()
+
+            with contextlib.redirect_stderr(io.StringIO()):
+                idle = _wait_for_telegram_idle(workspace, timeout=1.0, poll_interval=0.01)
+            thread.join(timeout=2)
+
+            self.assertTrue(idle)
+
+    def test_wait_for_telegram_idle_times_out_when_jobs_stay_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            workspace.ensure()
+            active = JobRegistry(workspace).create(interface="telegram", chat_id=42, task_id="task-a", prompt="work")
+            JobRegistry(workspace).set_status(active.job_id, "running")
+
+            with contextlib.redirect_stderr(io.StringIO()):
+                idle = _wait_for_telegram_idle(workspace, timeout=0.01, poll_interval=0.01)
+
+            self.assertFalse(idle)
+
     def test_video_command_sends_project_relative_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -1142,6 +1727,73 @@ class TelegramInterfaceTests(unittest.TestCase):
             self.assertEqual(api.videos, [(42, video.resolve(), "caption")])
             self.assertTrue(api.messages)
             self.assertIn("Video sent", api.messages[0][1])
+
+    def test_bot_api_sends_non_mp4_video_as_document(self) -> None:
+        class CaptureApi(TelegramBotApi):
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, dict[str, object], dict[str, Path]]] = []
+
+            def _request_multipart(
+                self,
+                method: str,
+                fields: dict[str, str | int | bool],
+                files: dict[str, Path],
+            ) -> dict[str, object]:
+                self.calls.append((method, dict(fields), dict(files)))
+                return {"ok": True, "result": {}}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "clip.mkv"
+            path.write_bytes(b"fake mkv")
+            api = CaptureApi()
+
+            api.send_video(42, path, caption="review clip")
+
+            self.assertEqual(len(api.calls), 1)
+            method, fields, files = api.calls[0]
+            self.assertEqual(method, "sendDocument")
+            self.assertEqual(fields["caption"], "review clip")
+            self.assertEqual(files["document"], path)
+
+    def test_video_command_reports_telegram_upload_limit_before_sending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            project_dir = tmp / "project"
+            project_dir.mkdir()
+            video = project_dir / "large.mp4"
+            with video.open("wb") as handle:
+                handle.truncate(51 * 1024 * 1024)
+            ProjectRegistry(workspace).upsert(
+                project_id="proj",
+                title="Project One",
+                project_dir=project_dir,
+            )
+            sent: list[tuple[int, Path, str]] = []
+            handler = TelegramCommandHandler(
+                workspace,
+                video_sender=lambda chat_id, path, caption: sent.append((chat_id, path, caption)),
+            )
+            handler.chat_state.set_current_project(42, "proj")
+
+            reply = asyncio.run(handler.handle_text("/video large.mp4", chat_id=42))[0]
+
+            self.assertEqual(sent, [])
+            self.assertIn("Telegram Bot API upload limit is 50 MB", reply)
+
+    def test_telegram_http_error_message_includes_api_description(self) -> None:
+        exc = urllib.error.HTTPError(
+            "https://api.telegram.org/botREDACTED/sendVideo",
+            400,
+            "Bad Request",
+            {},
+            io.BytesIO(b'{"ok":false,"description":"Bad Request: failed to get HTTP URL content"}'),
+        )
+
+        self.assertEqual(
+            _telegram_http_error_message(exc),
+            "Telegram API HTTP 400: Bad Request: failed to get HTTP URL content",
+        )
 
     def test_telegram_polling_error_does_not_escape_server_loop(self) -> None:
         class FailingApi:

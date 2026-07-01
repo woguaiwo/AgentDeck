@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -54,6 +56,8 @@ class JobRecord:
 class JobRegistry:
     """JSON-backed index of remote interface background jobs."""
 
+    _LOCK = threading.RLock()
+
     def __init__(self, workspace: Workspace) -> None:
         self.workspace = workspace
 
@@ -71,24 +75,25 @@ class JobRegistry:
         job_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> JobRecord:
-        records = self._read()
-        resolved_id = job_id or _new_job_id()
-        while resolved_id in records:
-            resolved_id = _new_job_id()
-        now = time.time()
-        record = JobRecord(
-            job_id=resolved_id,
-            interface=interface,
-            chat_id=chat_id,
-            task_id=task_id,
-            prompt=prompt,
-            created_at=now,
-            updated_at=now,
-            metadata=dict(metadata or {}),
-        )
-        records[record.job_id] = record
-        self._write(records)
-        return record
+        with self._LOCK:
+            records = self._read()
+            resolved_id = job_id or _new_job_id()
+            while resolved_id in records:
+                resolved_id = _new_job_id()
+            now = time.time()
+            record = JobRecord(
+                job_id=resolved_id,
+                interface=interface,
+                chat_id=chat_id,
+                task_id=task_id,
+                prompt=prompt,
+                created_at=now,
+                updated_at=now,
+                metadata=dict(metadata or {}),
+            )
+            records[record.job_id] = record
+            self._write(records)
+            return record
 
     def get(self, job_id: str) -> JobRecord | None:
         return self._read().get(job_id)
@@ -115,28 +120,30 @@ class JobRegistry:
         return records
 
     def set_status(self, job_id: str, status: str, *, error: str = "") -> JobRecord | None:
-        records = self._read()
-        record = records.get(job_id)
-        if record is None:
-            return None
-        record.status = _validate_status(status)
-        record.updated_at = time.time()
-        if error:
-            record.error = error
-        records[job_id] = record
-        self._write(records)
-        return record
+        with self._LOCK:
+            records = self._read()
+            record = records.get(job_id)
+            if record is None:
+                return None
+            record.status = _validate_status(status)
+            record.updated_at = time.time()
+            if error:
+                record.error = error
+            records[job_id] = record
+            self._write(records)
+            return record
 
     def update_metadata(self, job_id: str, metadata: dict[str, Any]) -> JobRecord | None:
-        records = self._read()
-        record = records.get(job_id)
-        if record is None:
-            return None
-        record.metadata.update(dict(metadata))
-        record.updated_at = time.time()
-        records[job_id] = record
-        self._write(records)
-        return record
+        with self._LOCK:
+            records = self._read()
+            record = records.get(job_id)
+            if record is None:
+                return None
+            record.metadata.update(dict(metadata))
+            record.updated_at = time.time()
+            records[job_id] = record
+            self._write(records)
+            return record
 
     def finish(
         self,
@@ -147,53 +154,56 @@ class JobRegistry:
         final_text: str = "",
         error: str = "",
     ) -> JobRecord | None:
-        records = self._read()
-        record = records.get(job_id)
-        if record is None:
-            return None
-        record.status = _validate_status(status)
-        record.updated_at = time.time()
-        record.session_id = session_id
-        record.final_text = final_text
-        record.error = error
-        records[job_id] = record
-        self._write(records)
-        return record
+        with self._LOCK:
+            records = self._read()
+            record = records.get(job_id)
+            if record is None:
+                return None
+            record.status = _validate_status(status)
+            record.updated_at = time.time()
+            record.session_id = session_id
+            record.final_text = final_text
+            record.error = error
+            records[job_id] = record
+            self._write(records)
+            return record
 
     def cancel(self, job_id: str, *, reason: str) -> JobRecord | None:
-        records = self._read()
-        record = records.get(job_id)
-        if record is None:
-            return None
-        if record.status == "queued":
-            record.status = "cancelled"
-            record.error = reason
-        elif record.status == "running":
-            record.status = "cancel_requested"
-            record.error = reason
-        elif record.status == "cancel_requested":
-            record.error = record.error or reason
-        else:
+        with self._LOCK:
+            records = self._read()
+            record = records.get(job_id)
+            if record is None:
+                return None
+            if record.status == "queued":
+                record.status = "cancelled"
+                record.error = reason
+            elif record.status == "running":
+                record.status = "cancel_requested"
+                record.error = reason
+            elif record.status == "cancel_requested":
+                record.error = record.error or reason
+            else:
+                return record
+            record.updated_at = time.time()
+            records[job_id] = record
+            self._write(records)
             return record
-        record.updated_at = time.time()
-        records[job_id] = record
-        self._write(records)
-        return record
 
     def mark_unfinished_interrupted(self, *, interface: str, reason: str) -> int:
-        records = self._read()
-        changed = 0
-        now = time.time()
-        for record in records.values():
-            if record.interface != interface or record.status not in {"queued", "running", "cancel_requested"}:
-                continue
-            record.status = "interrupted"
-            record.updated_at = now
-            record.error = reason
-            changed += 1
-        if changed:
-            self._write(records)
-        return changed
+        with self._LOCK:
+            records = self._read()
+            changed = 0
+            now = time.time()
+            for record in records.values():
+                if record.interface != interface or record.status not in {"queued", "running", "cancel_requested"}:
+                    continue
+                record.status = "interrupted"
+                record.updated_at = now
+                record.error = reason
+                changed += 1
+            if changed:
+                self._write(records)
+            return changed
 
     def _read(self) -> dict[str, JobRecord]:
         if not self.path.exists():
@@ -224,7 +234,7 @@ class JobRegistry:
             "version": 1,
             "jobs": {key: record.to_dict() for key, record in sorted(records.items())},
         }
-        tmp = self.path.with_suffix(".tmp")
+        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
         tmp.replace(self.path)
 

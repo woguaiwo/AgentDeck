@@ -11,6 +11,7 @@ import shlex
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -27,6 +28,7 @@ from agentdeck.core.error_daemon import (
     event_should_fail_job,
     first_error_event,
     format_error_decision_message,
+    record_nonfatal_incident_for_job,
 )
 from agentdeck.core.events import EventKind
 from agentdeck.core.run_service import (
@@ -38,12 +40,14 @@ from agentdeck.core.run_service import (
 )
 from agentdeck.storage.approvals import ApprovalRecord, ApprovalRegistry
 from agentdeck.storage.agents import ASSISTANT_AGENT_ID, AgentRecord, AgentRegistry
+from agentdeck.storage.clones import CloneCapsule, CloneStore, create_rules_clone_capsule, spawn_worker_from_clone
 from agentdeck.storage.directories import DirectoryRecord, DirectoryRegistry
+from agentdeck.storage.experience import COLLECTION_KINDS, EDGE_RELATIONS, ExperienceCollection, ExperienceEvent, ExperienceStore
 from agentdeck.storage.focus import FOCUS_STATUSES, FocusRecord, FocusRegistry
 from agentdeck.storage.jobs import JobRecord, JobRegistry
 from agentdeck.storage.memory import MemoryDocument, MarkdownMemoryStore
 from agentdeck.storage.progress import ProgressJournal, format_review
-from agentdeck.storage.provider_sessions import ProviderSessionCandidate, scan_provider_sessions
+from agentdeck.storage.provider_sessions import ProviderSessionCandidate, scan_codex_index_sessions, scan_provider_sessions
 from agentdeck.storage.projects import ProjectRecord, ProjectRegistry
 from agentdeck.storage.project_state import ProjectStateStore
 from agentdeck.storage.session_state import SessionStateStore
@@ -52,6 +56,7 @@ from agentdeck.storage.tasks import TaskBoard, TaskRecord
 
 
 MAX_TELEGRAM_MESSAGE = 3900
+TELEGRAM_BOT_UPLOAD_LIMIT_BYTES = 50 * 1024 * 1024
 AUTO_CONTINUE_DELAY_SECONDS = 1.0
 DEFAULT_AUTO_APPROVAL_MODE = "bypass"
 HUMAN_AUTO_APPROVAL_MODE = "fail"
@@ -103,11 +108,24 @@ class TelegramBotApi:
 
     def send_video(self, chat_id: int, path: str | Path, caption: str = "") -> None:
         video_path = Path(path).expanduser()
+        _ensure_telegram_uploadable(video_path)
+        if not _looks_like_mpeg4_video(video_path):
+            self.send_document(chat_id, video_path, caption=caption)
+            return
         fields: dict[str, str | int | bool] = {"chat_id": chat_id, "supports_streaming": True}
         clean_caption = caption.strip()
         if clean_caption:
             fields["caption"] = clean_caption[:1000]
         self._request_multipart("sendVideo", fields, {"video": video_path})
+
+    def send_document(self, chat_id: int, path: str | Path, caption: str = "") -> None:
+        document_path = Path(path).expanduser()
+        _ensure_telegram_uploadable(document_path)
+        fields: dict[str, str | int | bool] = {"chat_id": chat_id}
+        clean_caption = caption.strip()
+        if clean_caption:
+            fields["caption"] = clean_caption[:1000]
+        self._request_multipart("sendDocument", fields, {"document": document_path})
 
     def _request(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
         body = urllib.parse.urlencode(payload).encode("utf-8")
@@ -131,8 +149,11 @@ class TelegramBotApi:
             data=body,
             headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
         )
-        with urllib.request.urlopen(request, timeout=120) as response:
-            data = json.loads(response.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                data = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(_telegram_http_error_message(exc)) from exc
         if not data.get("ok"):
             raise RuntimeError(f"Telegram API error: {data}")
         return data
@@ -141,10 +162,12 @@ class TelegramBotApi:
 class TelegramChatStateStore:
     """Persist small per-chat interface state."""
 
+    _LOCK = threading.RLock()
+
     def __init__(self, workspace: Workspace, *, scope: str = "") -> None:
         self.workspace = workspace
         self.scope = scope.strip()
-        self._lock = threading.Lock()
+        self._lock = self._LOCK
 
     @property
     def path(self) -> Path:
@@ -231,6 +254,20 @@ class TelegramChatStateStore:
             key = self._chat_key(chat_id)
             chat = dict(data.get(key) or {})
             chat["current_directory_id"] = directory_id
+            data[key] = chat
+            self._write(data)
+
+    def current_experience_collection(self, chat_id: int) -> str:
+        with self._lock:
+            data = self._read()
+            return str(data.get(self._chat_key(chat_id), {}).get("current_experience_collection_id") or "")
+
+    def set_current_experience_collection(self, chat_id: int, collection_id: str) -> None:
+        with self._lock:
+            data = self._read()
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
+            chat["current_experience_collection_id"] = collection_id
             data[key] = chat
             self._write(data)
 
@@ -398,6 +435,33 @@ class TelegramChatStateStore:
             data[key] = chat
             self._write(data)
 
+    def set_recent_experience_collections(self, chat_id: int, collection_ids: list[str]) -> None:
+        with self._lock:
+            data = self._read()
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
+            chat["recent_experience_collection_ids"] = collection_ids
+            data[key] = chat
+            self._write(data)
+
+    def set_recent_experience_events(self, chat_id: int, event_ids: list[str]) -> None:
+        with self._lock:
+            data = self._read()
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
+            chat["recent_experience_event_ids"] = event_ids
+            data[key] = chat
+            self._write(data)
+
+    def set_recent_clones(self, chat_id: int, clone_ids: list[str]) -> None:
+        with self._lock:
+            data = self._read()
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
+            chat["recent_clone_ids"] = clone_ids
+            data[key] = chat
+            self._write(data)
+
     def recent_task_id(self, chat_id: int, index: int) -> str:
         with self._lock:
             data = self._read()
@@ -494,6 +558,52 @@ class TelegramChatStateStore:
                 return ""
             return str(memory_paths[index - 1])
 
+    def recent_experience_collection_id(self, chat_id: int, index: int) -> str:
+        with self._lock:
+            data = self._read()
+            collection_ids = data.get(self._chat_key(chat_id), {}).get("recent_experience_collection_ids") or []
+            if not isinstance(collection_ids, list) or index < 1 or index > len(collection_ids):
+                return ""
+            return str(collection_ids[index - 1])
+
+    def recent_experience_event_id(self, chat_id: int, index: int) -> str:
+        with self._lock:
+            data = self._read()
+            event_ids = data.get(self._chat_key(chat_id), {}).get("recent_experience_event_ids") or []
+            if not isinstance(event_ids, list) or index < 1 or index > len(event_ids):
+                return ""
+            return str(event_ids[index - 1])
+
+    def recent_clone_id(self, chat_id: int, index: int) -> str:
+        with self._lock:
+            data = self._read()
+            clone_ids = data.get(self._chat_key(chat_id), {}).get("recent_clone_ids") or []
+            if not isinstance(clone_ids, list) or index < 1 or index > len(clone_ids):
+                return ""
+            return str(clone_ids[index - 1])
+
+    def auto_states(self) -> list[tuple[int, dict[str, Any]]]:
+        with self._lock:
+            data = self._read()
+            states: list[tuple[int, dict[str, Any]]] = []
+            prefix = f"{self.scope}:" if self.scope else ""
+            for key, chat in data.items():
+                chat_id_text = key
+                if self.scope:
+                    if not key.startswith(prefix):
+                        continue
+                    chat_id_text = key[len(prefix) :]
+                elif ":" in key:
+                    continue
+                try:
+                    chat_id = int(chat_id_text)
+                except ValueError:
+                    continue
+                state = chat.get("auto") or {}
+                if isinstance(state, dict):
+                    states.append((chat_id, dict(state)))
+            return sorted(states, key=lambda item: item[0])
+
     def _chat_key(self, chat_id: int) -> str:
         if not self.scope:
             return str(chat_id)
@@ -516,7 +626,7 @@ class TelegramChatStateStore:
     def _write(self, data: dict[str, dict[str, Any]]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {"version": 1, "chats": data}
-        tmp = self.path.with_suffix(".tmp")
+        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
         tmp.replace(self.path)
 
@@ -677,6 +787,9 @@ class TelegramUpdateOffsetStore:
 class TelegramJobQueue:
     """Background runner for Telegram-triggered jobs."""
 
+    _SESSION_LOCKS_LOCK = threading.RLock()
+    _SESSION_LOCKS: dict[str, threading.Lock] = {}
+
     def __init__(
         self,
         workspace: Workspace,
@@ -746,6 +859,55 @@ class TelegramJobQueue:
             records = [record for record in records if record.status in statuses]
         return records[0] if records else None
 
+    def recover_auto_jobs(self) -> list[JobRecord]:
+        recovered: list[JobRecord] = []
+        for chat_id, state in self.chat_state.auto_states():
+            if not bool(state.get("enabled")):
+                continue
+            if _auto_expired(state):
+                self.chat_state.disable_auto(chat_id)
+                self._send(chat_id, "Auto mode ended during restart: timer expired.")
+                continue
+            if self.latest_for_chat(chat_id, statuses=ACTIVE_JOB_STATUSES) is not None:
+                continue
+            prompt = str(state.get("prompt") or DEFAULT_AUTO_PROMPT).strip() or DEFAULT_AUTO_PROMPT
+            focus_id = str(state.get("focus_id") or "")
+            task_id = str(state.get("task_id") or "")
+            metadata: dict[str, Any] = {
+                "auto": True,
+                "auto_recovered": True,
+                "approval_mode": _auto_approval_mode(state),
+                "auto_mode": _auto_mode(state),
+            }
+            if focus_id:
+                metadata["focus_id"] = focus_id
+                focus = FocusRegistry(self.workspace).resolve(focus_id)
+                if focus is not None:
+                    if focus.agent_id:
+                        metadata["agent_id"] = focus.agent_id
+                    session_id = _safe_session_id_for_resume(self.workspace, focus.session_id)
+                    if session_id:
+                        metadata["session_id"] = session_id
+            elif not task_id:
+                task_id = self.chat_state.current_task(chat_id)
+            if not focus_id and not task_id:
+                self.chat_state.disable_auto(chat_id)
+                self._send(chat_id, "Auto mode stopped during restart: no focus or task is selected.")
+                continue
+            job = self.start(chat_id=chat_id, task_id="" if focus_id else task_id, prompt=prompt, metadata=metadata)
+            self.chat_state.mark_auto_job(chat_id, job_id=job.job_id, task_id=task_id, focus_id=focus_id)
+            recovered.append(job)
+            self._send(
+                chat_id,
+                "\n".join(
+                    [
+                        f"Auto mode recovered after AgentDeck restart: {job.job_id}",
+                        "Use /auto status or /auto end.",
+                    ]
+                ),
+            )
+        return recovered
+
     def _record_matches_scope(self, record: JobRecord) -> bool:
         if not self.state_scope:
             return True
@@ -770,7 +932,30 @@ class TelegramJobQueue:
             return record
 
     def _run_job(self, job_id: str) -> None:
-        job = self._start_job(job_id)
+        queued = self.registry.get(job_id)
+        lock_key = self._provider_lock_key_for_job(queued) if queued is not None else ""
+        provider_lock = self._provider_lock(lock_key) if lock_key else None
+        if lock_key:
+            self.registry.update_metadata(
+                job_id,
+                {"provider_lock_key": lock_key, "provider_lock_state": "waiting"},
+            )
+        if provider_lock is not None:
+            provider_lock.acquire()
+        try:
+            if lock_key:
+                self.registry.update_metadata(job_id, {"provider_lock_state": "acquired"})
+            job = self._start_job(job_id)
+            if job is None:
+                return
+            self._run_started_job(job)
+        finally:
+            if provider_lock is not None:
+                provider_lock.release()
+                self.registry.update_metadata(job_id, {"provider_lock_state": "released"})
+
+    def _run_started_job(self, job: JobRecord) -> None:
+        job_id = job.job_id
         if job is None:
             return
         cancellation = self._get_cancellation(job_id)
@@ -792,11 +977,11 @@ class TelegramJobQueue:
             )
         except RunConfigurationError as exc:
             finished = self._finish_job(job_id, status="error", error=str(exc))
-            self._send(job.chat_id, f"Job failed: {job_id}\n{exc}")
+            self._send(job.chat_id, f"Job failed: {job_id}\n{exc}", job_id=job_id)
             self._stop_auto_after_failure(finished or job, str(exc))
         except Exception as exc:  # keep the polling loop alive even if a background job crashes
             finished = self._finish_job(job_id, status="error", error=str(exc))
-            self._send(job.chat_id, f"Job failed: {job_id}\n{exc}")
+            self._send(job.chat_id, f"Job failed: {job_id}\n{exc}", job_id=job_id)
             self._stop_auto_after_failure(finished or job, str(exc))
         else:
             cancel_event = next((event for event in result.events if event.kind == EventKind.CANCELLED), None)
@@ -831,6 +1016,7 @@ class TelegramJobQueue:
                     notifier=lambda incident_arg, decision: self._send(
                         job.chat_id,
                         format_error_decision_message(incident_arg, decision),
+                        job_id=job_id,
                     ),
                 )
                 daemon.process_incident(incident)
@@ -844,7 +1030,7 @@ class TelegramJobQueue:
                         event=error_event,
                         adapter=result.adapter,
                     )
-                    ErrorHandlingDaemon(self.workspace).process_incident(incident)
+                    record_nonfatal_incident_for_job(self.workspace, incident)
                 finished = self._finish_job(
                     job_id,
                     status="done",
@@ -861,14 +1047,48 @@ class TelegramJobQueue:
                 self.chat_state.set_current_session(job.chat_id, result.session_id)
                 if result.focus_id:
                     self.chat_state.set_current_focus(job.chat_id, result.focus_id)
-            self._send(job.chat_id, _format_job_completion(finished_job, result.approval_requested))
+            self._send(job.chat_id, _format_job_completion(finished_job, result.approval_requested), job_id=job_id)
             if _is_assistant_job(finished_job):
                 for reply in self._assistant_action_replies(finished_job.chat_id, finished_job.final_text):
-                    self._send(finished_job.chat_id, reply)
+                    self._send(finished_job.chat_id, reply, job_id=job_id)
             self._continue_auto_if_needed(finished or job, result.approval_requested)
         finally:
             with self._lock:
                 self._cancellations.pop(job_id, None)
+
+    @classmethod
+    def _provider_lock(cls, key: str) -> threading.Lock:
+        with cls._SESSION_LOCKS_LOCK:
+            lock = cls._SESSION_LOCKS.get(key)
+            if lock is None:
+                lock = threading.Lock()
+                cls._SESSION_LOCKS[key] = lock
+            return lock
+
+    def _provider_lock_key_for_job(self, job: JobRecord | None) -> str:
+        if job is None:
+            return ""
+        metadata = dict(job.metadata or {})
+        session_id = str(metadata.get("session_id") or job.session_id or "")
+        focus_id = str(metadata.get("focus_id") or "")
+        if not session_id and focus_id:
+            focus = FocusRegistry(self.workspace).resolve(focus_id)
+            if focus is not None:
+                session_id = focus.session_id
+        if not session_id and job.task_id:
+            task = TaskBoard(self.workspace).resolve(job.task_id)
+            if task is not None:
+                session_id = task.session_id
+        if not session_id:
+            return ""
+        session = SessionRegistry(self.workspace).resolve(session_id)
+        if session is None:
+            return f"agentdeck-session:{session_id}"
+        provider_id = session.provider_session_id.strip()
+        if provider_id:
+            provider_kind = session.provider_session_kind or "provider_session"
+            return f"provider:{session.adapter}:{provider_kind}:{provider_id}"
+        return f"agentdeck-session:{session.session_id}"
 
     def _start_job(self, job_id: str) -> JobRecord | None:
         with self._lock:
@@ -913,11 +1133,25 @@ class TelegramJobQueue:
         with self._lock:
             return self._cancellations.get(job_id)
 
-    def _send(self, chat_id: int, text: str) -> None:
+    def _send(self, chat_id: int, text: str, *, job_id: str = "") -> bool:
         try:
             self.sender(chat_id, text)
-        except Exception:
-            pass
+            return True
+        except Exception as exc:
+            detail = _one_line(str(exc), 300)
+            print(f"[agentdeck] telegram send error chat={chat_id} job={job_id or '-'}: {detail}", file=sys.stderr, flush=True)
+            if job_id:
+                current = self.registry.get(job_id)
+                count = int((current.metadata or {}).get("send_error_count") or 0) if current is not None else 0
+                self.registry.update_metadata(
+                    job_id,
+                    {
+                        "last_send_error": detail,
+                        "last_send_error_at": time.time(),
+                        "send_error_count": count + 1,
+                    },
+                )
+            return False
 
     def _assistant_action_replies(self, chat_id: int, final_text: str) -> list[str]:
         if self._assistant_action_handler is None or not chat_id:
@@ -1132,6 +1366,14 @@ class TelegramCommandHandler:
             return [self._memories(rest, chat_id=chat_id)]
         if command in {"/forget", "forget"}:
             return [self._set_memory_disabled(rest, disabled=True, chat_id=chat_id)]
+        if command in {"/experience", "experience", "/experiences", "experiences"}:
+            return [self._experience(rest, chat_id=chat_id)]
+        if command in {"/event", "event"}:
+            return [self._experience("record " + rest, chat_id=chat_id)]
+        if command in {"/clones", "clones"}:
+            return [self._clones(rest, chat_id=chat_id)]
+        if command in {"/clone", "clone"}:
+            return [self._clone(rest, chat_id=chat_id)]
         if command in {"/compact", "compact"}:
             return [self._compact(rest, chat_id=chat_id)]
         if command in {"/handoffs", "handoffs"}:
@@ -1367,6 +1609,10 @@ class TelegramCommandHandler:
         assert path is not None
         if not _looks_like_video(path):
             return f"Not a recognized video file: {path.name}"
+        try:
+            _ensure_telegram_uploadable(path)
+        except RuntimeError as exc:
+            return f"Video send failed: {exc}"
         caption = " ".join(parts[1:]).strip()
         try:
             self.video_sender(chat_id, path, caption)
@@ -2361,6 +2607,378 @@ class TelegramCommandHandler:
                 return mapped
         return ref
 
+    def _experience(self, rest: str, *, chat_id: int | None) -> str:
+        subcommand, subrest = _split_once(rest)
+        lowered = subcommand.lower()
+        if not lowered:
+            return self._experience_collections("", chat_id=chat_id)
+        if lowered in {"help", "-h", "--help"}:
+            return _experience_help_text()
+        if lowered in {"new", "create", "collection"}:
+            return self._experience_new_collection(subrest, chat_id=chat_id)
+        if lowered in {"use", "select"}:
+            return self._experience_use(subrest, chat_id=chat_id)
+        if lowered in {"record", "add", "event"}:
+            return self._experience_record(subrest, chat_id=chat_id)
+        if lowered in {"events", "list"}:
+            return self._experience_events(subrest, chat_id=chat_id)
+        if lowered in {"show", "detail"}:
+            return self._experience_show(subrest, chat_id=chat_id)
+        if lowered == "link":
+            return self._experience_link(subrest, chat_id=chat_id)
+        if lowered in COLLECTION_KINDS or lowered in _EXPERIENCE_KIND_ALIASES:
+            return self._experience_collections(lowered, chat_id=chat_id)
+        return self._experience_collections(rest, chat_id=chat_id)
+
+    def _experience_collections(self, rest: str, *, chat_id: int | None) -> str:
+        kind = _experience_kind_alias(rest.strip()) if rest.strip() else ""
+        store = ExperienceStore(self.workspace)
+        records = self._relevant_experience_collections(chat_id=chat_id, kind=kind)
+        if chat_id is not None:
+            self.chat_state.set_recent_experience_collections(chat_id, [record.collection_id for record in records])
+        if not records:
+            kind_text = f" for kind {kind}" if kind else ""
+            return "\n".join(
+                [
+                    f"No experience collections{kind_text}.",
+                    "Use /experience new <kind> <title> to create one.",
+                    "Kinds: research_exploration, engineering_change, ops_maintenance, qa_support, decision_planning, scratch",
+                ]
+            )
+        current_id = self.chat_state.current_experience_collection(chat_id) if chat_id is not None else ""
+        lines = ["Experience collections:"]
+        for index, record in enumerate(records[:10], 1):
+            marker = " [current]" if record.collection_id == current_id else ""
+            lines.append(f"{index}. {record.title}{marker}")
+            lines.append(f"   kind: {record.kind}  status: {record.status}  id: {record.collection_id}")
+            scope = _experience_scope_text(record)
+            if scope:
+                lines.append(f"   scope: {scope}")
+            if record.purpose:
+                lines.append(f"   purpose: {_one_line(record.purpose, 220)}")
+            event_count = len(store.list_events(collection=record.collection_id, limit=0))
+            lines.append(f"   events: {event_count}")
+        lines.append("")
+        lines.append("Use /experience use <list #>, /experience events, or /experience record <event>.")
+        return "\n".join(lines)
+
+    def _experience_new_collection(self, rest: str, *, chat_id: int | None) -> str:
+        if chat_id is None:
+            return "This command requires a Telegram chat."
+        head, fields = _parse_experience_pipe_fields(rest)
+        first, title_rest = _split_once(head)
+        kind = _experience_kind_alias(first)
+        title = title_rest.strip() if kind else head.strip()
+        kind = kind or "scratch"
+        if not title:
+            return "Usage: /experience new <kind> <title> [| purpose: ...]"
+
+        project = self._resolve_project(self.chat_state.current_project(chat_id))
+        directory = self._resolve_directory(self.chat_state.current_directory(chat_id))
+        agent = self._resolve_agent(self.chat_state.current_agent(chat_id))
+        focus = self._resolve_focus(self.chat_state.current_focus(chat_id))
+        session = self._resolve_session(self.chat_state.current_session(chat_id))
+        try:
+            record = ExperienceStore(self.workspace).create_collection(
+                title,
+                kind=kind,
+                purpose=_first_field(fields, "purpose"),
+                project_id=project.project_id if project is not None else "",
+                directory_id=directory.directory_id if directory is not None else "",
+                worker_id=session.session_id if session is not None else "",
+                agent_id=agent.agent_id if agent is not None else "",
+                focus_id=focus.focus_id if focus is not None else "",
+                metadata={"source": "telegram"},
+            )
+        except ValueError as exc:
+            return str(exc)
+        self.chat_state.set_current_experience_collection(chat_id, record.collection_id)
+        self.chat_state.set_recent_experience_collections(chat_id, [record.collection_id])
+        lines = [
+            "Experience collection created and selected:",
+            f"title: {record.title}",
+            f"id: {record.collection_id}",
+            f"kind: {record.kind}",
+        ]
+        scope = _experience_scope_text(record)
+        if scope:
+            lines.append(f"scope: {scope}")
+        if record.purpose:
+            lines.append(f"purpose: {_one_line(record.purpose, 260)}")
+        lines.append("")
+        lines.append("Use /experience record <event> to add the first event.")
+        return "\n".join(lines)
+
+    def _experience_use(self, rest: str, *, chat_id: int | None) -> str:
+        if chat_id is None:
+            return "This command requires a Telegram chat."
+        record = self._resolve_experience_collection(rest, chat_id=chat_id)
+        if record is None:
+            return "Experience collection not found. Run /experience first, then /experience use <list #>."
+        self.chat_state.set_current_experience_collection(chat_id, record.collection_id)
+        self.chat_state.set_recent_experience_collections(chat_id, [record.collection_id])
+        return "\n".join(
+            [
+                "Current experience collection set:",
+                f"title: {record.title}",
+                f"id: {record.collection_id}",
+                f"kind: {record.kind}",
+                "",
+                "Use /experience record <event> or /experience events.",
+            ]
+        )
+
+    def _experience_record(self, rest: str, *, chat_id: int | None) -> str:
+        if chat_id is None:
+            return "This command requires a Telegram chat."
+        collection_id = self.chat_state.current_experience_collection(chat_id)
+        collection = ExperienceStore(self.workspace).resolve_collection(collection_id) if collection_id else None
+        if collection is None:
+            return "No current experience collection. Use /experience or /experience new <kind> <title> first."
+        head, fields = _parse_experience_pipe_fields(rest)
+        if not head:
+            return "Usage: /experience record <event purpose> [| result: ...] [| decision: ...] [| tag: ...]"
+        try:
+            event = ExperienceStore(self.workspace).record_event(
+                collection.collection_id,
+                purpose=head,
+                context=_first_field(fields, "context"),
+                actions=fields.get("action", []),
+                result=_first_field(fields, "result"),
+                analysis=_first_field(fields, "analysis"),
+                decisions=fields.get("decision", []),
+                artifacts=_parse_experience_telegram_artifacts(fields.get("artifact", [])),
+                tags=fields.get("tag", []),
+                parent_event_id=_resolve_optional_experience_event_ref(self, _first_field(fields, "parent"), chat_id=chat_id),
+                level=_first_field(fields, "level") or "micro",
+                kind=_first_field(fields, "kind") or "event",
+                status=_first_field(fields, "status") or "done",
+                confidence=_first_field(fields, "confidence"),
+                metadata={"source": "telegram"},
+            )
+        except ValueError as exc:
+            return str(exc)
+        self.chat_state.set_recent_experience_events(chat_id, [event.event_id])
+        lines = [
+            "Experience event recorded:",
+            f"event: {event.event_id}",
+            f"collection: {collection.title}",
+            f"purpose: {_one_line(event.purpose, 260)}",
+        ]
+        if event.result:
+            lines.append(f"result: {_one_line(event.result, 260)}")
+        if event.decisions:
+            lines.append(f"decision: {_one_line(event.decisions[0], 260)}")
+        lines.append("")
+        lines.append("Use /experience events to list recent events.")
+        return "\n".join(lines)
+
+    def _experience_events(self, rest: str, *, chat_id: int | None) -> str:
+        store = ExperienceStore(self.workspace)
+        query = rest.strip()
+        collection_id = self.chat_state.current_experience_collection(chat_id) if chat_id is not None else ""
+        collection = store.resolve_collection(collection_id) if collection_id else None
+        if collection is not None:
+            events = store.list_events(collection=collection.collection_id, query=query, limit=10)
+            title = f"Experience events: {collection.title}"
+        else:
+            events = self._relevant_experience_events(chat_id=chat_id, query=query)
+            title = "Experience events"
+        if chat_id is not None:
+            self.chat_state.set_recent_experience_events(chat_id, [event.event_id for event in events])
+        if not events:
+            suffix = f" matching: {query}" if query else ""
+            return f"No experience events{suffix}. Use /experience record <event>."
+        lines = [title]
+        if query:
+            lines.append(f"query: {query}")
+        for index, event in enumerate(events[:10], 1):
+            lines.append(f"{index}. {_one_line(event.purpose, 220)}")
+            lines.append(f"   id: {event.event_id}  level: {event.level}  status: {event.status}")
+            if event.result:
+                lines.append(f"   result: {_one_line(event.result, 220)}")
+            if event.decisions:
+                lines.append(f"   decision: {_one_line(event.decisions[0], 220)}")
+        lines.append("")
+        lines.append("Use /experience show <list #> or /experience link <from #> <relation> <to #>.")
+        return "\n".join(lines)
+
+    def _experience_show(self, rest: str, *, chat_id: int | None) -> str:
+        ref = rest.strip()
+        if not ref:
+            return "Usage: /experience show <event #, event id, collection #, or collection id>"
+        event = self._resolve_experience_event(ref, chat_id=chat_id)
+        if event is not None:
+            return self._format_experience_event_detail(event)
+        collection = self._resolve_experience_collection(ref, chat_id=chat_id)
+        if collection is not None:
+            return self._format_experience_collection_detail(collection)
+        return f"Experience record not found: {ref}"
+
+    def _experience_link(self, rest: str, *, chat_id: int | None) -> str:
+        parts = rest.strip().split(maxsplit=3)
+        if len(parts) < 3:
+            return "Usage: /experience link <from event #> <relation> <to event #> [reason]"
+        from_ref, relation, to_ref = parts[:3]
+        reason = parts[3] if len(parts) > 3 else ""
+        from_event = self._resolve_experience_event(from_ref, chat_id=chat_id)
+        to_event = self._resolve_experience_event(to_ref, chat_id=chat_id)
+        if from_event is None:
+            return f"From event not found: {from_ref}"
+        if to_event is None:
+            return f"To event not found: {to_ref}"
+        try:
+            edge = ExperienceStore(self.workspace).link_events(
+                from_event.event_id,
+                to_event.event_id,
+                relation=relation,
+                reason=reason,
+                metadata={"source": "telegram"},
+            )
+        except ValueError as exc:
+            return str(exc)
+        return "\n".join(
+            [
+                "Experience events linked:",
+                f"{_short_id(edge.from_event_id)} --{edge.relation}--> {_short_id(edge.to_event_id)}",
+                f"edge: {edge.edge_id}",
+            ]
+        )
+
+    def _resolve_experience_collection(self, value: str, *, chat_id: int | None = None) -> ExperienceCollection | None:
+        clean = value.strip()
+        if not clean:
+            return None
+        if chat_id is not None and clean.isdigit():
+            mapped = self.chat_state.recent_experience_collection_id(chat_id, int(clean))
+            if mapped:
+                clean = mapped
+        return ExperienceStore(self.workspace).resolve_collection(clean)
+
+    def _resolve_experience_event(self, value: str, *, chat_id: int | None = None) -> ExperienceEvent | None:
+        clean = value.strip()
+        if not clean:
+            return None
+        if chat_id is not None and clean.isdigit():
+            mapped = self.chat_state.recent_experience_event_id(chat_id, int(clean))
+            if mapped:
+                clean = mapped
+        return ExperienceStore(self.workspace).resolve_event(clean)
+
+    def _relevant_experience_collections(self, *, chat_id: int | None, kind: str = "") -> list[ExperienceCollection]:
+        store = ExperienceStore(self.workspace)
+        if chat_id is None:
+            return store.list_collections(kind=kind)[:10]
+        filters: list[dict[str, str]] = []
+        focus_id = self.chat_state.current_focus(chat_id)
+        session_id = self.chat_state.current_session(chat_id)
+        agent_id = self.chat_state.current_agent(chat_id)
+        project_id = self.chat_state.current_project(chat_id)
+        if focus_id:
+            filters.append({"focus_id": focus_id})
+        if session_id:
+            filters.append({"worker_id": session_id})
+        if agent_id:
+            filters.append({"agent_id": agent_id})
+        if project_id:
+            filters.append({"project_id": project_id})
+        records: dict[str, ExperienceCollection] = {}
+        for scope in filters:
+            for record in store.list_collections(kind=kind, **scope):
+                records.setdefault(record.collection_id, record)
+        if not records:
+            for record in store.list_collections(kind=kind):
+                records.setdefault(record.collection_id, record)
+        return sorted(records.values(), key=lambda item: (item.status == "archived", -item.updated_at))[:10]
+
+    def _relevant_experience_events(self, *, chat_id: int | None, query: str = "") -> list[ExperienceEvent]:
+        store = ExperienceStore(self.workspace)
+        if chat_id is None:
+            return store.list_events(query=query, limit=10)
+        filters: list[dict[str, str]] = []
+        focus_id = self.chat_state.current_focus(chat_id)
+        session_id = self.chat_state.current_session(chat_id)
+        agent_id = self.chat_state.current_agent(chat_id)
+        project_id = self.chat_state.current_project(chat_id)
+        if focus_id:
+            filters.append({"focus_id": focus_id})
+        if session_id:
+            filters.append({"worker_id": session_id})
+        if agent_id:
+            filters.append({"agent_id": agent_id})
+        if project_id:
+            filters.append({"project_id": project_id})
+        records: dict[str, ExperienceEvent] = {}
+        for scope in filters:
+            for event in store.list_events(query=query, limit=10, **scope):
+                records.setdefault(event.event_id, event)
+        if not records:
+            for event in store.list_events(query=query, limit=10):
+                records.setdefault(event.event_id, event)
+        return sorted(records.values(), key=lambda item: (item.started_at or item.created_at, item.sequence_index), reverse=True)[:10]
+
+    def _format_experience_collection_detail(self, record: ExperienceCollection) -> str:
+        store = ExperienceStore(self.workspace)
+        events = store.list_events(collection=record.collection_id, limit=8)
+        lines = [
+            record.title,
+            f"id: {record.collection_id}",
+            f"kind: {record.kind}",
+            f"status: {record.status}",
+        ]
+        scope = _experience_scope_text(record)
+        if scope:
+            lines.append(f"scope: {scope}")
+        if record.purpose:
+            lines.append(f"purpose: {_one_line(record.purpose, 400)}")
+        lines.append(f"events: {len(store.list_events(collection=record.collection_id, limit=0))}")
+        if events:
+            lines.append("")
+            lines.append("Recent events:")
+            for index, event in enumerate(events, 1):
+                lines.append(f"{index}. {_one_line(event.purpose, 220)}")
+                if event.result:
+                    lines.append(f"   result: {_one_line(event.result, 220)}")
+        return "\n".join(lines)
+
+    def _format_experience_event_detail(self, event: ExperienceEvent) -> str:
+        store = ExperienceStore(self.workspace)
+        collection = store.resolve_collection(event.collection_id)
+        edges = store.list_edges(event_id=event.event_id)
+        lines = [
+            event.purpose,
+            f"id: {event.event_id}",
+            f"collection: {collection.title if collection is not None else event.collection_id}",
+            f"level: {event.level}  kind: {event.kind}  status: {event.status}",
+        ]
+        if event.context:
+            lines.append(f"context: {_one_line(event.context, 400)}")
+        if event.actions:
+            lines.append("actions:")
+            for action in event.actions[:5]:
+                lines.append(f"- {_one_line(action, 260)}")
+        if event.result:
+            lines.append(f"result: {_one_line(event.result, 400)}")
+        if event.analysis:
+            lines.append(f"analysis: {_one_line(event.analysis, 400)}")
+        if event.decisions:
+            lines.append("decisions:")
+            for decision in event.decisions[:5]:
+                lines.append(f"- {_one_line(decision, 260)}")
+        if event.tags:
+            lines.append(f"tags: {', '.join(event.tags[:8])}")
+        if event.artifacts:
+            lines.append("artifacts:")
+            for artifact in event.artifacts[:5]:
+                kind = str(artifact.get("kind") or "file")
+                path = str(artifact.get("path") or "")
+                lines.append(f"- {kind}: {path}")
+        if edges:
+            lines.append("edges:")
+            for edge in edges[:6]:
+                lines.append(f"- {_short_id(edge.from_event_id)} --{edge.relation}--> {_short_id(edge.to_event_id)}")
+        return "\n".join(lines)
+
     def _compact(self, rest: str, *, chat_id: int | None) -> str:
         focus = None
         if chat_id is not None:
@@ -2882,17 +3500,226 @@ class TelegramCommandHandler:
         lines.append("Use /session <list #>, /use session <list #>, or /resume <list #> <message>.")
         return "\n".join(lines)
 
+    def _clones(self, rest: str, *, chat_id: int | None) -> str:
+        query = rest.strip().lower()
+        records = CloneStore(self.workspace).list()
+        if query:
+            records = [
+                record
+                for record in records
+                if query in record.clone_id.lower()
+                or query in record.title.lower()
+                or query in record.source_session_id.lower()
+                or query in record.source_worker_id.lower()
+            ]
+        if not records:
+            return "No clone capsules. Use /workers, then CLI `agentdeck workers clone <worker>` to create one."
+        records = records[:10]
+        if chat_id is not None:
+            self.chat_state.set_recent_clones(chat_id, [record.clone_id for record in records])
+        lines = ["Clone capsules:"]
+        for index, record in enumerate(records, 1):
+            status = "ok" if bool(record.validation.get("ok")) else "needs-review"
+            lines.append(f"{index}. {record.title or record.clone_id}")
+            lines.append(f"   id: {_short_id(record.clone_id, keep=18)}  source: {record.source_session_id}  provider: {record.provider}")
+            lines.append(f"   validation: {status}  created: {_format_timestamp(record.created_at)}")
+        lines.append("")
+        lines.append("Use /clone show <list #> or /clone spawn <list #> [agent <id>] [title <name>].")
+        return "\n".join(lines)
+
+    def _clone(self, rest: str, *, chat_id: int | None) -> str:
+        subcommand, subrest = _split_once(rest.strip())
+        lowered = subcommand.lower()
+        if lowered in {"", "list"}:
+            return self._clones(subrest, chat_id=chat_id)
+        if lowered in {"show", "view"}:
+            return self._clone_show(subrest, chat_id=chat_id)
+        if lowered in {"spawn", "new", "create"}:
+            return self._clone_spawn(subrest, chat_id=chat_id)
+        if lowered in {"current", "fork", "copy"}:
+            return self._clone_current(subrest, chat_id=chat_id)
+        record = self._resolve_clone(rest, chat_id=chat_id)
+        if record is None:
+            return "Clone not found. Use /clones first, then /clone show <list #>."
+        return self._format_clone_detail(record)
+
+    def _clone_show(self, rest: str, *, chat_id: int | None) -> str:
+        record = self._resolve_clone(rest, chat_id=chat_id)
+        if record is None:
+            return "Clone not found. Use /clones first, then /clone show <list #>."
+        return self._format_clone_detail(record)
+
+    def _clone_spawn(self, rest: str, *, chat_id: int | None) -> str:
+        if chat_id is None:
+            return "This command requires a Telegram chat."
+        ref, option_text = _split_once(rest.strip())
+        if not ref:
+            return "Usage: /clone spawn <clone # or id> [agent <id>] [title <name>] [project <project>] [cwd <path>] [adapter codex|kimi|echo] [replace]"
+        record = self._resolve_clone(ref, chat_id=chat_id)
+        if record is None:
+            return "Clone not found. Use /clones first, then /clone spawn <list #>."
+        options = _parse_clone_spawn_options(option_text)
+        try:
+            result = spawn_worker_from_clone(
+                self.workspace,
+                record,
+                agent_id=options.get("agent", ""),
+                session_id=options.get("session", ""),
+                title=options.get("title", ""),
+                project=options.get("project", ""),
+                project_dir=options.get("cwd", ""),
+                adapter=options.get("adapter", ""),
+                role=options.get("role", "developer"),
+                team_id=options.get("team", "default"),
+                model=options.get("model", ""),
+                sandbox=options.get("sandbox", ""),
+                approval_mode=options.get("approval", "fail"),
+                replace=bool(options.get("replace")),
+            )
+        except ValueError as exc:
+            return str(exc)
+
+        session = SessionRegistry(self.workspace).get(result["session_id"])
+        if session is not None:
+            self._select_session(chat_id, session)
+        self.chat_state.set_current_agent(chat_id, result["agent_id"])
+        self.chat_state.set_recent_sessions(chat_id, [result["session_id"]])
+
+        lines = [
+            "Clone worker prepared:",
+            f"worker: {result['agent_id']}",
+            f"session: {result['session_id']}",
+            f"clone: {record.clone_id}",
+            f"context: {result['clone_context_path']}",
+            "",
+            "Use plain text now to start this worker, or /run <message>.",
+        ]
+        return "\n".join(lines)
+
+    def _resolve_clone(self, value: str, *, chat_id: int | None = None) -> CloneCapsule | None:
+        clean = value.strip()
+        if not clean:
+            return None
+        store = CloneStore(self.workspace)
+        if clean.isdigit() and chat_id is not None:
+            mapped = self.chat_state.recent_clone_id(chat_id, int(clean))
+            if mapped:
+                return store.get(mapped)
+        return store.get(clean)
+
+    def _format_clone_detail(self, record: CloneCapsule) -> str:
+        lines = [
+            record.title or record.clone_id,
+            f"id: {record.clone_id}",
+            f"source_session: {record.source_session_id}",
+            f"source_worker: {record.source_worker_id or '-'}",
+            f"provider: {record.provider} {_short_id(record.provider_session_id)}",
+            f"project_dir: {record.project_dir}",
+            f"validation: {'ok' if bool(record.validation.get('ok')) else 'needs-review'}",
+        ]
+        current = dict(record.current or {})
+        if current.get("objective"):
+            lines.append(f"objective: {_one_line(str(current['objective']), 240)}")
+        if current.get("next_step"):
+            lines.append(f"next: {_one_line(str(current['next_step']), 220)}")
+        if record.decisions:
+            lines.append("decisions:")
+            for decision in record.decisions[:3]:
+                lines.append(f"- {_one_line(decision, 220)}")
+        if record.experience_collections:
+            lines.append(f"experience_collections: {len(record.experience_collections)}")
+        lines.append("")
+        lines.append("Use /clone spawn <list # or id> [agent <id>] [title <name>] to prepare a new worker.")
+        return "\n".join(lines)
+
+    def _clone_current(self, rest: str, *, chat_id: int | None) -> str:
+        if chat_id is None:
+            return "This command requires a Telegram chat."
+        session = self._current_clone_source_session(chat_id)
+        if session is None:
+            return "No current worker to clone. Use /workers, then /use session <list #> first."
+        if not session.provider_session_id:
+            return f"Current worker has no native provider session yet: {session.session_id}"
+
+        options = _parse_clone_spawn_options(rest)
+        collections: list[str] = []
+        collection_ref = options.get("collection", "")
+        if collection_ref:
+            collection_id = self.chat_state.recent_experience_collection_id(chat_id, int(collection_ref)) if collection_ref.isdigit() else collection_ref
+            collections.append(collection_id)
+        else:
+            current_collection = self.chat_state.current_experience_collection(chat_id)
+            if current_collection:
+                collections.append(current_collection)
+        try:
+            capsule = create_rules_clone_capsule(
+                self.workspace,
+                session.session_id,
+                home=options.get("home") or None,
+                collections=collections,
+            )
+            result = spawn_worker_from_clone(
+                self.workspace,
+                capsule,
+                agent_id=options.get("agent", ""),
+                session_id=options.get("session", ""),
+                title=options.get("title", ""),
+                project=options.get("project", ""),
+                project_dir=options.get("cwd", ""),
+                adapter=options.get("adapter", ""),
+                role=options.get("role", "developer"),
+                team_id=options.get("team", "default"),
+                model=options.get("model", ""),
+                sandbox=options.get("sandbox", ""),
+                approval_mode=options.get("approval", "fail"),
+                replace=bool(options.get("replace")),
+            )
+        except ValueError as exc:
+            return str(exc)
+
+        spawned = SessionRegistry(self.workspace).get(result["session_id"])
+        if spawned is not None:
+            self._select_session(chat_id, spawned)
+        self.chat_state.set_current_agent(chat_id, result["agent_id"])
+        self.chat_state.set_recent_clones(chat_id, [capsule.clone_id])
+        self.chat_state.set_recent_sessions(chat_id, [result["session_id"]])
+
+        lines = [
+            "Current worker cloned and spawned:",
+            f"source: {session.title} ({session.session_id})",
+            f"clone: {capsule.clone_id}",
+            f"worker: {result['agent_id']}",
+            f"session: {result['session_id']}",
+        ]
+        if collections:
+            lines.append(f"collections: {', '.join(collections)}")
+        lines.extend(["", "Use plain text now to start the cloned worker."])
+        return "\n".join(lines)
+
+    def _current_clone_source_session(self, chat_id: int) -> SessionRecord | None:
+        current_session_id = self.chat_state.current_session(chat_id)
+        session = SessionRegistry(self.workspace).resolve(current_session_id) if current_session_id else None
+        if session is not None:
+            return session
+        focus = self._resolve_focus(self.chat_state.current_focus(chat_id))
+        if focus is not None and focus.session_id:
+            return SessionRegistry(self.workspace).resolve(focus.session_id)
+        return None
+
     def _session(self, rest: str, *, chat_id: int | None) -> str:
         session_ref = rest.strip()
         if not session_ref:
             return (
                 "Usage: /session <session_id, title, or number>, "
-                "/session scan [codex|kimi] <old cwd>, or /session import <scan #>"
+                "/session scan [codex|kimi] <old cwd>, "
+                "/session scan-codex-index, or /session import <scan #>"
             )
         subcommand, subrest = _split_once(session_ref)
         lowered = subcommand.lower()
         if lowered == "scan":
             return self._session_scan(subrest, chat_id=chat_id)
+        if lowered in {"scan-codex-index", "codex-index"}:
+            return self._session_scan_codex_index(subrest, chat_id=chat_id)
         if lowered == "import":
             return self._session_import(subrest, chat_id=chat_id)
         if lowered in {"use", "select"}:
@@ -2958,6 +3785,35 @@ class TelegramCommandHandler:
         lines.append("Use /session import <list #> [project <project>] [task <task>] [agent <agent>].")
         return "\n".join(lines)
 
+    def _session_scan_codex_index(self, rest: str, *, chat_id: int | None) -> str:
+        cwd = rest.strip()
+        if not cwd and chat_id is not None:
+            current_project = self._resolve_project(self.chat_state.current_project(chat_id))
+            if current_project is not None:
+                cwd = current_project.project_dir
+        candidates = scan_codex_index_sessions(project_dir=cwd or None)[:10]
+        if not candidates:
+            suffix = f" for: {cwd}" if cwd else ""
+            return f"No Codex resume-index sessions found{suffix}."
+        if chat_id is not None:
+            self.chat_state.set_recent_provider_sessions(chat_id, candidates)
+
+        lines = ["Codex resume-index sessions:"]
+        if cwd:
+            lines.append(f"cwd filter: {cwd}")
+        for index, candidate in enumerate(candidates, 1):
+            cwd_text = candidate.project_dir or "cwd unknown"
+            marker = "" if candidate.project_dir else " [needs cwd]"
+            lines.append(f"{index}. {candidate.title}{marker}")
+            lines.append(
+                f"   id: {_short_id(candidate.provider_session_id)}  "
+                f"updated: {_format_timestamp(candidate.updated_at)}"
+            )
+            lines.append(f"   directory: {cwd_text}")
+        lines.append("")
+        lines.append("Use /session import <list #> [project <project>] [agent <agent>] [cwd <path>].")
+        return "\n".join(lines)
+
     def _session_import(self, rest: str, *, chat_id: int | None) -> str:
         if chat_id is None:
             return "This command requires a Telegram chat."
@@ -2991,6 +3847,8 @@ class TelegramCommandHandler:
             agent_id = project.default_agent_id
         agent_id = agent_id or "default"
         project_dir = options.get("cwd") or (project.project_dir if project is not None else candidate.project_dir)
+        if not project_dir:
+            return "Provider session has no working directory. Use /session import <list #> cwd <path> ..."
 
         registry = SessionRegistry(self.workspace)
         record = registry.import_provider_session(
@@ -4066,6 +4924,7 @@ class TelegramServer:
 
     def serve_forever(self, *, once: bool = False) -> None:
         self._send_restart_notices()
+        self.job_queue.recover_auto_jobs()
         offset: int | None = self.offset_store.get(self.config.bot_id)
         while True:
             try:
@@ -4277,6 +5136,42 @@ def _parse_session_import_options(rest: str) -> dict[str, str]:
     return options
 
 
+def _parse_clone_spawn_options(rest: str) -> dict[str, str]:
+    tokens = rest.strip().split()
+    options: dict[str, str] = {}
+    index = 0
+    while index < len(tokens):
+        key = tokens[index].lower()
+        if key == "replace":
+            options["replace"] = "true"
+            index += 1
+            continue
+        if key == "title":
+            title = " ".join(tokens[index + 1 :]).strip()
+            if title:
+                options["title"] = title
+            break
+        if key in {
+            "agent",
+            "session",
+            "project",
+            "cwd",
+            "adapter",
+            "role",
+            "team",
+            "model",
+            "sandbox",
+            "approval",
+            "home",
+            "collection",
+        } and index + 1 < len(tokens):
+            options[key] = tokens[index + 1]
+            index += 2
+            continue
+        index += 1
+    return options
+
+
 def _short_id(value: str, *, keep: int = 8) -> str:
     clean = value.strip()
     if len(clean) <= keep:
@@ -4319,6 +5214,56 @@ def _looks_like_video(path: Path) -> bool:
     if content_type.startswith("video/"):
         return True
     return path.suffix.lower() in {".mp4", ".mov", ".m4v", ".webm", ".mkv", ".avi"}
+
+
+def _looks_like_mpeg4_video(path: Path) -> bool:
+    content_type = mimetypes.guess_type(path.name)[0] or ""
+    return content_type == "video/mp4" or path.suffix.lower() in {".mp4", ".m4v"}
+
+
+def _ensure_telegram_uploadable(path: Path) -> None:
+    try:
+        size = path.stat().st_size
+    except OSError as exc:
+        raise RuntimeError(f"Cannot read file for Telegram upload: {path}") from exc
+    if size > TELEGRAM_BOT_UPLOAD_LIMIT_BYTES:
+        raise RuntimeError(
+            "Telegram Bot API upload limit is 50 MB for bot-uploaded files; "
+            f"{path.name} is {_format_bytes(size)}. Use a smaller clip, a link, or a local Bot API server."
+        )
+
+
+def _telegram_http_error_message(exc: urllib.error.HTTPError) -> str:
+    detail = ""
+    try:
+        raw = exc.read().decode("utf-8", errors="replace")
+    except OSError:
+        raw = ""
+    if raw:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            data = None
+        if isinstance(data, dict):
+            description = str(data.get("description") or "").strip()
+            if description:
+                detail = description
+        if not detail:
+            detail = _one_line(raw, 500)
+    prefix = f"Telegram API HTTP {exc.code}"
+    if detail:
+        return f"{prefix}: {detail}"
+    return f"{prefix}: {exc.reason}"
+
+
+def _format_bytes(size: int) -> str:
+    value = float(size)
+    for unit in ["B", "KB", "MB", "GB"]:
+        if value < 1024 or unit == "GB":
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
 
 
 def _parse_allowed_chat_ids(values: list[str]) -> list[int]:
@@ -4584,7 +5529,7 @@ def _assistant_action_allowed(action: str) -> tuple[bool, str]:
     if command == "/session":
         if not rest.strip():
             return False, "/session requires a session reference, scan command, or import command"
-        if lowered_sub in {"scan", "import"}:
+        if lowered_sub in {"scan", "scan-codex-index", "codex-index", "import"}:
             return True, ""
         return True, ""
     if command == "/agent":
@@ -4639,6 +5584,127 @@ def _format_memory_document(index: int, memory: MemoryDocument) -> list[str]:
     if excerpt:
         lines.append(f"   note: {excerpt}")
     return lines
+
+
+_EXPERIENCE_KIND_ALIASES = {
+    "research": "research_exploration",
+    "explore": "research_exploration",
+    "engineering": "engineering_change",
+    "eng": "engineering_change",
+    "ops": "ops_maintenance",
+    "maintenance": "ops_maintenance",
+    "qa": "qa_support",
+    "support": "qa_support",
+    "decision": "decision_planning",
+    "planning": "decision_planning",
+}
+
+
+def _experience_kind_alias(value: str) -> str:
+    clean = re.sub(r"[^a-zA-Z0-9_.-]+", "_", value.strip().lower()).strip("_.-")
+    if clean in COLLECTION_KINDS:
+        return clean
+    return _EXPERIENCE_KIND_ALIASES.get(clean, "")
+
+
+def _parse_experience_pipe_fields(text: str) -> tuple[str, dict[str, list[str]]]:
+    parts = [part.strip() for part in text.split("|")]
+    head = parts[0] if parts else ""
+    fields: dict[str, list[str]] = {}
+    field_aliases = {
+        "ctx": "context",
+        "context": "context",
+        "action": "action",
+        "actions": "action",
+        "result": "result",
+        "analysis": "analysis",
+        "decision": "decision",
+        "decisions": "decision",
+        "tag": "tag",
+        "tags": "tag",
+        "artifact": "artifact",
+        "artifacts": "artifact",
+        "purpose": "purpose",
+        "level": "level",
+        "kind": "kind",
+        "status": "status",
+        "parent": "parent",
+        "confidence": "confidence",
+    }
+    for part in parts[1:]:
+        if not part or ":" not in part:
+            continue
+        key, value = part.split(":", 1)
+        normalized = field_aliases.get(key.strip().lower())
+        clean_value = value.strip()
+        if normalized and clean_value:
+            fields.setdefault(normalized, []).append(clean_value)
+    return head.strip(), fields
+
+
+def _first_field(fields: dict[str, list[str]], key: str) -> str:
+    values = fields.get(key) or []
+    return values[0].strip() if values else ""
+
+
+def _parse_experience_telegram_artifacts(values: list[str]) -> list[dict[str, str]]:
+    artifacts: list[dict[str, str]] = []
+    for value in values:
+        text = value.strip()
+        if not text:
+            continue
+        kind = "file"
+        path = text
+        if ":" in text and not re.match(r"^[a-zA-Z]:[\\/]", text):
+            maybe_kind, maybe_path = text.split(":", 1)
+            if maybe_kind.strip() and maybe_path.strip():
+                kind = maybe_kind.strip()
+                path = maybe_path.strip()
+        artifacts.append({"kind": kind, "path": path})
+    return artifacts
+
+
+def _resolve_optional_experience_event_ref(
+    handler: TelegramCommandHandler,
+    value: str,
+    *,
+    chat_id: int | None,
+) -> str:
+    clean = value.strip()
+    if not clean:
+        return ""
+    event = handler._resolve_experience_event(clean, chat_id=chat_id)
+    return event.event_id if event is not None else clean
+
+
+def _experience_scope_text(record: ExperienceCollection) -> str:
+    parts: list[str] = []
+    if record.project_id:
+        parts.append(f"project={record.project_id}")
+    if record.worker_id:
+        parts.append(f"worker={record.worker_id}")
+    if record.agent_id:
+        parts.append(f"agent={record.agent_id}")
+    if record.focus_id:
+        parts.append(f"focus={record.focus_id}")
+    return "  ".join(parts)
+
+
+def _experience_help_text() -> str:
+    return "\n".join(
+        [
+            "Experience commands:",
+            "/experience",
+            "/experience new <kind> <title> [| purpose: ...]",
+            "/experience use <collection # or id>",
+            "/experience record <event> [| result: ...] [| decision: ...] [| tag: ...]",
+            "/experience events [query]",
+            "/experience show <event #, event id, collection #, or collection id>",
+            "/experience link <from event #> <relation> <to event #> [reason]",
+            "Kinds: research_exploration, engineering_change, ops_maintenance, qa_support, decision_planning, scratch",
+            "Relations: led_to, blocked_by, resolved_by, supports, contradicts, replaces, depends_on, produced, verified_by, contains, related_to",
+        ]
+    )
 
 
 def _parse_compact_options(rest: str, *, default_title: str) -> tuple[str, bool]:
@@ -4720,6 +5786,14 @@ def _help_text() -> str:
             "/memories [focus]",
             "/memory disable <memory #, id, title, or path>",
             "/memory enable <memory #, id, title, or path>",
+            "/experience",
+            "/experience new <kind> <title>",
+            "/experience record <event> [| result: ...] [| decision: ...]",
+            "/experience events [query]",
+            "/clones [query]",
+            "/clone show <clone # or id>",
+            "/clone spawn <clone # or id> [agent <id>] [title <name>]",
+            "/clone current [agent <id>] [title <name>]",
             "/compact [--pin] [title]",
             "/handoffs [focus or legacy task]",
             "/review <manager review summary>",
@@ -4729,6 +5803,7 @@ def _help_text() -> str:
             "/session <session_id or list #>",
             "/session use <session_id or list #>",
             "/session scan [codex|kimi] <old cwd>",
+            "/session scan-codex-index [cwd]",
             "/session import <scan #> [project <project>] [task <task>] [agent <agent>]",
             "/resume <session_id or list #> <message>",
             "/auto start [hours]",

@@ -42,6 +42,7 @@ class CodexExecAdapter:
     skip_git_repo_check: bool = True
     approval_mode: ApprovalMode = ApprovalMode.FAIL
     extra_args: tuple[str, ...] = field(default_factory=tuple)
+    env: dict[str, str] | None = None
 
     async def send(
         self,
@@ -83,6 +84,7 @@ class CodexExecAdapter:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 limit=SUBPROCESS_STREAM_LIMIT,
+                env=self.env,
             )
             cancel_task = asyncio.create_task(_terminate_on_cancel(process, cancellation))
 

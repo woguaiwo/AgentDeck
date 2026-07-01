@@ -21,6 +21,7 @@ from agentdeck.core.error_daemon import (
     create_error_incident_for_job,
     event_should_fail_job,
     first_error_event,
+    record_nonfatal_incident_for_job,
 )
 from agentdeck.core.run_service import RunConfigurationError, RunRequest, run_agent_prompt
 from agentdeck.interfaces.telegram import AUTO_TASK_DONE_MARKER
@@ -182,7 +183,7 @@ class WebJobQueue:
                 return
             if error_event is not None:
                 incident = create_error_incident_for_job(self.workspace, job=job, event=error_event, adapter=result.adapter)
-                ErrorHandlingDaemon(self.workspace).process_incident(incident)
+                record_nonfatal_incident_for_job(self.workspace, incident)
             self.registry.finish(job.job_id, status=status, session_id=result.session_id, final_text=result.final_text)
             if status == "done" and not event_should_fail_job(error_event):
                 self._continue_auto_if_needed(job, result.final_text, approval_requested=result.approval_requested)

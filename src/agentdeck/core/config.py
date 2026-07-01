@@ -121,6 +121,18 @@ class Workspace:
     def memory_dir(self) -> Path:
         return self.root / "memory"
 
+    @property
+    def clones_dir(self) -> Path:
+        return self.root / "clones"
+
+    @property
+    def experience_dir(self) -> Path:
+        return self.root / "experience"
+
+    @property
+    def tmp_dir(self) -> Path:
+        return self.root / "tmp"
+
     def ensure(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         for path in [
@@ -138,6 +150,9 @@ class Workspace:
             self.errors_dir,
             self.board_dir,
             self.focus_dir,
+            self.clones_dir,
+            self.experience_dir,
+            self.tmp_dir,
             self.memory_dir / "user",
             self.memory_dir / "projects",
             self.memory_dir / "teams",
@@ -166,6 +181,9 @@ class Workspace:
             "project_state": str(self.project_state_dir),
             "errors": str(self.errors_dir),
             "focus": str(self.focus_dir),
+            "clones": str(self.clones_dir),
+            "experience": str(self.experience_dir),
+            "tmp": str(self.tmp_dir),
             "memory": str(self.memory_dir),
         }
 

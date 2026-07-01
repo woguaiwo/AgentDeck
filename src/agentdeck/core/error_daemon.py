@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 from collections.abc import Callable
 
 from agentdeck.core.config import Workspace
@@ -112,6 +113,32 @@ def create_error_incident_for_job(
     adapter: str = "",
 ) -> ErrorIncidentRecord:
     return ErrorIncidentStore(workspace).create_from_event(job=job, event=event, adapter=adapter)
+
+
+def record_nonfatal_incident_for_job(workspace: Workspace, incident: ErrorIncidentRecord) -> ErrorDecisionRecord:
+    """Record a nonfatal adapter incident without pausing auto mode."""
+
+    decision = ErrorDecisionRecord(
+        decision_id=f"decision-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}",
+        incident_id=incident.incident_id,
+        action="pass",
+        reason="Nonfatal adapter warning; job completed successfully.",
+        notify_user=False,
+        record_unknown=False,
+        metadata={"nonfatal": True},
+    )
+    store = ErrorIncidentStore(workspace)
+    store.append_decision(incident, decision)
+    store.mark_resolved(incident.incident_id)
+    JobRegistry(workspace).update_metadata(
+        incident.job_id,
+        {
+            "warning_incident_id": incident.incident_id,
+            "warning_kind": incident.error_kind,
+            "warning_decision": "pass",
+        },
+    )
+    return decision
 
 
 def event_should_fail_job(event: AgentEvent | None) -> bool:

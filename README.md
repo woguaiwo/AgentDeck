@@ -149,6 +149,22 @@ agentdeck workers scan --provider codex --cwd /old/project/path
 agentdeck workers scan --provider kimi --cwd /old/project/path
 ```
 
+For Codex sessions that already appear in `codex resume`, AgentDeck can import
+directly from Codex's official resume index. If the Codex rollout contains a
+cwd, AgentDeck will use it automatically; otherwise pass `--cwd`:
+
+```bash
+agentdeck workers scan-codex-index
+
+agentdeck workers import-codex-index <codex_session_id_or_exact_title> \
+  --project <project_id> \
+  --agent <agent_id>
+
+agentdeck workers import-codex-index <codex_session_id_or_exact_title> \
+  --cwd /old/project/path \
+  --agent <agent_id>
+```
+
 Then bind the chosen provider session to an AgentDeck project and identity. The
 imported worker is also bound to a stable directory id through
 `DirectoryRegistry`. The older `agentdeck sessions ...` command remains as a
@@ -172,7 +188,9 @@ agentdeck workers import \
 After import, `agentdeck run --session <provider_session_id> "Continue"` resumes
 the underlying provider session while recording the run in AgentDeck. If a
 project moved directories, scan with the old provider cwd and import with the
-new AgentDeck project or `--cwd`.
+new AgentDeck project or `--cwd`. Imported Codex index sessions can still be
+opened in the Codex TUI with `codex resume <codex_session_id> -C <cwd>` while
+AgentDeck uses `codex exec resume <codex_session_id>` for background runs.
 
 ## Codex Approval Modes
 
@@ -330,6 +348,14 @@ Supported commands:
 /memories [focus]
 /memory disable <memory #, id, title, or path>
 /memory enable <memory #, id, title, or path>
+/experience
+/experience new <kind> <title>
+/experience record <event> [| result: ...] [| decision: ...]
+/experience events [query]
+/clones [query]
+/clone show <clone # or id>
+/clone spawn <clone # or id> [agent <id>] [title <name>]
+/clone current [agent <id>] [title <name>]
 /compact [--pin] [title]
 /handoffs [focus or legacy task]
 /review <manager review summary>
@@ -339,6 +365,7 @@ Supported commands:
 /session <session_id or list #>
 /session use <session_id or list #>
 /session scan [codex|kimi] <old cwd>
+/session scan-codex-index
 /session import <scan #> [project <project>] [task <task>] [agent <agent>]
 /resume <session_id or list #> <message>
 /auto start [hours]
@@ -408,7 +435,8 @@ those marker lines from the user-visible reply and executes only a small
 whitelist of routing commands, such as `/projects`, `/directories`, `/agents`,
 `/focus`, `/workers`, `/sessions`, `/status`, `/use project`, `/use directory`,
 `/use agent`, `/use focus`, `/use session`, `/project new`, `/directory add`,
-`/agent new`, `/session scan`, `/session import`, and `/restart`. `/restart`
+`/agent new`, `/session scan`, `/session scan-codex-index`, `/session import`,
+and `/restart`. `/restart`
 refuses to reload while Telegram jobs are active, and assistant actions cannot
 force it. It will not
 execute `/run`, `/auto`, approval, cancellation, shell, destructive, or
@@ -428,12 +456,13 @@ binding.
 For phone use, `/status` is the main control panel. It shows the current
 project, directory, agent, focus, session, latest job, auto mode, pending
 approvals, and recent sessions. `/projects`, `/directories`, `/agents`,
-`/focus`, `/jobs`, `/workers`, `/sessions`, and `/approvals` store numbered lists for the
-current chat, so commands like `/use project <list #>`,
+`/focus`, `/jobs`, `/workers`, `/sessions`, `/clones`, and `/approvals` store
+numbered lists for the current chat, so commands like `/use project <list #>`,
 `/use directory <list #>`, `/use agent <list #>`, `/use focus <list #>`,
 `/use session <list #>`, `/job <list #>`,
-`/job resume <list #>`, `/cancel <list #>`, and `/resume <list #> <message>`
-avoid copying long ids.
+`/job resume <list #>`, `/cancel <list #>`, `/clone show <list #>`,
+`/clone spawn <list #>`, and `/resume <list #> <message>` avoid copying long
+ids.
 
 Projects, directories, agents, and focus records can also be created from
 Telegram:
@@ -458,6 +487,22 @@ route plain text messages back to the assistant. Selecting a different project
 or agent with `/use project ...` or `/use agent ...` also clears the current
 task/session in legacy compatibility mode, so select or create a focus or
 session before sending work messages.
+
+Phone users can clone the selected worker without leaving Telegram. Use
+`/clone current` after selecting a session or focus-backed worker; AgentDeck
+creates a deterministic clone capsule from the current provider session, spawns
+a fresh prepared worker, and selects it for the chat. The next plain text
+message starts a new native Codex/Kimi provider session from the clone context:
+
+```text
+/workers
+/use session 1
+/clone current agent research-fork title Research Fork
+continue from the cloned context
+```
+
+Use `/clones`, `/clone show <list #>`, and `/clone spawn <list #>` when you
+want to inspect or reuse an existing capsule instead.
 
 Auto mode is a focus-level job loop. After selecting or creating a focus, send
 `/auto start` to start one run immediately and then keep starting the next run
@@ -534,6 +579,10 @@ cancellation yet may still finish normally after `cancel_requested`.
 ├── inbox/
 ├── board/
 │   └── tasks.json
+├── experience/
+│   ├── collections.json
+│   ├── events.json
+│   └── edges.json
 └── memory/
     ├── user/
     ├── projects/
@@ -583,6 +632,109 @@ future retrieval. Pinned memories are injected before ordinary recent memories;
 `/memory disable 1` after `/memories` to soft-prune a noisy memory without
 deleting its Markdown file, and `/memory enable 1` to restore it while the
 recent list is still active.
+
+## Experience Collections
+
+Markdown memory is for compact facts and context snapshots. Experience
+collections are for transferable event graphs: structured records of what an
+agent tried, why it tried it, what happened, what decision came out, and which
+artifacts prove it.
+
+Collections separate task nature so clone and retrieval do not mix unrelated
+work. Use kinds such as `research_exploration`, `engineering_change`,
+`ops_maintenance`, `qa_support`, `decision_planning`, and `scratch`:
+
+```bash
+agentdeck experience create-collection "IMU synthesis research" \
+  --kind research_exploration \
+  --project reid \
+  --worker <worker_id> \
+  --purpose "Explain IMU synthesis magnitude errors"
+
+agentdeck experience record "IMU synthesis research" \
+  --purpose "Check whether root orientation causes magnitude error" \
+  --action "Compared synthetic and ground-truth IMU peaks" \
+  --result "Root orientation alone does not explain the error" \
+  --decision "Keep investigating local high-frequency events" \
+  --artifact "report:outputs/imu/event_diagnostics.md" \
+  --tag imu
+
+agentdeck experience events --collection "IMU synthesis research"
+agentdeck experience link <event_a> <event_b> --relation led_to
+```
+
+The organizer can also turn structured handoffs and manager reviews into
+candidate experience events. It is deterministic in v1 and writes through the
+same `ExperienceStore` APIs as manual CLI and Telegram commands:
+
+```bash
+agentdeck experience organize --limit 50
+agentdeck experience serve --once
+agentdeck experience serve --poll-interval 30
+```
+
+Events support both hierarchy and graph relationships. `parent_event_id` stores
+macro/meso/micro containment, while `experience link` stores logical
+relationships such as `led_to`, `blocked_by`, `resolved_by`, `supports`, and
+`verified_by`.
+
+## Worker Clone Capsules
+
+A clone capsule is AgentDeck's safe handoff format for starting a new worker
+from an existing provider-backed worker. It records a redacted, provider-neutral
+context bundle under `.agentdeck/clones/<clone_id>/`:
+
+- `clone_capsule.json` is the structured transfer record.
+- `clone_context.md` is the human-readable context prompt.
+- `sources.json` records the source files and AgentDeck state used.
+- `validation.json` records safety checks such as missing fields or secrets.
+
+Clone spawn deliberately does not copy Codex/Kimi private provider storage and
+does not fabricate native provider session ids. It creates AgentDeck-side state:
+a new agent identity, a prepared worker/session record, and a session state
+card. The first real run starts a fresh native provider session from the clone
+context.
+
+Worker clone capsules include relevant experience collections automatically
+when they are tied to the source worker, agent, project, or focus. Pass
+`--collection <id-or-title>` to clone only selected collections:
+
+```bash
+agentdeck workers clone <worker_id> --collection "IMU synthesis research"
+```
+
+The full CLI flow is:
+
+```bash
+agentdeck workers clone <worker_id> --strategy rules
+agentdeck clones list
+agentdeck clones show <clone_id> --context
+agentdeck clones spawn <clone_id> \
+  --agent <new_worker_id> \
+  --title "New Worker"
+agentdeck run --agent <new_worker_id> "Continue from the cloned context"
+```
+
+`--strategy ai` runs an isolated temporary summarizer behind the same capsule
+schema. The deterministic rules strategy remains the default and is the one used
+by Telegram's one-command phone flow.
+
+From Telegram, after selecting the worker to clone:
+
+```text
+/clone current agent research-fork title Research Fork
+```
+
+Or reuse an existing capsule:
+
+```text
+/clones
+/clone show 1
+/clone spawn 1 agent research-fork title Research Fork
+```
+
+The spawned worker is selected automatically in that chat. Send a plain text
+message to start its first native provider session.
 
 ## Handoffs And Session State
 

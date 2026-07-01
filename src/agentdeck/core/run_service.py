@@ -575,6 +575,8 @@ def _session_resume_problem(session: SessionRecord, request: RunRequest) -> str:
         and not request.resume_last
         and not session.provider_session_id
     ):
+        if bool(session.metadata.get("clone_prepared")):
+            return ""
         return f"session has no provider session id; pass --resume explicitly: {session.session_id}"
     return ""
 
@@ -629,3 +631,9 @@ def _apply_agent_defaults(request: RunRequest, agent: AgentRecord, sessions: Ses
     )
     if latest is not None:
         request.session = latest.session_id
+        return
+
+    if _requires_provider_session(adapter_name):
+        prepared = sessions.latest_for_agent(agent.agent_id, adapter=adapter_name, require_provider_session=False)
+        if prepared is not None and bool(prepared.metadata.get("clone_prepared")):
+            request.session = prepared.session_id

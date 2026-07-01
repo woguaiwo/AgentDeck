@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import threading
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -66,6 +68,8 @@ class SessionRegistry:
     overwrite-friendly index for listing sessions and resuming provider threads.
     """
 
+    _LOCK = threading.RLock()
+
     def __init__(self, workspace: Workspace) -> None:
         self.workspace = workspace
 
@@ -84,91 +88,94 @@ class SessionRegistry:
         title: str | None = None,
         project_id: str = "",
     ) -> SessionRecord:
-        records = self._read()
-        existing = records.get(session_id)
-        now = time.time()
-        resolved_project_dir = str(Path(project_dir).expanduser().resolve())
-        clean_title = _clean_title(title or "")
-        if existing is None:
-            record = SessionRecord(
-                session_id=session_id,
-                agent_id=agent_id,
-                adapter=adapter,
-                project_dir=resolved_project_dir,
-                title=clean_title or _title_from_prompt(prompt),
-                last_user_message=prompt,
-                created_at=now,
-                updated_at=now,
-            )
-            record.metadata["title_source"] = "manual" if clean_title else "prompt"
-        else:
-            record = existing
-            record.agent_id = agent_id
-            record.adapter = adapter
-            record.project_dir = resolved_project_dir
-            record.status = "running"
-            record.updated_at = now
-            record.last_user_message = prompt
-            if clean_title:
-                record.title = clean_title
-                record.metadata["title_source"] = "manual"
-            elif not record.title:
-                record.title = _title_from_prompt(prompt)
-                record.metadata["title_source"] = "prompt"
-        self._sync_directory_metadata(record, project_id=project_id)
-        records[session_id] = record
-        self._write(records)
-        return record
+        with self._LOCK:
+            records = self._read()
+            existing = records.get(session_id)
+            now = time.time()
+            resolved_project_dir = str(Path(project_dir).expanduser().resolve())
+            clean_title = _clean_title(title or "")
+            if existing is None:
+                record = SessionRecord(
+                    session_id=session_id,
+                    agent_id=agent_id,
+                    adapter=adapter,
+                    project_dir=resolved_project_dir,
+                    title=clean_title or _title_from_prompt(prompt),
+                    last_user_message=prompt,
+                    created_at=now,
+                    updated_at=now,
+                )
+                record.metadata["title_source"] = "manual" if clean_title else "prompt"
+            else:
+                record = existing
+                record.agent_id = agent_id
+                record.adapter = adapter
+                record.project_dir = resolved_project_dir
+                record.status = "running"
+                record.updated_at = now
+                record.last_user_message = prompt
+                if clean_title:
+                    record.title = clean_title
+                    record.metadata["title_source"] = "manual"
+                elif not record.title:
+                    record.title = _title_from_prompt(prompt)
+                    record.metadata["title_source"] = "prompt"
+            self._sync_directory_metadata(record, project_id=project_id)
+            records[session_id] = record
+            self._write(records)
+            return record
 
     def update_from_event(self, event: AgentEvent) -> None:
-        records = self._read()
-        record = records.get(event.session_id)
-        if record is None:
-            return
+        with self._LOCK:
+            records = self._read()
+            record = records.get(event.session_id)
+            if record is None:
+                return
 
-        record.updated_at = event.created_at
-        if event.kind == EventKind.USER_MESSAGE:
-            record.last_user_message = event.text
-            if not record.title:
-                record.title = _title_from_prompt(event.text)
-                record.metadata["title_source"] = "prompt"
-        elif event.kind == EventKind.STATUS:
-            self._update_status_event(record, event)
-        elif event.kind == EventKind.ASSISTANT_FINAL:
-            record.status = "idle"
-            record.last_assistant_final = event.text
-        elif event.kind == EventKind.APPROVAL_REQUESTED:
-            record.status = "waiting_approval"
-        elif event.kind == EventKind.CANCELLED:
-            record.status = "cancelled"
-            record.metadata["last_cancel_reason"] = event.text
-        elif event.kind == EventKind.ERROR:
-            if bool(event.payload.get("approval_required")):
-                record.status = "waiting_approval"
-            elif not bool(event.payload.get("nonfatal")):
-                record.status = "error"
-            record.metadata["last_error"] = event.text
-        elif event.kind == EventKind.SESSION_IDLE:
-            if record.status not in {"cancelled", "error", "waiting_approval"}:
+            record.updated_at = event.created_at
+            if event.kind == EventKind.USER_MESSAGE:
+                record.last_user_message = event.text
+                if not record.title:
+                    record.title = _title_from_prompt(event.text)
+                    record.metadata["title_source"] = "prompt"
+            elif event.kind == EventKind.STATUS:
+                self._update_status_event(record, event)
+            elif event.kind == EventKind.ASSISTANT_FINAL:
                 record.status = "idle"
+                record.last_assistant_final = event.text
+            elif event.kind == EventKind.APPROVAL_REQUESTED:
+                record.status = "waiting_approval"
+            elif event.kind == EventKind.CANCELLED:
+                record.status = "cancelled"
+                record.metadata["last_cancel_reason"] = event.text
+            elif event.kind == EventKind.ERROR:
+                if bool(event.payload.get("approval_required")):
+                    record.status = "waiting_approval"
+                elif not bool(event.payload.get("nonfatal")):
+                    record.status = "error"
+                record.metadata["last_error"] = event.text
+            elif event.kind == EventKind.SESSION_IDLE:
+                if record.status not in {"cancelled", "error", "waiting_approval"}:
+                    record.status = "idle"
 
-        records[event.session_id] = record
-        self._write(records)
+            records[event.session_id] = record
+            self._write(records)
 
     def get(self, session_id: str) -> SessionRecord | None:
         return self._read().get(session_id)
 
     def rename(self, session_id: str, title: str) -> SessionRecord | None:
-        records = self._read()
-        record = self.resolve(session_id)
-        if record is None:
-            return None
-        record.title = _clean_title(title) or _title_from_prompt(record.last_user_message)
-        record.updated_at = time.time()
-        record.metadata["title_source"] = "manual"
-        records[record.session_id] = record
-        self._write(records)
-        return record
+        with self._LOCK:
+            records = self._read()
+            record = self.resolve(session_id)
+            if record is None:
+                return None
+            record.title = _clean_title(title) or _title_from_prompt(record.last_user_message)
+            record.updated_at = time.time()
+            record.metadata["title_source"] = "manual"
+            records[record.session_id] = record
+            self._write(records)
+            return record
 
     def set_current_focus(
         self,
@@ -178,30 +185,31 @@ class SessionRegistry:
         focus_text: str = "",
         actor: str = "system",
     ) -> SessionRecord | None:
-        records = self._read()
-        record = self.resolve(session)
-        if record is None:
-            return None
-        previous = str(record.metadata.get(CURRENT_FOCUS_METADATA_KEY) or "")
-        clean_focus_id = focus_id.strip()
-        record.metadata[CURRENT_FOCUS_METADATA_KEY] = clean_focus_id
-        history = record.metadata.get(FOCUS_HISTORY_METADATA_KEY)
-        if not isinstance(history, list):
-            history = []
-        history.append(
-            {
-                "from": previous,
-                "to": clean_focus_id,
-                "text": _clean_multiline(focus_text),
-                "actor": _clean_title(actor) or "system",
-                "created_at": time.time(),
-            }
-        )
-        record.metadata[FOCUS_HISTORY_METADATA_KEY] = history[-50:]
-        record.updated_at = time.time()
-        records[record.session_id] = record
-        self._write(records)
-        return record
+        with self._LOCK:
+            records = self._read()
+            record = self.resolve(session)
+            if record is None:
+                return None
+            previous = str(record.metadata.get(CURRENT_FOCUS_METADATA_KEY) or "")
+            clean_focus_id = focus_id.strip()
+            record.metadata[CURRENT_FOCUS_METADATA_KEY] = clean_focus_id
+            history = record.metadata.get(FOCUS_HISTORY_METADATA_KEY)
+            if not isinstance(history, list):
+                history = []
+            history.append(
+                {
+                    "from": previous,
+                    "to": clean_focus_id,
+                    "text": _clean_multiline(focus_text),
+                    "actor": _clean_title(actor) or "system",
+                    "created_at": time.time(),
+                }
+            )
+            record.metadata[FOCUS_HISTORY_METADATA_KEY] = history[-50:]
+            record.updated_at = time.time()
+            records[record.session_id] = record
+            self._write(records)
+            return record
 
     def current_focus_id(self, session: str) -> str:
         record = self.resolve(session)
@@ -236,53 +244,98 @@ class SessionRegistry:
         if not provider_session_id:
             raise ValueError("provider_session_id is required")
 
-        records = self._read()
-        record = records.get(session_id or "")
-        if record is None:
-            for candidate in records.values():
-                if candidate.adapter == adapter and candidate.provider_session_id == provider_session_id:
-                    record = candidate
-                    break
+        with self._LOCK:
+            records = self._read()
+            record = records.get(session_id or "")
+            if record is None:
+                for candidate in records.values():
+                    if candidate.adapter == adapter and candidate.provider_session_id == provider_session_id:
+                        record = candidate
+                        break
 
-        now = time.time()
-        clean_title = _clean_title(title)
-        resolved_project_dir = str(Path(project_dir).expanduser().resolve())
-        if record is None:
+            now = time.time()
+            clean_title = _clean_title(title)
+            resolved_project_dir = str(Path(project_dir).expanduser().resolve())
+            if record is None:
+                record = SessionRecord(
+                    session_id=session_id or _import_session_id(adapter, provider_session_id),
+                    agent_id=agent_id,
+                    adapter=adapter,
+                    project_dir=resolved_project_dir,
+                    title=clean_title or provider_session_id,
+                    status="idle",
+                    created_at=now,
+                    updated_at=now,
+                    provider_session_id=provider_session_id,
+                    provider_session_kind=provider_session_kind,
+                )
+            else:
+                record.agent_id = agent_id
+                record.adapter = adapter
+                record.project_dir = resolved_project_dir
+                record.status = "idle"
+                record.updated_at = now
+                record.provider_session_id = provider_session_id
+                record.provider_session_kind = provider_session_kind
+                if clean_title:
+                    record.title = clean_title
+
+            if clean_title:
+                record.metadata["title_source"] = "manual"
+            elif not record.title:
+                record.title = provider_session_id
+                record.metadata["title_source"] = "provider"
+            record.metadata["imported"] = True
+            if metadata:
+                record.metadata.update(metadata)
+            self._sync_directory_metadata(record, project_id=project_id)
+            records[record.session_id] = record
+            self._write(records)
+            return record
+
+    def create_prepared_session(
+        self,
+        *,
+        agent_id: str,
+        adapter: str,
+        project_dir: str | Path,
+        title: str,
+        session_id: str | None = None,
+        project_id: str = "",
+        metadata: dict[str, Any] | None = None,
+        replace: bool = False,
+    ) -> SessionRecord:
+        """Create an AgentDeck session shell before its native provider session exists."""
+        with self._LOCK:
+            records = self._read()
+            clean_title = _clean_title(title)
+            resolved_session_id = session_id or f"session-{uuid.uuid4().hex[:12]}"
+            if resolved_session_id in records and not replace:
+                raise ValueError(f"session already exists: {resolved_session_id}")
+
+            now = time.time()
             record = SessionRecord(
-                session_id=session_id or _import_session_id(adapter, provider_session_id),
+                session_id=resolved_session_id,
                 agent_id=agent_id,
                 adapter=adapter,
-                project_dir=resolved_project_dir,
-                title=clean_title or provider_session_id,
-                status="idle",
-                created_at=now,
+                project_dir=str(Path(project_dir).expanduser().resolve()),
+                title=clean_title or resolved_session_id,
+                status="prepared",
+                created_at=records[resolved_session_id].created_at if resolved_session_id in records else now,
                 updated_at=now,
-                provider_session_id=provider_session_id,
-                provider_session_kind=provider_session_kind,
+                provider_session_id="",
+                provider_session_kind="",
+                metadata=dict(records[resolved_session_id].metadata) if resolved_session_id in records else {},
             )
-        else:
-            record.agent_id = agent_id
-            record.adapter = adapter
-            record.project_dir = resolved_project_dir
-            record.status = "idle"
-            record.updated_at = now
-            record.provider_session_id = provider_session_id
-            record.provider_session_kind = provider_session_kind
+            record.metadata["prepared"] = True
+            if metadata:
+                record.metadata.update(metadata)
             if clean_title:
-                record.title = clean_title
-
-        if clean_title:
-            record.metadata["title_source"] = "manual"
-        elif not record.title:
-            record.title = provider_session_id
-            record.metadata["title_source"] = "provider"
-        record.metadata["imported"] = True
-        if metadata:
-            record.metadata.update(metadata)
-        self._sync_directory_metadata(record, project_id=project_id)
-        records[record.session_id] = record
-        self._write(records)
-        return record
+                record.metadata["title_source"] = "manual"
+            self._sync_directory_metadata(record, project_id=project_id)
+            records[record.session_id] = record
+            self._write(records)
+            return record
 
     def resolve(self, value: str) -> SessionRecord | None:
         records = self._read()
@@ -386,7 +439,7 @@ class SessionRegistry:
             "version": 1,
             "sessions": {key: record.to_dict() for key, record in sorted(records.items())},
         }
-        tmp = self.path.with_suffix(".tmp")
+        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
         tmp.replace(self.path)
 

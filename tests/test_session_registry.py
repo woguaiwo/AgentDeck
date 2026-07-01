@@ -4,6 +4,7 @@ import json
 import re
 import sys
 import tempfile
+import threading
 import textwrap
 import unittest
 from pathlib import Path
@@ -16,6 +17,38 @@ from agentdeck.storage.sessions import SessionRegistry
 
 
 class SessionRegistryTests(unittest.TestCase):
+    def test_concurrent_session_starts_do_not_collide_on_registry_tmp_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            workspace.ensure()
+            project = Path(tmpdir) / "project"
+            project.mkdir()
+            start = threading.Barrier(12)
+            errors: list[BaseException] = []
+
+            def worker(index: int) -> None:
+                try:
+                    start.wait(timeout=2)
+                    SessionRegistry(workspace).upsert_start(
+                        session_id=f"session-{index}",
+                        agent_id=f"agent-{index}",
+                        adapter="echo",
+                        project_dir=project,
+                        prompt=f"prompt {index}",
+                    )
+                except BaseException as exc:  # pragma: no cover - surfaced by assertion below
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=worker, args=(index,)) for index in range(12)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+
+            self.assertEqual(errors, [])
+            records = SessionRegistry(workspace).list()
+            self.assertEqual({record.session_id for record in records}, {f"session-{index}" for index in range(12)})
+
     def test_registry_captures_codex_thread_id_from_status_event(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             workspace = Workspace(Path(tmpdir) / ".agentdeck")
@@ -359,6 +392,122 @@ class SessionRegistryTests(unittest.TestCase):
             found = json.loads(stdout.getvalue())
             ids = {item["provider_session_id"] for item in found}
             self.assertEqual(ids, {"codex-thread-1", "kimi-session-1"})
+
+    def test_cli_workers_import_codex_index_adopts_visible_resume_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            workspace.ensure()
+            home = tmp / "home"
+            project = tmp / "project"
+            project.mkdir()
+            codex_dir = home / ".codex"
+            rollout = codex_dir / "sessions" / "2026" / "06" / "30" / "rollout.jsonl"
+            rollout.parent.mkdir(parents=True)
+            (codex_dir / "session_index.jsonl").write_text(
+                json.dumps(
+                    {
+                        "id": "official-thread-1",
+                        "thread_name": "Official visible work",
+                        "updated_at": "2026-06-30T00:00:00Z",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            rollout.write_text(
+                json.dumps(
+                    {
+                        "timestamp": "2026-06-30T00:00:00Z",
+                        "type": "session_meta",
+                        "payload": {"id": "official-thread-1", "cwd": str(project)},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(
+                    [
+                        "--workspace",
+                        str(workspace.root),
+                        "workers",
+                        "scan-codex-index",
+                        "--home",
+                        str(home),
+                        "--json",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            visible = json.loads(stdout.getvalue())
+            self.assertEqual(visible[0]["provider_session_id"], "official-thread-1")
+            self.assertEqual(visible[0]["title"], "Official visible work")
+            self.assertEqual(visible[0]["project_dir"], str(project))
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(
+                    [
+                        "--workspace",
+                        str(workspace.root),
+                        "workers",
+                        "import-codex-index",
+                        "Official visible work",
+                        "--home",
+                        str(home),
+                        "--agent",
+                        "agent-a",
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertIn("provider_session_id: official-thread-1", stdout.getvalue())
+            record = SessionRegistry(workspace).resolve("Official visible work")
+            assert record is not None
+            self.assertEqual(record.provider_session_id, "official-thread-1")
+            self.assertEqual(record.project_dir, str(project))
+            self.assertEqual(record.metadata["import_source"], "codex_session_index")
+
+            args_path = tmp / "codex_args.txt"
+            fake = tmp / "fake_codex"
+            fake.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!{sys.executable}
+                    import sys
+                    from pathlib import Path
+
+                    args = sys.argv[1:]
+                    Path({str(args_path)!r}).write_text("\\n".join(args), encoding="utf-8")
+                    for i, arg in enumerate(args):
+                        if arg in {{"--output-last-message", "-o"}} and i + 1 < len(args):
+                            Path(args[i + 1]).write_text("official final", encoding="utf-8")
+                    """
+                ),
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                code = main(
+                    [
+                        "--workspace",
+                        str(workspace.root),
+                        "run",
+                        "continue",
+                        "--session",
+                        "Official visible work",
+                        "--codex-bin",
+                        str(fake),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            self.assertIn("official final", stdout.getvalue())
+            args = args_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(args[:2], ["exec", "resume"])
+            self.assertIn("official-thread-1", args)
 
     def test_cli_run_session_refuses_codex_session_without_provider_id(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

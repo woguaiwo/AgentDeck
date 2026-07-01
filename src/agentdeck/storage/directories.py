@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import threading
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -55,6 +57,8 @@ class DirectoryRegistry:
     optional hierarchy metadata without changing provider cwd behavior.
     """
 
+    _LOCK = threading.RLock()
+
     def __init__(self, workspace: Workspace) -> None:
         self.workspace = workspace
 
@@ -73,37 +77,38 @@ class DirectoryRegistry:
         status: str = "active",
         metadata: dict[str, Any] | None = None,
     ) -> DirectoryRecord:
-        resolved_path = str(Path(path).expanduser().resolve())
-        directory_id = directory_id_for_path(resolved_path)
-        parent_directory_id = ""
-        parent_text = str(parent or "").strip()
-        if parent_text:
-            parent_directory_id = (
-                parent_text
-                if parent_text.startswith("dir-")
-                else directory_id_for_path(Path(parent_text).expanduser().resolve())
-            )
+        with self._LOCK:
+            resolved_path = str(Path(path).expanduser().resolve())
+            directory_id = directory_id_for_path(resolved_path)
+            parent_directory_id = ""
+            parent_text = str(parent or "").strip()
+            if parent_text:
+                parent_directory_id = (
+                    parent_text
+                    if parent_text.startswith("dir-")
+                    else directory_id_for_path(Path(parent_text).expanduser().resolve())
+                )
 
-        records = self._read()
-        existing = records.get(directory_id)
-        now = time.time()
-        record = DirectoryRecord(
-            directory_id=directory_id,
-            path=resolved_path,
-            project_id=_normalize_token(project_id) if project_id else (existing.project_id if existing else ""),
-            title=_clean_title(title) or (existing.title if existing else Path(resolved_path).name or resolved_path),
-            parent_directory_id=parent_directory_id or (existing.parent_directory_id if existing else ""),
-            role=_normalize_token(role or "workspace"),
-            status=status or (existing.status if existing else "active"),
-            created_at=existing.created_at if existing else now,
-            updated_at=now,
-            metadata=dict(existing.metadata) if existing else {},
-        )
-        if metadata:
-            record.metadata.update(metadata)
-        records[directory_id] = record
-        self._write(records)
-        return record
+            records = self._read()
+            existing = records.get(directory_id)
+            now = time.time()
+            record = DirectoryRecord(
+                directory_id=directory_id,
+                path=resolved_path,
+                project_id=_normalize_token(project_id) if project_id else (existing.project_id if existing else ""),
+                title=_clean_title(title) or (existing.title if existing else Path(resolved_path).name or resolved_path),
+                parent_directory_id=parent_directory_id or (existing.parent_directory_id if existing else ""),
+                role=_normalize_token(role or "workspace"),
+                status=status or (existing.status if existing else "active"),
+                created_at=existing.created_at if existing else now,
+                updated_at=now,
+                metadata=dict(existing.metadata) if existing else {},
+            )
+            if metadata:
+                record.metadata.update(metadata)
+            records[directory_id] = record
+            self._write(records)
+            return record
 
     def get(self, directory_id: str) -> DirectoryRecord | None:
         return self._read().get(directory_id.strip())
@@ -168,7 +173,7 @@ class DirectoryRegistry:
             "version": 1,
             "directories": {key: record.to_dict() for key, record in sorted(records.items())},
         }
-        tmp = self.path.with_suffix(".tmp")
+        tmp = self.path.with_name(f"{self.path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
         tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
         tmp.replace(self.path)
 

@@ -7,6 +7,7 @@ import asyncio
 from datetime import datetime
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -15,18 +16,38 @@ from pathlib import Path
 
 from agentdeck.core.config import DEFAULT_PROJECT_LOCAL_CONFIG, Workspace, find_project_local_config, project_local_config_path
 from agentdeck.core.error_daemon import ErrorHandlingDaemon
+from agentdeck.core.experience_organizer import ExperienceOrganizer, ExperienceOrganizerResult
 from agentdeck.core.run_service import RunConfigurationError, RunRequest, build_agentdeck_context, run_agent_prompt
 from agentdeck.interfaces.telegram import TelegramBotApi, TelegramMultiServer, TelegramServer, config_from_env
 from agentdeck.storage.approvals import APPROVAL_STATUSES, ApprovalRecord, ApprovalRegistry
+from agentdeck.storage.clones import (
+    CloneCapsule,
+    CloneStore,
+    create_ai_clone_capsule,
+    create_rules_clone_capsule,
+    spawn_worker_from_clone,
+)
 from agentdeck.storage.event_log import EventLog
 from agentdeck.storage.errors import ErrorIncidentStore
+from agentdeck.storage.experience import (
+    COLLECTION_KINDS,
+    COLLECTION_STATUSES,
+    EDGE_RELATIONS,
+    EVENT_LEVELS,
+    EVENT_STATUSES,
+    ExperienceCollection,
+    ExperienceEdge,
+    ExperienceEvent,
+    ExperienceStore,
+)
 from agentdeck.storage.agents import ASSISTANT_AGENT_ID, DEFAULT_ASSISTANT_TEMPLATE, AgentRecord, AgentRegistry
 from agentdeck.storage.directories import DirectoryRecord, DirectoryRegistry
 from agentdeck.storage.focus import FOCUS_STATUSES, FocusRecord, FocusRegistry
 from agentdeck.storage.jobs import JobRecord, JobRegistry
 from agentdeck.storage.memory import MarkdownMemoryStore
 from agentdeck.storage.progress import ProgressJournal, format_handoff, format_review
-from agentdeck.storage.provider_sessions import ProviderSessionCandidate, scan_provider_sessions
+from agentdeck.storage.provider_cleanup import ProviderDeleteResult, delete_provider_session
+from agentdeck.storage.provider_sessions import ProviderSessionCandidate, scan_codex_index_sessions, scan_provider_sessions
 from agentdeck.storage.projects import ProjectRecord, ProjectRegistry
 from agentdeck.storage.project_state import ProjectStateStore
 from agentdeck.storage.session_state import SessionStateStore
@@ -140,6 +161,76 @@ def build_parser() -> argparse.ArgumentParser:
     mem_compact_focus.add_argument("--max-chars", type=int, default=6000)
     mem_compact_focus.add_argument("--pin", action="store_true", help="Prioritize this snapshot in retrieval")
 
+    experience = sub.add_parser("experience", help="Manage experience collections and event graphs")
+    exp_sub = experience.add_subparsers(dest="experience_command", required=True)
+    exp_collections = exp_sub.add_parser("collections", help="List experience collections")
+    exp_collections.add_argument("--project")
+    exp_collections.add_argument("--worker")
+    exp_collections.add_argument("--agent")
+    exp_collections.add_argument("--focus")
+    exp_collections.add_argument("--kind", choices=sorted(COLLECTION_KINDS))
+    exp_collections.add_argument("--status", choices=sorted(COLLECTION_STATUSES))
+    exp_create_collection = exp_sub.add_parser("create-collection", help="Create an experience collection")
+    exp_create_collection.add_argument("title")
+    exp_create_collection.add_argument("--kind", required=True, choices=sorted(COLLECTION_KINDS))
+    exp_create_collection.add_argument("--purpose", default="")
+    exp_create_collection.add_argument("--project")
+    exp_create_collection.add_argument("--worker")
+    exp_create_collection.add_argument("--agent")
+    exp_create_collection.add_argument("--focus")
+    exp_create_collection.add_argument("--directory-id", default="")
+    exp_create_collection.add_argument("--status", default="active", choices=sorted(COLLECTION_STATUSES))
+    exp_show_collection = exp_sub.add_parser("show-collection", help="Show one experience collection")
+    exp_show_collection.add_argument("collection")
+    exp_record = exp_sub.add_parser("record", help="Record one experience event")
+    exp_record.add_argument("collection")
+    exp_record.add_argument("--purpose", required=True)
+    exp_record.add_argument("--context", default="")
+    exp_record.add_argument("--action", action="append", default=[])
+    exp_record.add_argument("--result", default="")
+    exp_record.add_argument("--analysis", default="")
+    exp_record.add_argument("--decision", action="append", default=[])
+    exp_record.add_argument("--artifact", action="append", default=[], help="Artifact path or kind:path")
+    exp_record.add_argument("--tag", action="append", default=[])
+    exp_record.add_argument("--parent")
+    exp_record.add_argument("--sequence", type=int, default=0)
+    exp_record.add_argument("--level", default="micro", choices=sorted(EVENT_LEVELS))
+    exp_record.add_argument("--kind", default="event")
+    exp_record.add_argument("--status", default="done", choices=sorted(EVENT_STATUSES))
+    exp_record.add_argument("--focus")
+    exp_record.add_argument("--confidence", default="")
+    exp_events = exp_sub.add_parser("events", help="List/search experience events")
+    exp_events.add_argument("--collection")
+    exp_events.add_argument("--project")
+    exp_events.add_argument("--worker")
+    exp_events.add_argument("--agent")
+    exp_events.add_argument("--focus")
+    exp_events.add_argument("--kind")
+    exp_events.add_argument("--query")
+    exp_events.add_argument("--limit", type=int, default=20)
+    exp_show = exp_sub.add_parser("show", help="Show one experience event")
+    exp_show.add_argument("event")
+    exp_link = exp_sub.add_parser("link", help="Link two experience events")
+    exp_link.add_argument("from_event")
+    exp_link.add_argument("to_event")
+    exp_link.add_argument("--relation", required=True, choices=sorted(EDGE_RELATIONS))
+    exp_link.add_argument("--reason", default="")
+    exp_edges = exp_sub.add_parser("edges", help="List experience graph edges")
+    exp_edges.add_argument("--event")
+    exp_edges.add_argument("--relation", choices=sorted(EDGE_RELATIONS))
+    exp_organize = exp_sub.add_parser("organize", help="Extract structured progress into experience events once")
+    exp_organize.add_argument("--limit", type=int, default=50)
+    exp_organize.add_argument("--collection", default="", help="Existing collection id/title to write into")
+    exp_organize.add_argument("--kind", choices=sorted(COLLECTION_KINDS), default="", help="Kind for auto-created collections")
+    exp_organize.add_argument("--dry-run", action="store_true")
+    exp_serve = exp_sub.add_parser("serve", help="Run the experience organizer daemon in the foreground")
+    exp_serve.add_argument("--once", action="store_true", help="Process pending progress once and exit")
+    exp_serve.add_argument("--poll-interval", type=float, default=30.0)
+    exp_serve.add_argument("--limit", type=int, default=50)
+    exp_serve.add_argument("--collection", default="", help="Existing collection id/title to write into")
+    exp_serve.add_argument("--kind", choices=sorted(COLLECTION_KINDS), default="", help="Kind for auto-created collections")
+    exp_serve.add_argument("--dry-run", action="store_true")
+
     events = sub.add_parser("events", help="Inspect event log")
     events.add_argument("--tail", type=int, default=20)
 
@@ -197,6 +288,11 @@ def build_parser() -> argparse.ArgumentParser:
     sess_scan.add_argument("--home", help="Home directory containing .codex/.kimi")
     sess_scan.add_argument("--limit", type=int, default=20)
     sess_scan.add_argument("--json", action="store_true", help="Print raw JSON")
+    sess_scan_codex = sess_sub.add_parser("scan-codex-index", help="List sessions visible to codex resume")
+    sess_scan_codex.add_argument("--cwd", help="Only show indexed sessions whose rollout cwd matches this directory")
+    sess_scan_codex.add_argument("--home", help="Home directory containing .codex")
+    sess_scan_codex.add_argument("--limit", type=int, default=20)
+    sess_scan_codex.add_argument("--json", action="store_true", help="Print raw JSON")
     sess_import = sess_sub.add_parser("import", help="Bind an existing provider session to AgentDeck")
     sess_import.add_argument("--provider", required=True, choices=["codex", "kimi"])
     sess_import.add_argument("--provider-session", required=True, help="Codex thread id or Kimi session id")
@@ -209,6 +305,32 @@ def build_parser() -> argparse.ArgumentParser:
     sess_import.add_argument("--title", help="Human-readable title")
     sess_import.add_argument("--session-id", help="Explicit AgentDeck session id")
     sess_import.add_argument("--kind", help="Provider session kind override")
+    sess_import_codex = sess_sub.add_parser("import-codex-index", help="Import a session visible to codex resume")
+    sess_import_codex.add_argument("session", help="Codex session id or exact thread name")
+    sess_import_codex.add_argument("--home", help="Home directory containing .codex")
+    sess_import_codex.add_argument("--project", help="Project id or title")
+    sess_import_codex.add_argument("--task", help="Optional task id or title to attach to the imported session")
+    sess_import_codex.add_argument("--focus", help="Optional focus id or title to attach to the imported session")
+    sess_import_codex.add_argument("--agent", help="Agent id")
+    sess_import_codex.add_argument("--cwd", help="Provider working directory; required if Codex rollout has no cwd")
+    sess_import_codex.add_argument("--title", help="Human-readable title")
+    sess_import_codex.add_argument("--session-id", help="Explicit AgentDeck session id")
+    sess_clone = sess_sub.add_parser("clone", help="Create a clone capsule from one session")
+    sess_clone.add_argument("session")
+    sess_clone.add_argument("--home", help="Home directory containing .codex/.kimi")
+    sess_clone.add_argument("--strategy", default="rules", choices=["rules", "ai"], help="Clone generation strategy")
+    sess_clone.add_argument("--recent-turns", type=int, default=12)
+    sess_clone.add_argument("--max-provider-chars", type=int, default=24000)
+    sess_clone.add_argument("--summarizer-adapter", default="codex-exec", choices=["echo", "codex", "codex-exec", "kimi", "kimi-print"])
+    sess_clone.add_argument("--codex-bin", default="codex")
+    sess_clone.add_argument("--kimi-bin", default="kimi")
+    sess_clone.add_argument("--model")
+    sess_clone.add_argument("--keep-debug", action="store_true", help="Keep ephemeral summarizer temp files for debugging")
+    sess_clone.add_argument("--collection", action="append", default=[], help="Experience collection id/title to include. Repeatable.")
+    sess_clone.add_argument("--json", action="store_true", help="Print raw capsule JSON")
+    sess_delete_provider = sess_sub.add_parser("delete-provider-session", help="Delete the session's native provider session")
+    sess_delete_provider.add_argument("session")
+    _add_provider_delete_args(sess_delete_provider)
 
     workers = sub.add_parser("workers", help="Manage session-agent workers")
     worker_sub = workers.add_subparsers(dest="workers_command", required=True)
@@ -227,6 +349,11 @@ def build_parser() -> argparse.ArgumentParser:
     worker_scan.add_argument("--home", help="Home directory containing .codex/.kimi")
     worker_scan.add_argument("--limit", type=int, default=20)
     worker_scan.add_argument("--json", action="store_true", help="Print raw JSON")
+    worker_scan_codex = worker_sub.add_parser("scan-codex-index", help="List sessions visible to codex resume")
+    worker_scan_codex.add_argument("--cwd", help="Only show indexed sessions whose rollout cwd matches this directory")
+    worker_scan_codex.add_argument("--home", help="Home directory containing .codex")
+    worker_scan_codex.add_argument("--limit", type=int, default=20)
+    worker_scan_codex.add_argument("--json", action="store_true", help="Print raw JSON")
     worker_import = worker_sub.add_parser("import", help="Bind an existing provider session as a worker")
     worker_import.add_argument("--provider", required=True, choices=["codex", "kimi"])
     worker_import.add_argument("--provider-session", required=True, help="Codex thread id or Kimi session id")
@@ -239,6 +366,62 @@ def build_parser() -> argparse.ArgumentParser:
     worker_import.add_argument("--title", help="Human-readable title")
     worker_import.add_argument("--session-id", help="Explicit AgentDeck session-agent id")
     worker_import.add_argument("--kind", help="Provider session kind override")
+    worker_import_codex = worker_sub.add_parser("import-codex-index", help="Import a session visible to codex resume")
+    worker_import_codex.add_argument("session", help="Codex session id or exact thread name")
+    worker_import_codex.add_argument("--home", help="Home directory containing .codex")
+    worker_import_codex.add_argument("--project", help="Project id or title")
+    worker_import_codex.add_argument("--task", help="Optional legacy task id or title to attach to the imported worker")
+    worker_import_codex.add_argument("--focus", help="Optional focus id or title to attach to the imported worker")
+    worker_import_codex.add_argument("--agent", help="Identity id")
+    worker_import_codex.add_argument("--cwd", help="Provider working directory; required if Codex rollout has no cwd")
+    worker_import_codex.add_argument("--title", help="Human-readable title")
+    worker_import_codex.add_argument("--session-id", help="Explicit AgentDeck session-agent id")
+    worker_clone = worker_sub.add_parser("clone", help="Create a clone capsule from one worker")
+    worker_clone.add_argument("session")
+    worker_clone.add_argument("--home", help="Home directory containing .codex/.kimi")
+    worker_clone.add_argument("--strategy", default="rules", choices=["rules", "ai"], help="Clone generation strategy")
+    worker_clone.add_argument("--recent-turns", type=int, default=12)
+    worker_clone.add_argument("--max-provider-chars", type=int, default=24000)
+    worker_clone.add_argument("--summarizer-adapter", default="codex-exec", choices=["echo", "codex", "codex-exec", "kimi", "kimi-print"])
+    worker_clone.add_argument("--codex-bin", default="codex")
+    worker_clone.add_argument("--kimi-bin", default="kimi")
+    worker_clone.add_argument("--model")
+    worker_clone.add_argument("--keep-debug", action="store_true", help="Keep ephemeral summarizer temp files for debugging")
+    worker_clone.add_argument("--collection", action="append", default=[], help="Experience collection id/title to include. Repeatable.")
+    worker_clone.add_argument("--json", action="store_true", help="Print raw capsule JSON")
+    worker_delete_provider = worker_sub.add_parser("delete-provider-session", help="Delete the worker's native provider session")
+    worker_delete_provider.add_argument("session")
+    _add_provider_delete_args(worker_delete_provider)
+
+    clones = sub.add_parser("clones", help="Inspect worker clone capsules")
+    clones_sub = clones.add_subparsers(dest="clones_command", required=True)
+    clones_sub.add_parser("list", help="List clone capsules")
+    clones_show = clones_sub.add_parser("show", help="Show one clone capsule")
+    clones_show.add_argument("clone")
+    clones_show.add_argument("--context", action="store_true", help="Print rendered clone_context.md")
+    clones_spawn = clones_sub.add_parser("spawn", help="Prepare a new worker from one clone capsule")
+    clones_spawn.add_argument("clone")
+    clones_spawn.add_argument("--agent", help="New worker identity id")
+    clones_spawn.add_argument("--session-id", help="Explicit prepared session id")
+    clones_spawn.add_argument("--title", help="Human-readable worker title")
+    clones_spawn.add_argument("--project", help="Project id or title override")
+    clones_spawn.add_argument("--cwd", help="Working directory override")
+    clones_spawn.add_argument("--adapter", choices=["echo", "codex", "codex-exec", "kimi", "kimi-print"])
+    clones_spawn.add_argument("--role", default="developer")
+    clones_spawn.add_argument("--team", default="default")
+    clones_spawn.add_argument("--model")
+    clones_spawn.add_argument("--sandbox")
+    clones_spawn.add_argument("--approval-mode", default="fail", choices=["fail", "record", "bypass"])
+    clones_spawn.add_argument("--replace", action="store_true", help="Replace an existing prepared worker/agent record")
+    clones_spawn.add_argument("--json", action="store_true", help="Print raw JSON")
+    clones_delete_provider = clones_sub.add_parser(
+        "delete-provider-session",
+        help="Delete the source provider session recorded in a clone capsule",
+    )
+    clones_delete_provider.add_argument("clone")
+    _add_provider_delete_args(clones_delete_provider)
+    clones_cleanup = clones_sub.add_parser("cleanup", help="Clean stale clone temporary runs")
+    clones_cleanup.add_argument("--older-than", type=float, default=86400.0, help="Minimum age in seconds")
 
     agents = sub.add_parser("agents", help="Manage project agents")
     agent_sub = agents.add_subparsers(dest="agents_command", required=True)
@@ -506,6 +689,21 @@ def build_parser() -> argparse.ArgumentParser:
     telegram_restart.add_argument("--poll-timeout", type=int, default=30)
     telegram_restart.add_argument("--force", action="store_true", help="Send SIGKILL if SIGTERM does not stop the old bot")
     telegram_restart.add_argument("--force-jobs", action="store_true", help="Restart even when Telegram jobs are queued or running")
+    telegram_restart.add_argument(
+        "--wait-idle",
+        nargs="?",
+        const=300.0,
+        default=0.0,
+        type=float,
+        metavar="SECONDS",
+        help="Wait up to SECONDS for a no-active-job gap before restarting. Defaults to 300 seconds when no value is given.",
+    )
+    telegram_restart.add_argument(
+        "--idle-poll-interval",
+        type=float,
+        default=0.2,
+        help="Polling interval in seconds for --wait-idle.",
+    )
     telegram_sub.add_parser("status", help="Show detached Telegram bot status")
     telegram_bots = telegram_sub.add_parser("bots", help="Manage saved Telegram bot configs")
     telegram_bots_sub = telegram_bots.add_subparsers(dest="telegram_bots_command", required=True)
@@ -527,6 +725,18 @@ def build_parser() -> argparse.ArgumentParser:
     web_serve.add_argument("--port", type=int, default=8765)
 
     return parser
+
+
+def _add_provider_delete_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--force", action="store_true", help="Actually delete the native provider session")
+    parser.add_argument("--home", help="Home directory containing .codex/.kimi")
+    parser.add_argument("--codex-bin", default="codex")
+    parser.add_argument("--kimi-bin", default="kimi")
+    parser.add_argument("--kimi-web-url", default="", help="Existing Kimi web base URL, e.g. http://127.0.0.1:5494")
+    parser.add_argument("--kimi-web-token", default="", help="Bearer token for an existing Kimi web server")
+    parser.add_argument("--kimi-web-port", type=int, default=0, help="Port for a temporary Kimi web server")
+    parser.add_argument("--timeout", type=float, default=20.0)
+    parser.add_argument("--json", action="store_true", help="Print raw JSON result")
 
 
 def resolve_workspace(args: argparse.Namespace, cwd: str | Path | None = None) -> Workspace:
@@ -634,6 +844,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.memory_command == "compact-focus":
             return _compact_focus_memory(workspace, args)
 
+    if args.command == "experience":
+        workspace.ensure()
+        return _handle_experience_command(workspace, args)
+
     if args.command == "events":
         workspace.ensure()
         for event in EventLog(workspace).tail(args.tail):
@@ -690,6 +904,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command in {"sessions", "workers"}:
         return _handle_session_agent_command(workspace, args)
+
+    if args.command == "clones":
+        workspace.ensure()
+        return _handle_clones_command(workspace, args)
 
     if args.command == "agents":
         workspace.ensure()
@@ -1184,14 +1402,20 @@ def _telegram_restart(args: argparse.Namespace, workspace: Workspace) -> int:
     if pid and _pid_alive(pid):
         active_jobs = _active_telegram_jobs(workspace)
         if active_jobs and not bool(getattr(args, "force_jobs", False)):
-            print("telegram restart blocked: active Telegram jobs exist", file=sys.stderr)
-            for job in active_jobs[:5]:
-                task = f" task={job.task_id}" if job.task_id else ""
-                print(f"- {job.job_id} status={job.status}{task}", file=sys.stderr)
-            if len(active_jobs) > 5:
-                print(f"- ... {len(active_jobs) - 5} more", file=sys.stderr)
-            print("wait for them to finish, cancel them, or rerun with: agentdeck telegram restart --force-jobs", file=sys.stderr)
-            return 2
+            wait_idle = max(0.0, float(getattr(args, "wait_idle", 0.0) or 0.0))
+            if wait_idle > 0.0 and _wait_for_telegram_idle(
+                workspace,
+                timeout=wait_idle,
+                poll_interval=float(getattr(args, "idle_poll_interval", 0.2) or 0.2),
+            ):
+                active_jobs = []
+            elif wait_idle > 0.0:
+                active_jobs = _active_telegram_jobs(workspace)
+            if not active_jobs:
+                print("telegram restart: idle gap found")
+            else:
+                _print_telegram_restart_blocked(active_jobs)
+                return 2
         stop_code = _telegram_stop(argparse.Namespace(force=bool(getattr(args, "force", False))), workspace)
         if stop_code != 0:
             return stop_code
@@ -1201,6 +1425,42 @@ def _telegram_restart(args: argparse.Namespace, workspace: Workspace) -> int:
     else:
         print("telegram service is not running; starting it")
     return _telegram_start(args, workspace)
+
+
+def _print_telegram_restart_blocked(active_jobs: list[JobRecord]) -> None:
+    print("telegram restart blocked: active Telegram jobs exist", file=sys.stderr)
+    for job in active_jobs[:5]:
+        task = f" task={job.task_id}" if job.task_id else ""
+        print(f"- {job.job_id} status={job.status}{task}", file=sys.stderr)
+    if len(active_jobs) > 5:
+        print(f"- ... {len(active_jobs) - 5} more", file=sys.stderr)
+    print(
+        "wait for them to finish, cancel them, rerun with --wait-idle, or rerun with: agentdeck telegram restart --force-jobs",
+        file=sys.stderr,
+    )
+
+
+def _wait_for_telegram_idle(workspace: Workspace, *, timeout: float, poll_interval: float = 0.2) -> bool:
+    deadline = time.time() + max(0.0, timeout)
+    interval = max(0.05, poll_interval)
+    last_report = 0.0
+    while True:
+        active_jobs = _active_telegram_jobs(workspace)
+        if not active_jobs:
+            return True
+        now = time.time()
+        if now >= deadline:
+            return False
+        if now - last_report >= 10.0:
+            print("telegram restart blocked: active Telegram jobs exist", file=sys.stderr)
+            for job in active_jobs[:5]:
+                task = f" task={job.task_id}" if job.task_id else ""
+                print(f"- waiting: {job.job_id} status={job.status}{task}", file=sys.stderr)
+            if len(active_jobs) > 5:
+                print(f"- ... {len(active_jobs) - 5} more", file=sys.stderr)
+            print(f"waiting up to {max(0.0, deadline - now):.1f}s for an idle gap...", file=sys.stderr)
+            last_report = now
+        time.sleep(min(interval, max(0.0, deadline - now)))
 
 
 def _active_telegram_jobs(workspace: Workspace) -> list[JobRecord]:
@@ -1448,6 +1708,15 @@ def _handle_session_agent_command(workspace: Workspace, args: argparse.Namespace
         else:
             _print_provider_sessions(candidates)
         return 0
+    if command == "scan-codex-index":
+        candidates = scan_codex_index_sessions(project_dir=args.cwd, home=args.home)
+        if args.limit and args.limit > 0:
+            candidates = candidates[: args.limit]
+        if args.json:
+            print(json.dumps([item.to_dict() for item in candidates], ensure_ascii=False, indent=2, sort_keys=True))
+        else:
+            _print_provider_sessions(candidates)
+        return 0
     if command == "import":
         project = ProjectRegistry(workspace).resolve(args.project) if args.project else None
         if args.project and project is None:
@@ -1485,7 +1754,426 @@ def _handle_session_agent_command(workspace: Workspace, args: argparse.Namespace
         print(f"{'worker' if args.command == 'workers' else 'imported'}: {record.title} ({record.session_id})")
         print(f"provider_session_id: {record.provider_session_id}")
         return 0
+    if command == "import-codex-index":
+        candidates = scan_codex_index_sessions(home=args.home)
+        matches = [
+            candidate
+            for candidate in candidates
+            if candidate.provider_session_id == args.session or candidate.title == args.session
+        ]
+        if not matches:
+            print(f"codex indexed session not found: {args.session}", file=sys.stderr)
+            return 2
+        candidate = matches[0]
+        project = ProjectRegistry(workspace).resolve(args.project) if args.project else None
+        if args.project and project is None:
+            print(f"project not found: {args.project}", file=sys.stderr)
+            return 2
+        project_dir = args.cwd or candidate.project_dir or (project.project_dir if project is not None else "")
+        if not project_dir:
+            print(
+                "cwd required: Codex index has no working directory for this session; pass --cwd /path/to/project",
+                file=sys.stderr,
+            )
+            return 2
+        agent_id = args.agent or (project.default_agent_id if project is not None else "default")
+        metadata = dict(candidate.metadata)
+        metadata.update(
+            {
+                "provider": "codex",
+                "imported_by": "cli",
+                "entity": entity_label,
+                "import_source": "codex_session_index",
+                "codex_interactive_resume": f"codex resume {candidate.provider_session_id} -C {project_dir}",
+                "codex_background_resume": f"codex exec resume {candidate.provider_session_id} -C {project_dir} <prompt>",
+            }
+        )
+        try:
+            record = registry.import_provider_session(
+                provider_session_id=candidate.provider_session_id,
+                provider_session_kind="codex_thread",
+                agent_id=agent_id,
+                adapter="codex",
+                project_dir=project_dir,
+                title=args.title or candidate.title,
+                session_id=args.session_id,
+                project_id=project.project_id if project is not None else "",
+                metadata=metadata,
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if args.task:
+            task = TaskBoard(workspace).attach_session(args.task, record.session_id)
+            if task is None:
+                print(f"task not found: {args.task}", file=sys.stderr)
+                return 2
+        if args.focus:
+            focus = FocusRegistry(workspace).attach_session(args.focus, record.session_id)
+            if focus is None:
+                print(f"focus not found: {args.focus}", file=sys.stderr)
+                return 2
+        print(f"{'worker' if args.command == 'workers' else 'imported'}: {record.title} ({record.session_id})")
+        print(f"provider_session_id: {record.provider_session_id}")
+        print(f"interactive_resume: codex resume {record.provider_session_id} -C {record.project_dir}")
+        print(f"background_resume: codex exec resume {record.provider_session_id} -C {record.project_dir} <prompt>")
+        return 0
+    if command == "clone":
+        try:
+            if args.strategy == "ai":
+                capsule = create_ai_clone_capsule(
+                    workspace,
+                    args.session,
+                    home=args.home,
+                    recent_turns=args.recent_turns,
+                    max_provider_chars=args.max_provider_chars,
+                    summarizer_adapter=args.summarizer_adapter,
+                    codex_bin=args.codex_bin,
+                    kimi_bin=args.kimi_bin,
+                    model=args.model,
+                    keep_debug=args.keep_debug,
+                    collections=args.collection,
+                )
+            else:
+                capsule = create_rules_clone_capsule(
+                    workspace,
+                    args.session,
+                    home=args.home,
+                    recent_turns=args.recent_turns,
+                    max_provider_chars=args.max_provider_chars,
+                    collections=args.collection,
+                )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(capsule.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+        else:
+            print(f"clone: {capsule.clone_id}")
+            print(f"source_session_id: {capsule.source_session_id}")
+            print(f"provider_session_id: {capsule.provider_session_id}")
+            print(f"context: {CloneStore(workspace).context_path(capsule.clone_id)}")
+            print(f"validation_ok: {str(bool(capsule.validation.get('ok'))).lower()}")
+        return 0
+    if command == "delete-provider-session":
+        record = registry.resolve(args.session)
+        if record is None:
+            print(f"{entity_label} not found: {args.session}", file=sys.stderr)
+            return 2
+        if not record.provider_session_id:
+            print(f"{entity_label} has no provider session id: {record.session_id}", file=sys.stderr)
+            return 2
+        result = _delete_native_provider_session(
+            provider=_provider_for_session_record(record),
+            provider_session_id=record.provider_session_id,
+            args=args,
+        )
+        _print_provider_delete_result(result, json_output=args.json)
+        return 0 if result.ok else 2
     return 0
+
+
+def _handle_clones_command(workspace: Workspace, args: argparse.Namespace) -> int:
+    store = CloneStore(workspace)
+    if args.clones_command == "list":
+        _print_clones(store.list())
+        return 0
+    if args.clones_command == "show":
+        capsule = store.get(args.clone)
+        if capsule is None:
+            print(f"clone not found: {args.clone}", file=sys.stderr)
+            return 2
+        if args.context:
+            path = store.context_path(capsule.clone_id)
+            try:
+                print(path.read_text(encoding="utf-8"), end="")
+            except OSError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+        else:
+            print(json.dumps(capsule.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.clones_command == "spawn":
+        capsule = store.get(args.clone)
+        if capsule is None:
+            print(f"clone not found: {args.clone}", file=sys.stderr)
+            return 2
+        try:
+            result = _spawn_worker_from_clone(workspace, capsule, args)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        else:
+            print(f"worker: {result['agent_id']}")
+            print(f"session: {result['session_id']}")
+            print(f"clone: {result['clone_id']}")
+            print(f"context: {result['clone_context_path']}")
+            print(f"first_run: {result['first_run']}")
+        return 0
+    if args.clones_command == "delete-provider-session":
+        capsule = store.get(args.clone)
+        if capsule is None:
+            print(f"clone not found: {args.clone}", file=sys.stderr)
+            return 2
+        if not capsule.provider_session_id:
+            print(f"clone has no provider session id: {capsule.clone_id}", file=sys.stderr)
+            return 2
+        result = _delete_native_provider_session(
+            provider=capsule.provider,
+            provider_session_id=capsule.provider_session_id,
+            args=args,
+        )
+        _print_provider_delete_result(result, json_output=args.json)
+        return 0 if result.ok else 2
+    if args.clones_command == "cleanup":
+        removed = store.cleanup_tmp(older_than_seconds=args.older_than)
+        print(f"removed: {removed}")
+        return 0
+    return 0
+
+
+def _spawn_worker_from_clone(workspace: Workspace, capsule: CloneCapsule, args: argparse.Namespace) -> dict[str, str]:
+    return spawn_worker_from_clone(
+        workspace,
+        capsule,
+        agent_id=args.agent or "",
+        session_id=args.session_id or "",
+        title=args.title or "",
+        project=args.project or "",
+        project_dir=args.cwd or "",
+        adapter=args.adapter or "",
+        role=args.role,
+        team_id=args.team,
+        model=args.model or "",
+        sandbox=args.sandbox or "",
+        approval_mode=args.approval_mode,
+        replace=args.replace,
+    )
+
+
+def _handle_experience_command(workspace: Workspace, args: argparse.Namespace) -> int:
+    store = ExperienceStore(workspace)
+    if args.experience_command == "collections":
+        _print_experience_collections(
+            store.list_collections(
+                project_id=args.project or "",
+                worker_id=args.worker or "",
+                agent_id=args.agent or "",
+                focus_id=args.focus or "",
+                kind=args.kind or "",
+                status=args.status or "",
+            )
+        )
+        return 0
+    if args.experience_command == "create-collection":
+        try:
+            record = store.create_collection(
+                args.title,
+                kind=args.kind,
+                purpose=args.purpose,
+                project_id=args.project or "",
+                directory_id=args.directory_id or "",
+                worker_id=args.worker or "",
+                agent_id=args.agent or "",
+                focus_id=args.focus or "",
+                status=args.status,
+                metadata={"source": "cli"},
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(f"collection: {record.title} ({record.collection_id})")
+        print(f"kind: {record.kind}")
+        if record.purpose:
+            print(f"purpose: {record.purpose}")
+        return 0
+    if args.experience_command == "show-collection":
+        record = store.resolve_collection(args.collection)
+        if record is None:
+            print(f"experience collection not found: {args.collection}", file=sys.stderr)
+            return 2
+        summary = store.collection_summary(record.collection_id, event_limit=20) or record.to_dict()
+        print(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.experience_command == "record":
+        try:
+            event = store.record_event(
+                args.collection,
+                purpose=args.purpose,
+                context=args.context,
+                actions=args.action,
+                result=args.result,
+                analysis=args.analysis,
+                decisions=args.decision,
+                artifacts=_parse_experience_artifacts(args.artifact),
+                tags=args.tag,
+                parent_event_id=args.parent or "",
+                sequence_index=args.sequence,
+                level=args.level,
+                kind=args.kind,
+                status=args.status,
+                focus_id=args.focus or "",
+                confidence=args.confidence,
+                metadata={"source": "cli"},
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(f"event: {event.event_id}")
+        print(f"collection: {event.collection_id}")
+        print(f"purpose: {event.purpose}")
+        if event.result:
+            print(f"result: {event.result}")
+        return 0
+    if args.experience_command == "events":
+        _print_experience_events(
+            store.list_events(
+                collection=args.collection or "",
+                project_id=args.project or "",
+                worker_id=args.worker or "",
+                agent_id=args.agent or "",
+                focus_id=args.focus or "",
+                kind=args.kind or "",
+                query=args.query or "",
+                limit=args.limit,
+            )
+        )
+        return 0
+    if args.experience_command == "show":
+        event = store.resolve_event(args.event)
+        if event is None:
+            print(f"experience event not found: {args.event}", file=sys.stderr)
+            return 2
+        payload = event.to_dict()
+        payload["edges"] = [edge.to_dict() for edge in store.list_edges(event_id=event.event_id)]
+        print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.experience_command == "link":
+        try:
+            edge = store.link_events(
+                args.from_event,
+                args.to_event,
+                relation=args.relation,
+                reason=args.reason,
+                metadata={"source": "cli"},
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(f"edge: {edge.edge_id}")
+        print(f"{edge.from_event_id} --{edge.relation}--> {edge.to_event_id}")
+        if edge.reason:
+            print(f"reason: {edge.reason}")
+        return 0
+    if args.experience_command == "edges":
+        _print_experience_edges(store.list_edges(event_id=args.event or "", relation=args.relation or ""))
+        return 0
+    if args.experience_command == "organize":
+        try:
+            result = ExperienceOrganizer(workspace).process_once(
+                limit=args.limit,
+                collection=args.collection or "",
+                kind=args.kind or "",
+                dry_run=bool(args.dry_run),
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        _print_experience_organizer_result(result, dry_run=bool(args.dry_run))
+        return 0
+    if args.experience_command == "serve":
+        try:
+            if args.once:
+                result = ExperienceOrganizer(workspace).process_once(
+                    limit=args.limit,
+                    collection=args.collection or "",
+                    kind=args.kind or "",
+                    dry_run=bool(args.dry_run),
+                )
+                _print_experience_organizer_result(result, dry_run=bool(args.dry_run))
+            else:
+                ExperienceOrganizer(workspace).serve_forever(
+                    once=False,
+                    poll_interval=args.poll_interval,
+                    limit=args.limit,
+                    collection=args.collection or "",
+                    kind=args.kind or "",
+                    dry_run=bool(args.dry_run),
+                )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        return 0
+    return 2
+
+
+def _parse_experience_artifacts(values: list[str]) -> list[dict[str, str]]:
+    artifacts: list[dict[str, str]] = []
+    for value in values or []:
+        text = str(value).strip()
+        if not text:
+            continue
+        kind = "file"
+        path = text
+        if ":" in text and not re.match(r"^[a-zA-Z]:[\\/]", text):
+            maybe_kind, maybe_path = text.split(":", 1)
+            if maybe_kind.strip() and maybe_path.strip():
+                kind = maybe_kind.strip()
+                path = maybe_path.strip()
+        artifacts.append({"kind": kind, "path": path})
+    return artifacts
+
+
+def _delete_native_provider_session(
+    *,
+    provider: str,
+    provider_session_id: str,
+    args: argparse.Namespace,
+) -> ProviderDeleteResult:
+    return delete_provider_session(
+        provider=provider,
+        provider_session_id=provider_session_id,
+        force=bool(getattr(args, "force", False)),
+        home=getattr(args, "home", None),
+        codex_bin=getattr(args, "codex_bin", "codex"),
+        kimi_bin=getattr(args, "kimi_bin", "kimi"),
+        kimi_web_url=getattr(args, "kimi_web_url", ""),
+        kimi_web_token=getattr(args, "kimi_web_token", ""),
+        kimi_web_port=int(getattr(args, "kimi_web_port", 0) or 0),
+        timeout=float(getattr(args, "timeout", 20.0) or 20.0),
+    )
+
+
+def _provider_for_session_record(record: SessionRecord) -> str:
+    provider = str(record.metadata.get("provider") or "").strip().lower()
+    if provider:
+        return provider
+    if record.adapter.startswith("codex") or record.provider_session_kind.startswith("codex"):
+        return "codex"
+    if record.adapter.startswith("kimi") or record.provider_session_kind.startswith("kimi"):
+        return "kimi"
+    return record.adapter
+
+
+def _print_provider_delete_result(result: ProviderDeleteResult, *, json_output: bool = False) -> None:
+    if json_output:
+        print(json.dumps(result.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    status = "deleted" if result.ok and result.executed else ("planned" if result.ok else "failed")
+    print(f"provider_delete: {status}")
+    print(f"provider: {result.provider}")
+    print(f"provider_session_id: {result.provider_session_id}")
+    print(f"action: {result.action}")
+    if result.command:
+        print(f"command: {' '.join(result.command)}")
+    if result.message:
+        print(f"message: {result.message}")
+    if result.error:
+        print(f"error: {result.error}")
+    if not result.executed:
+        print("rerun with --force to execute")
 
 
 def _print_sessions(records: list[SessionRecord]) -> None:
@@ -1527,6 +2215,100 @@ def _print_provider_sessions(records: list[ProviderSessionCandidate]) -> None:
                 ]
             )
         )
+
+
+def _print_clones(records: list[CloneCapsule]) -> None:
+    if not records:
+        print("no clones")
+        return
+    print("clone_id\ttitle\tsource_session_id\tprovider\tcreated_at\tvalidation")
+    for record in records:
+        print(
+            "\t".join(
+                [
+                    record.clone_id,
+                    record.title,
+                    record.source_session_id,
+                    record.provider,
+                    _format_timestamp(record.created_at),
+                    "ok" if bool(record.validation.get("ok")) else "needs-review",
+                ]
+            )
+        )
+
+
+def _print_experience_collections(records: list[ExperienceCollection]) -> None:
+    if not records:
+        print("no experience collections")
+        return
+    print("title\tcollection_id\tkind\tstatus\tproject\tworker\tfocus\tpurpose")
+    for record in records:
+        print(
+            "\t".join(
+                [
+                    record.title,
+                    record.collection_id,
+                    record.kind,
+                    record.status,
+                    record.project_id or "-",
+                    record.worker_id or record.agent_id or "-",
+                    record.focus_id or "-",
+                    record.purpose.replace("\n", " ") or "-",
+                ]
+            )
+        )
+
+
+def _print_experience_events(records: list[ExperienceEvent]) -> None:
+    if not records:
+        print("no experience events")
+        return
+    print("event_id\tlevel\tkind\tstatus\tcollection\tfocus\tpurpose\tresult")
+    for record in records:
+        print(
+            "\t".join(
+                [
+                    record.event_id,
+                    record.level,
+                    record.kind,
+                    record.status,
+                    record.collection_id,
+                    record.focus_id or "-",
+                    record.purpose.replace("\n", " "),
+                    record.result.replace("\n", " ") or "-",
+                ]
+            )
+        )
+
+
+def _print_experience_edges(records: list[ExperienceEdge]) -> None:
+    if not records:
+        print("no experience edges")
+        return
+    print("edge_id\tfrom\trelation\tto\treason")
+    for record in records:
+        print(
+            "\t".join(
+                [
+                    record.edge_id,
+                    record.from_event_id,
+                    record.relation,
+                    record.to_event_id,
+                    record.reason.replace("\n", " ") or "-",
+                ]
+            )
+        )
+
+
+def _print_experience_organizer_result(result: ExperienceOrganizerResult, *, dry_run: bool = False) -> None:
+    prefix = "dry-run " if dry_run else ""
+    print(
+        f"{prefix}experience organizer: "
+        f"collections_created={result.collections_created} "
+        f"events_created={result.events_created} "
+        f"edges_created={result.edges_created} "
+        f"skipped={result.skipped}"
+    )
 
 
 def _print_approvals(records: list[ApprovalRecord]) -> None:
