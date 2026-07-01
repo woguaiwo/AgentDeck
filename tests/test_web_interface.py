@@ -9,7 +9,9 @@ from agentdeck.core.events import AgentEvent, EventKind
 from agentdeck.interfaces.web import build_dashboard_snapshot, build_web_response, handle_web_action, render_dashboard_html
 from agentdeck.storage.agents import AgentRegistry
 from agentdeck.storage.approvals import ApprovalRegistry
+from agentdeck.storage.clones import CloneCapsule, CloneStore
 from agentdeck.storage.directories import DirectoryRegistry
+from agentdeck.storage.experience import ExperienceStore
 from agentdeck.storage.focus import FocusRegistry
 from agentdeck.storage.jobs import JobRegistry
 from agentdeck.storage.projects import ProjectRegistry
@@ -31,11 +33,18 @@ class WebInterfaceTests(unittest.TestCase):
             self.assertEqual(snapshot["counts"]["workers"], 1)
             self.assertEqual(snapshot["counts"]["active_tasks"], 1)
             self.assertEqual(snapshot["counts"]["pending_approvals"], 1)
+            self.assertEqual(snapshot["counts"]["experience_collections"], 1)
+            self.assertEqual(snapshot["counts"]["experience_events"], 1)
+            self.assertEqual(snapshot["counts"]["clones"], 1)
             self.assertEqual(snapshot["workers"][0]["identity"], "owner")
             self.assertEqual(snapshot["workers"][0]["focus_title"], "Web focus")
+            self.assertEqual(snapshot["experience_collections"][0]["event_count"], 1)
+            self.assertEqual(snapshot["clones"][0]["clone_id"], "clone-web")
             self.assertIn("Project One", html)
             self.assertIn("Web focus", html)
             self.assertIn("Workers", html)
+            self.assertIn("Experience Collections", html)
+            self.assertIn("Clone Capsules", html)
             self.assertIn("Directories", html)
             self.assertIn("Web task", html)
             self.assertIn("Run shell command?", html)
@@ -65,8 +74,11 @@ class WebInterfaceTests(unittest.TestCase):
             self.assertEqual(overview["counts"]["projects"], 1)
             self.assertEqual(overview["counts"]["directories"], 2)
             self.assertEqual(overview["counts"]["workers"], 1)
+            self.assertEqual(overview["counts"]["experience_collections"], 1)
+            self.assertEqual(overview["counts"]["clones"], 1)
             self.assertEqual(overview["focus"][0]["title"], "Web focus")
             self.assertEqual(overview["workers"][0]["session_agent_id"], "session-web")
+            self.assertEqual(overview["experience_events"][0]["purpose"], "Capture web memory overview")
             self.assertIn("AgentDeck", html)
             self.assertIn("Project One", html)
             self.assertIn("Web focus", html)
@@ -166,6 +178,35 @@ def _sample_workspace(root: Path) -> Workspace:
         prompt="hello",
     )
     TaskBoard(workspace).attach_session(task.task_id, "session-web")
+    experience = ExperienceStore(workspace)
+    collection = experience.create_collection(
+        "Web memory experience",
+        kind="engineering_change",
+        purpose="Show memory assets in the web overview.",
+        project_id=project.project_id,
+        worker_id="session-web",
+        agent_id="owner",
+    )
+    experience.record_event(
+        collection.collection_id,
+        purpose="Capture web memory overview",
+        result="Experience collections and clone capsules appear in the dashboard.",
+        decisions=["Expose memory assets as read-only Web cards"],
+    )
+    CloneStore(workspace).write(
+        CloneCapsule(
+            clone_id="clone-web",
+            source_session_id="session-web",
+            source_worker_id="session-web",
+            provider="codex",
+            provider_session_id="provider-web",
+            provider_session_kind="codex",
+            project_dir=str(project_dir),
+            title="Web clone capsule",
+            experience_collections=[{"collection_id": collection.collection_id, "title": collection.title}],
+            validation={"ok": True},
+        )
+    )
     JobRegistry(workspace).create(
         interface="telegram",
         chat_id=42,

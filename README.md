@@ -234,11 +234,12 @@ http://127.0.0.1:8765
 ```
 
 The Web console shows projects, directories, focus records, session-agent
-workers, legacy tasks, recent jobs, and pending approvals, plus JSON endpoints
-for future frontends. Its run and auto actions still keep legacy task
-compatibility, while read-only navigation now exposes the
-directory + session-agent + focus model. `/api/overview` keeps legacy `agents`
-and `sessions` fields while adding a `workers` view for the current model.
+workers, Experience Collections, clone capsules, legacy tasks, recent jobs, and
+pending approvals, plus JSON endpoints for future frontends. Its run and auto
+actions still keep legacy task compatibility, while read-only navigation now
+exposes the directory + session-agent + focus model. `/api/overview` keeps
+legacy `agents` and `sessions` fields while adding `workers`, `experience`, and
+`clones` views for the current model.
 
 ```text
 /

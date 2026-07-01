@@ -28,7 +28,9 @@ from agentdeck.interfaces.telegram import AUTO_TASK_DONE_MARKER
 from agentdeck.storage.admin import AdminMutationError, delete_project, rename_global_id, restore_project
 from agentdeck.storage.agents import ASSISTANT_AGENT_ID, AgentRegistry
 from agentdeck.storage.approvals import ApprovalRegistry
+from agentdeck.storage.clones import CloneStore
 from agentdeck.storage.directories import DirectoryRegistry
+from agentdeck.storage.experience import ExperienceStore
 from agentdeck.storage.focus import FocusRegistry
 from agentdeck.storage.jobs import JobRegistry
 from agentdeck.storage.projects import ProjectRegistry
@@ -57,6 +59,9 @@ class DashboardLimits:
     sessions: int = 12
     jobs: int = 12
     approvals: int = 12
+    experience_collections: int = 12
+    experience_events: int = 12
+    clones: int = 12
 
 
 @dataclass(frozen=True)
@@ -239,6 +244,10 @@ def build_dashboard_snapshot(workspace: Workspace, *, limits: DashboardLimits | 
     sessions = SessionRegistry(workspace).list()
     jobs = JobRegistry(workspace).list(limit=max(limits.jobs, 1))
     approvals = ApprovalRegistry(workspace).list()
+    experience_store = ExperienceStore(workspace)
+    experience_collections = experience_store.list_collections()
+    experience_events = experience_store.list_events(limit=max(limits.experience_events, 1))
+    clones = CloneStore(workspace).list()
 
     task_counts = {status: 0 for status in sorted(TASK_STATUSES)}
     for task in tasks:
@@ -273,6 +282,9 @@ def build_dashboard_snapshot(workspace: Workspace, *, limits: DashboardLimits | 
             "jobs": len(jobs),
             "active_jobs": len(active_jobs),
             "pending_approvals": len(pending_approvals),
+            "experience_collections": len(experience_collections),
+            "experience_events": len(experience_events),
+            "clones": len(clones),
         },
         "task_counts": task_counts,
         "job_counts": job_counts,
@@ -285,6 +297,12 @@ def build_dashboard_snapshot(workspace: Workspace, *, limits: DashboardLimits | 
         "sessions": [_session_summary(session) for session in sessions[: limits.sessions]],
         "jobs": [_job_summary(job) for job in jobs[: limits.jobs]],
         "approvals": [_approval_summary(approval) for approval in approvals[: limits.approvals]],
+        "experience_collections": [
+            _experience_collection_summary(collection, experience_store)
+            for collection in experience_collections[: limits.experience_collections]
+        ],
+        "experience_events": [_experience_event_summary(event) for event in experience_events[: limits.experience_events]],
+        "clones": [_clone_summary(clone) for clone in clones[: limits.clones]],
     }
 
 
@@ -482,6 +500,7 @@ def render_dashboard_html(snapshot: dict[str, Any], *, notice: str = "", error: 
             '<section class="metrics" aria-label="Workspace summary">',
             _metric("Projects", counts.get("projects", 0), f"{counts.get('active_projects', 0)} active"),
             _metric("Focus", counts.get("active_focus", 0), f"{counts.get('focus', 0)} total"),
+            _metric("Experience", counts.get("experience_collections", 0), f"{counts.get('experience_events', 0)} events"),
             _metric("Jobs", counts.get("active_jobs", 0), f"{counts.get('jobs', 0)} recent"),
             _metric("Approvals", counts.get("pending_approvals", 0), "pending"),
             "</section>",
@@ -498,6 +517,9 @@ def render_dashboard_html(snapshot: dict[str, Any], *, notice: str = "", error: 
             _panel("Tasks", _task_cards(snapshot.get("tasks", []))),
             _panel("Agents", _agent_cards(snapshot.get("agents", []))),
             _panel("Workers", _worker_cards(snapshot.get("workers", []))),
+            _panel("Experience Collections", _experience_collection_cards(snapshot.get("experience_collections", []))),
+            _panel("Recent Experience", _experience_event_cards(snapshot.get("experience_events", []))),
+            _panel("Clone Capsules", _clone_cards(snapshot.get("clones", []))),
             _panel("Jobs", _job_cards(snapshot.get("jobs", []))),
             _panel("Approvals", _approval_cards(snapshot.get("approvals", []))),
             "</section>",
@@ -685,6 +707,47 @@ def _approval_summary(approval: Any) -> dict[str, Any]:
         **approval.to_dict(),
         "updated_at_text": _format_timestamp(approval.updated_at),
         "request_text": _preview(approval.request_text, 220),
+    }
+
+
+def _experience_collection_summary(collection: Any, store: ExperienceStore) -> dict[str, Any]:
+    return {
+        **collection.to_dict(),
+        "updated_at_text": _format_timestamp(collection.updated_at),
+        "purpose": _preview(collection.purpose, 220),
+        "event_count": len(store.list_events(collection=collection.collection_id, limit=0)),
+    }
+
+
+def _experience_event_summary(event: Any) -> dict[str, Any]:
+    return {
+        **event.to_dict(),
+        "updated_at_text": _format_timestamp(event.updated_at),
+        "purpose": _preview(event.purpose, 220),
+        "result": _preview(event.result, 220),
+        "analysis": _preview(event.analysis, 220),
+        "decision": _preview(event.decisions[0], 220) if event.decisions else "",
+    }
+
+
+def _clone_summary(clone: Any) -> dict[str, Any]:
+    validation = dict(clone.validation or {})
+    return {
+        "clone_id": clone.clone_id,
+        "title": clone.title,
+        "strategy": clone.strategy,
+        "source_session_id": clone.source_session_id,
+        "source_worker_id": clone.source_worker_id,
+        "provider": clone.provider,
+        "provider_session_kind": clone.provider_session_kind,
+        "project_dir": clone.project_dir,
+        "created_at": clone.created_at,
+        "created_at_text": _format_timestamp(clone.created_at),
+        "experience_collection_count": len(clone.experience_collections or []),
+        "decision_count": len(clone.decisions or []),
+        "progress_count": len(clone.progress or []),
+        "validation_ok": bool(validation.get("ok")),
+        "validation_findings": len(validation.get("findings") or []),
     }
 
 
@@ -1013,6 +1076,76 @@ def _approval_cards(records: list[dict[str, Any]]) -> str:
                 ("request", record.get("request_text", "")),
             ],
             actions=_approval_actions(record),
+        )
+        for record in records
+    )
+
+
+def _experience_collection_cards(records: list[dict[str, Any]]) -> str:
+    if not records:
+        return _empty("No experience collections")
+    return "".join(
+        _card(
+            title=str(record.get("title") or record.get("collection_id") or ""),
+            meta=[
+                _badge(str(record.get("kind") or "")),
+                f"id {record.get('collection_id') or ''}",
+                f"events {record.get('event_count') or 0}",
+            ],
+            rows=[
+                ("status", record.get("status", "")),
+                ("project", record.get("project_id", "")),
+                ("worker", record.get("worker_id", "")),
+                ("focus", record.get("focus_id", "")),
+                ("purpose", record.get("purpose", "")),
+            ],
+        )
+        for record in records
+    )
+
+
+def _experience_event_cards(records: list[dict[str, Any]]) -> str:
+    if not records:
+        return _empty("No experience events")
+    return "".join(
+        _card(
+            title=str(record.get("purpose") or record.get("event_id") or ""),
+            meta=[
+                _badge(str(record.get("status") or "")),
+                f"{record.get('level') or ''}",
+                f"id {record.get('event_id') or ''}",
+            ],
+            rows=[
+                ("collection", record.get("collection_id", "")),
+                ("kind", record.get("kind", "")),
+                ("result", record.get("result", "")),
+                ("decision", record.get("decision", "")),
+                ("updated", record.get("updated_at_text", "")),
+            ],
+        )
+        for record in records
+    )
+
+
+def _clone_cards(records: list[dict[str, Any]]) -> str:
+    if not records:
+        return _empty("No clone capsules")
+    return "".join(
+        _card(
+            title=str(record.get("title") or record.get("clone_id") or ""),
+            meta=[
+                _badge(str(record.get("strategy") or "")),
+                f"id {record.get('clone_id') or ''}",
+                f"{record.get('provider') or ''}",
+            ],
+            rows=[
+                ("source worker", record.get("source_worker_id", "")),
+                ("source session", record.get("source_session_id", "")),
+                ("provider kind", record.get("provider_session_kind", "")),
+                ("experience", record.get("experience_collection_count", 0)),
+                ("validation", "ok" if record.get("validation_ok") else f"{record.get('validation_findings') or 0} findings"),
+                ("created", record.get("created_at_text", "")),
+            ],
         )
         for record in records
     )
