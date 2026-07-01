@@ -358,7 +358,7 @@ Supported commands:
 /clones [query]
 /clone show <clone # or id>
 /clone spawn <clone # or id> [agent <id>] [title <name>]
-/clone current [agent <id>] [title <name>]
+/clone current [strategy rules|ai] [agent <id>] [title <name>]
 /compact [--pin] [title]
 /handoffs [focus or legacy task]
 /review <manager review summary>
@@ -495,12 +495,14 @@ Phone users can clone the selected worker without leaving Telegram. Use
 `/clone current` after selecting a session or focus-backed worker; AgentDeck
 creates a deterministic clone capsule from the current provider session, spawns
 a fresh prepared worker, and selects it for the chat. The next plain text
-message starts a new native Codex/Kimi provider session from the clone context:
+message starts a new native Codex/Kimi provider session from the clone context.
+Use `strategy ai` only when you explicitly want the isolated summarizer path:
 
 ```text
 /workers
 /use session 1
 /clone current agent research-fork title Research Fork
+/clone current strategy ai agent research-fork-ai title Research Fork AI
 continue from the cloned context
 ```
 
@@ -728,8 +730,8 @@ agentdeck run --agent <new_worker_id> "Continue from the cloned context"
 ```
 
 `--strategy ai` runs an isolated temporary summarizer behind the same capsule
-schema. The deterministic rules strategy remains the default and is the one used
-by Telegram's one-command phone flow.
+schema. The deterministic rules strategy remains the default; Telegram can use
+the same opt-in path with `strategy ai`.
 
 From Telegram, after selecting the worker to clone:
 

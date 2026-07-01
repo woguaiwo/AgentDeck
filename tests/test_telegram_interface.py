@@ -402,9 +402,11 @@ class TelegramInterfaceTests(unittest.TestCase):
             self.assertIn("Current worker cloned and spawned:", reply)
             self.assertIn("worker: forked-dev", reply)
             self.assertIn("source: Current clone source", reply)
+            self.assertIn("strategy: rules", reply)
             clones = CloneStore(workspace).list()
             self.assertEqual(len(clones), 1)
             self.assertEqual(clones[0].source_session_id, "source-session")
+            self.assertEqual(clones[0].strategy, "rules")
             session = SessionRegistry(workspace).resolve("forked-dev-session")
             self.assertIsNotNone(session)
             assert session is not None
@@ -415,6 +417,92 @@ class TelegramInterfaceTests(unittest.TestCase):
             assert state is not None
             self.assertEqual(state.objective, "Clone current worker")
             self.assertIn("one-command phone clone flow", " ".join(state.decisions))
+
+    def test_clone_current_can_use_ai_strategy_when_explicitly_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            workspace.ensure()
+            project = tmp / "project"
+            home = tmp / "home"
+            project.mkdir()
+            codex_home = home / ".codex"
+            rollout = codex_home / "sessions" / "2026" / "07" / "01" / "rollout.jsonl"
+            rollout.parent.mkdir(parents=True)
+            (codex_home / "session_index.jsonl").write_text(
+                json.dumps(
+                    {
+                        "id": "codex-thread-ai",
+                        "thread_name": "AI clone source",
+                        "updated_at": "2026-07-01T00:00:00Z",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            rollout.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "timestamp": "2026-07-01T00:00:00Z",
+                                "type": "session_meta",
+                                "payload": {"id": "codex-thread-ai", "cwd": str(project)},
+                            }
+                        ),
+                        json.dumps({"type": "event_msg", "payload": {"role": "user", "text": "summarize clone"}}),
+                        json.dumps(
+                            {
+                                "type": "response_item",
+                                "payload": {"role": "assistant", "text": "ai clone context ready"},
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            SessionRegistry(workspace).import_provider_session(
+                provider_session_id="codex-thread-ai",
+                provider_session_kind="codex_thread",
+                agent_id="developer",
+                adapter="codex",
+                project_dir=project,
+                title="AI clone source",
+                session_id="source-ai",
+                project_id="agentdeck",
+                metadata={"provider": "codex"},
+            )
+            SessionStateStore(workspace).write(
+                SessionStateCard(
+                    session_id="source-ai",
+                    objective="Clone with AI summarizer",
+                    current_state="Rules capsule can be compressed",
+                    next_step="Use explicit AI strategy",
+                    project_id="agentdeck",
+                    agent_id="developer",
+                )
+            )
+            handler = TelegramCommandHandler(workspace)
+            handler.chat_state.set_current_session(42, "source-ai")
+
+            reply = asyncio.run(
+                handler.handle_text(
+                    f"/clone current home {home} strategy ai summarizer echo agent ai-fork title AI Fork",
+                    chat_id=42,
+                )
+            )[0]
+
+            self.assertIn("Current worker cloned and spawned:", reply)
+            self.assertIn("strategy: ai", reply)
+            self.assertIn("worker: ai-fork", reply)
+            clones = CloneStore(workspace).list()
+            self.assertEqual(len(clones), 1)
+            self.assertEqual(clones[0].strategy, "ai")
+            self.assertEqual(clones[0].metadata["ai_summarizer"]["status"], "applied")
+            self.assertFalse((workspace.tmp_dir / "clone-runs").exists())
+            session = SessionRegistry(workspace).resolve("ai-fork-session")
+            self.assertIsNotNone(session)
 
     def test_handler_lists_uses_and_reports_directories(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

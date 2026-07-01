@@ -42,7 +42,13 @@ from agentdeck.core.run_service import (
 )
 from agentdeck.storage.approvals import ApprovalRecord, ApprovalRegistry
 from agentdeck.storage.agents import ASSISTANT_AGENT_ID, AgentRecord, AgentRegistry
-from agentdeck.storage.clones import CloneCapsule, CloneStore, create_rules_clone_capsule, spawn_worker_from_clone
+from agentdeck.storage.clones import (
+    CloneCapsule,
+    CloneStore,
+    create_ai_clone_capsule,
+    create_rules_clone_capsule,
+    spawn_worker_from_clone,
+)
 from agentdeck.storage.directories import DirectoryRecord, DirectoryRegistry
 from agentdeck.storage.experience import COLLECTION_KINDS, EDGE_RELATIONS, ExperienceCollection, ExperienceEvent, ExperienceStore
 from agentdeck.storage.focus import FOCUS_STATUSES, FocusRecord, FocusRegistry
@@ -3741,12 +3747,30 @@ class TelegramCommandHandler:
             if current_collection:
                 collections.append(current_collection)
         try:
-            capsule = create_rules_clone_capsule(
-                self.workspace,
-                session.session_id,
-                home=options.get("home") or None,
-                collections=collections,
-            )
+            strategy = (options.get("strategy") or "rules").lower()
+            if strategy not in {"rules", "ai"}:
+                return "Unsupported clone strategy. Use strategy rules or strategy ai."
+            if strategy == "ai":
+                capsule = _create_ai_clone_capsule_for_telegram(
+                    self.workspace,
+                    session.session_id,
+                    home=options.get("home") or None,
+                    recent_turns=_positive_int_option(options.get("recent-turns", ""), default=12),
+                    max_provider_chars=_positive_int_option(options.get("max-provider-chars", ""), default=24000),
+                    summarizer_adapter=options.get("summarizer-adapter", "codex-exec"),
+                    model=options.get("model") or None,
+                    keep_debug=bool(options.get("keep-debug")),
+                    collections=collections,
+                )
+            else:
+                capsule = create_rules_clone_capsule(
+                    self.workspace,
+                    session.session_id,
+                    home=options.get("home") or None,
+                    recent_turns=_positive_int_option(options.get("recent-turns", ""), default=12),
+                    max_provider_chars=_positive_int_option(options.get("max-provider-chars", ""), default=24000),
+                    collections=collections,
+                )
             result = spawn_worker_from_clone(
                 self.workspace,
                 capsule,
@@ -3777,6 +3801,7 @@ class TelegramCommandHandler:
             "Current worker cloned and spawned:",
             f"source: {session.title} ({session.session_id})",
             f"clone: {capsule.clone_id}",
+            f"strategy: {capsule.strategy}",
             f"worker: {result['agent_id']}",
             f"session: {result['session_id']}",
         ]
@@ -5235,12 +5260,26 @@ def _parse_clone_spawn_options(rest: str) -> dict[str, str]:
             options["replace"] = "true"
             index += 1
             continue
+        if key in {"keep-debug", "debug"}:
+            options["keep-debug"] = "true"
+            index += 1
+            continue
         if key == "title":
             title = " ".join(tokens[index + 1 :]).strip()
             if title:
                 options["title"] = title
             break
-        if key in {
+        normalized = {
+            "summarizer": "summarizer-adapter",
+            "summarizer_adapter": "summarizer-adapter",
+            "recent": "recent-turns",
+            "recent_turns": "recent-turns",
+            "max": "max-provider-chars",
+            "max_chars": "max-provider-chars",
+            "max-provider": "max-provider-chars",
+            "max_provider_chars": "max-provider-chars",
+        }.get(key, key)
+        if normalized in {
             "agent",
             "session",
             "project",
@@ -5253,12 +5292,50 @@ def _parse_clone_spawn_options(rest: str) -> dict[str, str]:
             "approval",
             "home",
             "collection",
+            "strategy",
+            "summarizer-adapter",
+            "recent-turns",
+            "max-provider-chars",
         } and index + 1 < len(tokens):
-            options[key] = tokens[index + 1]
+            options[normalized] = tokens[index + 1]
             index += 2
             continue
         index += 1
     return options
+
+
+def _create_ai_clone_capsule_for_telegram(workspace: Workspace, session_id: str, **kwargs: Any) -> CloneCapsule:
+    """Run the sync AI clone helper outside Telegram's active asyncio loop."""
+
+    capsule: list[CloneCapsule] = []
+    errors: list[BaseException] = []
+
+    def target() -> None:
+        try:
+            capsule.append(create_ai_clone_capsule(workspace, session_id, **kwargs))
+        except BaseException as exc:  # pragma: no cover - re-raised in caller thread
+            errors.append(exc)
+
+    thread = threading.Thread(target=target, name="agentdeck-telegram-ai-clone", daemon=False)
+    thread.start()
+    thread.join()
+    if errors:
+        raise errors[0]
+    if not capsule:
+        raise RuntimeError("AI clone summarizer did not return a capsule")
+    return capsule[0]
+
+
+def _positive_int_option(value: str, *, default: int) -> int:
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"expected a positive integer, got: {value}") from exc
+    if parsed <= 0:
+        raise ValueError(f"expected a positive integer, got: {value}")
+    return parsed
 
 
 def _short_id(value: str, *, keep: int = 8) -> str:
@@ -5971,7 +6048,7 @@ def _help_text() -> str:
             "/clones [query]",
             "/clone show <clone # or id>",
             "/clone spawn <clone # or id> [agent <id>] [title <name>]",
-            "/clone current [agent <id>] [title <name>]",
+            "/clone current [strategy rules|ai] [agent <id>] [title <name>]",
             "/compact [--pin] [title]",
             "/handoffs [focus or legacy task]",
             "/review <manager review summary>",
