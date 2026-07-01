@@ -2,6 +2,7 @@ import contextlib
 import io
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 
 from agentdeck.cli import main
@@ -102,6 +103,42 @@ class ExperienceOrganizerTests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertIn("experience organizer: collections_created=1 events_created=1", stdout.getvalue())
             self.assertEqual(len(ExperienceStore(workspace).list_events(limit=10)), 1)
+
+    def test_experience_organizer_detached_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            stdout = io.StringIO()
+            try:
+                with contextlib.redirect_stdout(stdout):
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("ignore", ResourceWarning)
+                        start_code = main(
+                            [
+                                "--workspace",
+                                str(workspace.root),
+                                "experience",
+                                "start",
+                                "--poll-interval",
+                                "60",
+                            ]
+                        )
+                self.assertEqual(start_code, 0)
+                self.assertIn("experience organizer service started:", stdout.getvalue())
+
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    status_code = main(["--workspace", str(workspace.root), "experience", "status"])
+                self.assertEqual(status_code, 0)
+                self.assertIn("experience organizer service: running", stdout.getvalue())
+            finally:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    main(["--workspace", str(workspace.root), "experience", "stop", "--force"])
+
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                stopped_code = main(["--workspace", str(workspace.root), "experience", "status"])
+            self.assertEqual(stopped_code, 1)
+            self.assertIn("experience organizer service: stopped", stdout.getvalue())
 
 
 if __name__ == "__main__":

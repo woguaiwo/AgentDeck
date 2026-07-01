@@ -671,7 +671,15 @@ same `ExperienceStore` APIs as manual CLI and Telegram commands:
 agentdeck experience organize --limit 50
 agentdeck experience serve --once
 agentdeck experience serve --poll-interval 30
+agentdeck experience start --poll-interval 30
+agentdeck experience status
+agentdeck experience stop
 ```
+
+Use `experience start` when you want AgentDeck to keep organizing durable
+handoffs and reviews into Experience Collections in the background. It writes a
+pid file and log under `.agentdeck/experience/`, matching the daemon lifecycle
+used by the error handler.
 
 Events support both hierarchy and graph relationships. `parent_event_id` stores
 macro/meso/micro containment, while `experience link` stores logical

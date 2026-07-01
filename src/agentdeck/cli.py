@@ -230,6 +230,22 @@ def build_parser() -> argparse.ArgumentParser:
     exp_serve.add_argument("--collection", default="", help="Existing collection id/title to write into")
     exp_serve.add_argument("--kind", choices=sorted(COLLECTION_KINDS), default="", help="Kind for auto-created collections")
     exp_serve.add_argument("--dry-run", action="store_true")
+    exp_start = exp_sub.add_parser("start", help="Start the experience organizer daemon as a detached process")
+    exp_start.add_argument("--poll-interval", type=float, default=30.0)
+    exp_start.add_argument("--limit", type=int, default=50)
+    exp_start.add_argument("--collection", default="", help="Existing collection id/title to write into")
+    exp_start.add_argument("--kind", choices=sorted(COLLECTION_KINDS), default="", help="Kind for auto-created collections")
+    exp_start.add_argument("--dry-run", action="store_true")
+    exp_stop = exp_sub.add_parser("stop", help="Stop detached experience organizer daemon")
+    exp_stop.add_argument("--force", action="store_true", help="Send SIGKILL if SIGTERM does not stop the daemon")
+    exp_restart = exp_sub.add_parser("restart", help="Restart detached experience organizer daemon")
+    exp_restart.add_argument("--poll-interval", type=float, default=30.0)
+    exp_restart.add_argument("--limit", type=int, default=50)
+    exp_restart.add_argument("--collection", default="", help="Existing collection id/title to write into")
+    exp_restart.add_argument("--kind", choices=sorted(COLLECTION_KINDS), default="", help="Kind for auto-created collections")
+    exp_restart.add_argument("--dry-run", action="store_true")
+    exp_restart.add_argument("--force", action="store_true", help="Send SIGKILL if SIGTERM does not stop the old daemon")
+    exp_sub.add_parser("status", help="Show detached experience organizer daemon status")
 
     events = sub.add_parser("events", help="Inspect event log")
     events.add_argument("--tail", type=int, default=20)
@@ -846,6 +862,17 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "experience":
         workspace.ensure()
+        if args.experience_command == "start":
+            return _experience_start(args, workspace)
+        if args.experience_command == "stop":
+            return _experience_stop(args, workspace)
+        if args.experience_command == "restart":
+            stop_code = _experience_stop(argparse.Namespace(force=bool(getattr(args, "force", False))), workspace)
+            if stop_code not in {0, 1}:
+                return stop_code
+            return _experience_start(args, workspace)
+        if args.experience_command == "status":
+            return _experience_status(workspace)
         return _handle_experience_command(workspace, args)
 
     if args.command == "events":
@@ -1589,6 +1616,104 @@ def _errors_pid_path(workspace: Workspace) -> Path:
 
 def _errors_log_path(workspace: Workspace) -> Path:
     return workspace.errors_dir / "error-handler.log"
+
+
+def _experience_start(args: argparse.Namespace, workspace: Workspace) -> int:
+    pid = _read_pid(_experience_pid_path(workspace))
+    if pid and _pid_alive(pid):
+        print(f"experience organizer service already running: pid={pid}")
+        print(f"log: {_experience_log_path(workspace)}")
+        return 0
+    _experience_daemon_dir(workspace).mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        "-m",
+        "agentdeck",
+        "--workspace",
+        str(workspace.root),
+        "experience",
+        "serve",
+        "--poll-interval",
+        str(getattr(args, "poll_interval", 30.0)),
+        "--limit",
+        str(getattr(args, "limit", 50)),
+    ]
+    collection = str(getattr(args, "collection", "") or "")
+    if collection:
+        command.extend(["--collection", collection])
+    kind = str(getattr(args, "kind", "") or "")
+    if kind:
+        command.extend(["--kind", kind])
+    if bool(getattr(args, "dry_run", False)):
+        command.append("--dry-run")
+    with _experience_log_path(workspace).open("ab") as log:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            env=os.environ.copy(),
+            close_fds=True,
+            start_new_session=True,
+        )
+    _experience_pid_path(workspace).write_text(str(process.pid), encoding="utf-8")
+    print(f"experience organizer service started: pid={process.pid}")
+    print(f"workspace: {workspace.root}")
+    print(f"log: {_experience_log_path(workspace)}")
+    return 0
+
+
+def _experience_stop(args: argparse.Namespace, workspace: Workspace) -> int:
+    pid_path = _experience_pid_path(workspace)
+    pid = _read_pid(pid_path)
+    if not pid:
+        print("experience organizer service is not running")
+        return 1
+    if not _pid_alive(pid):
+        _unlink_quietly(pid_path)
+        print(f"experience organizer service is not running; removed stale pid {pid}")
+        return 1
+    os.kill(pid, signal.SIGTERM)
+    for _ in range(50):
+        if not _pid_alive(pid):
+            _unlink_quietly(pid_path)
+            print(f"experience organizer service stopped: pid={pid}")
+            return 0
+        time.sleep(0.1)
+    if args.force:
+        os.kill(pid, signal.SIGKILL)
+        _unlink_quietly(pid_path)
+        print(f"experience organizer service killed: pid={pid}")
+        return 0
+    print(f"experience organizer service did not stop after SIGTERM: pid={pid}", file=sys.stderr)
+    return 2
+
+
+def _experience_status(workspace: Workspace) -> int:
+    pid = _read_pid(_experience_pid_path(workspace))
+    if pid and _pid_alive(pid):
+        print(f"experience organizer service: running pid={pid}")
+        print(f"log: {_experience_log_path(workspace)}")
+        return 0
+    if pid:
+        print(f"experience organizer service: stopped stale_pid={pid}")
+        print(f"log: {_experience_log_path(workspace)}")
+        return 1
+    print("experience organizer service: stopped")
+    print(f"log: {_experience_log_path(workspace)}")
+    return 1
+
+
+def _experience_daemon_dir(workspace: Workspace) -> Path:
+    return workspace.root / "experience"
+
+
+def _experience_pid_path(workspace: Workspace) -> Path:
+    return _experience_daemon_dir(workspace) / "experience-organizer.pid"
+
+
+def _experience_log_path(workspace: Workspace) -> Path:
+    return _experience_daemon_dir(workspace) / "experience-organizer.log"
 
 
 def _telegram_status(workspace: Workspace) -> int:
