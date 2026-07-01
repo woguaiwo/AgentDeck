@@ -351,6 +351,8 @@ Supported commands:
 /experience
 /experience new <kind> <title>
 /experience record <event> [| result: ...] [| decision: ...]
+/experience organize [limit <n>] [kind <kind>] [dry-run]
+/experience organizer status|start|stop|restart
 /experience events [query]
 /clones [query]
 /clone show <clone # or id>
@@ -679,7 +681,8 @@ agentdeck experience stop
 Use `experience start` when you want AgentDeck to keep organizing durable
 handoffs and reviews into Experience Collections in the background. It writes a
 pid file and log under `.agentdeck/experience/`, matching the daemon lifecycle
-used by the error handler.
+used by the error handler. Phone users can run the same workflow with
+`/experience organize` and `/experience organizer status|start|stop|restart`.
 
 Events support both hierarchy and graph relationships. `parent_event_id` stores
 macro/meso/micro containment, while `experience link` stores logical

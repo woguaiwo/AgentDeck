@@ -8,6 +8,7 @@ import mimetypes
 import os
 import re
 import shlex
+import subprocess
 import sys
 import threading
 import time
@@ -31,6 +32,7 @@ from agentdeck.core.error_daemon import (
     record_nonfatal_incident_for_job,
 )
 from agentdeck.core.events import EventKind
+from agentdeck.core.experience_organizer import ExperienceOrganizer
 from agentdeck.core.run_service import (
     RunConfigurationError,
     RunRequest,
@@ -2620,6 +2622,10 @@ class TelegramCommandHandler:
             return self._experience_use(subrest, chat_id=chat_id)
         if lowered in {"record", "add", "event"}:
             return self._experience_record(subrest, chat_id=chat_id)
+        if lowered in {"organize", "organise"}:
+            return self._experience_organize(subrest, chat_id=chat_id)
+        if lowered in {"organizer", "organiser", "daemon"}:
+            return self._experience_organizer(subrest, chat_id=chat_id)
         if lowered in {"events", "list"}:
             return self._experience_events(subrest, chat_id=chat_id)
         if lowered in {"show", "detail"}:
@@ -2772,6 +2778,89 @@ class TelegramCommandHandler:
         lines.append("")
         lines.append("Use /experience events to list recent events.")
         return "\n".join(lines)
+
+    def _experience_organize(self, rest: str, *, chat_id: int | None) -> str:
+        try:
+            options = _parse_experience_organizer_options(rest)
+            result = ExperienceOrganizer(self.workspace).process_once(
+                limit=options["limit"],
+                collection=options["collection"],
+                kind=options["kind"],
+                dry_run=options["dry_run"],
+            )
+        except ValueError as exc:
+            return str(exc)
+        prefix = "Experience organizer dry run" if options["dry_run"] else "Experience organizer"
+        lines = [
+            f"{prefix}:",
+            f"collections_created: {result.collections_created}",
+            f"events_created: {result.events_created}",
+            f"edges_created: {result.edges_created}",
+            f"skipped: {result.skipped}",
+        ]
+        if not options["dry_run"] and result.events_created:
+            lines.append("")
+            lines.append("Use /experience events to inspect organized events.")
+        return "\n".join(lines)
+
+    def _experience_organizer(self, rest: str, *, chat_id: int | None) -> str:
+        action, tail = _split_once(rest)
+        action = action.lower() or "status"
+        aliases = {
+            "run": "start",
+            "on": "start",
+            "off": "stop",
+            "reload": "restart",
+            "restart": "restart",
+            "start": "start",
+            "stop": "stop",
+            "status": "status",
+        }
+        action = aliases.get(action, action)
+        if action not in {"start", "stop", "restart", "status"}:
+            return "Usage: /experience organizer status|start|stop|restart [limit <n>] [poll <seconds>] [kind <kind>] [collection <id>] [dry-run]"
+        command = [
+            sys.executable,
+            "-m",
+            "agentdeck",
+            "--workspace",
+            str(self.workspace.root),
+            "experience",
+            action,
+        ]
+        if action in {"start", "restart"}:
+            try:
+                options = _parse_experience_organizer_options(tail)
+            except ValueError as exc:
+                return str(exc)
+            command.extend(["--limit", str(options["limit"])])
+            command.extend(["--poll-interval", str(options["poll_interval"])])
+            if options["collection"]:
+                command.extend(["--collection", options["collection"]])
+            if options["kind"]:
+                command.extend(["--kind", options["kind"]])
+            if options["dry_run"]:
+                command.append("--dry-run")
+        elif action == "stop" and tail.strip().lower() in {"force", "--force"}:
+            command.append("--force")
+        try:
+            result = subprocess.run(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            return "Experience organizer command timed out."
+        output = "\n".join(part.strip() for part in [result.stdout, result.stderr] if part.strip())
+        if not output:
+            output = f"experience organizer {action}: exit={result.returncode}"
+        if result.returncode not in {0, 1}:
+            return f"Experience organizer {action} failed:\n{_trim_telegram_text(output)}"
+        return _trim_telegram_text(output)
 
     def _experience_events(self, rest: str, *, chat_id: int | None) -> str:
         store = ExperienceStore(self.workspace)
@@ -5647,6 +5736,86 @@ def _first_field(fields: dict[str, list[str]], key: str) -> str:
     return values[0].strip() if values else ""
 
 
+def _parse_experience_organizer_options(rest: str) -> dict[str, Any]:
+    options: dict[str, Any] = {
+        "limit": 50,
+        "poll_interval": 30.0,
+        "collection": "",
+        "kind": "",
+        "dry_run": False,
+    }
+    try:
+        tokens = shlex.split(rest)
+    except ValueError as exc:
+        raise ValueError(f"Invalid organizer options: {exc}") from exc
+    index = 0
+    while index < len(tokens):
+        token = tokens[index].strip()
+        lowered = token.lower()
+        if not token:
+            index += 1
+            continue
+        if lowered in {"dry-run", "--dry-run", "dryrun"}:
+            options["dry_run"] = True
+            index += 1
+            continue
+        if lowered in {"limit", "--limit", "-n"}:
+            if index + 1 >= len(tokens):
+                raise ValueError("Usage: limit <number>")
+            options["limit"] = _parse_positive_int(tokens[index + 1], field="limit")
+            index += 2
+            continue
+        if lowered.isdigit():
+            options["limit"] = _parse_positive_int(lowered, field="limit")
+            index += 1
+            continue
+        if lowered in {"poll", "interval", "poll-interval", "--poll-interval"}:
+            if index + 1 >= len(tokens):
+                raise ValueError("Usage: poll <seconds>")
+            options["poll_interval"] = _parse_positive_float(tokens[index + 1], field="poll interval")
+            index += 2
+            continue
+        if lowered in {"collection", "--collection"}:
+            if index + 1 >= len(tokens):
+                raise ValueError("Usage: collection <collection id or title>")
+            options["collection"] = tokens[index + 1]
+            index += 2
+            continue
+        if lowered in {"kind", "--kind"}:
+            if index + 1 >= len(tokens):
+                raise ValueError("Usage: kind <collection kind>")
+            kind = _experience_kind_alias(tokens[index + 1])
+            if not kind:
+                raise ValueError(f"Unsupported experience collection kind: {tokens[index + 1]}")
+            options["kind"] = kind
+            index += 2
+            continue
+        raise ValueError(
+            "Usage: /experience organize [limit <n>] [kind <kind>] [collection <id>] [dry-run]"
+        )
+    return options
+
+
+def _parse_positive_int(value: str, *, field: str) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise ValueError(f"{field} must be a positive number") from exc
+    if parsed <= 0:
+        raise ValueError(f"{field} must be a positive number")
+    return parsed
+
+
+def _parse_positive_float(value: str, *, field: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{field} must be a positive number") from exc
+    if parsed <= 0:
+        raise ValueError(f"{field} must be a positive number")
+    return parsed
+
+
 def _parse_experience_telegram_artifacts(values: list[str]) -> list[dict[str, str]]:
     artifacts: list[dict[str, str]] = []
     for value in values:
@@ -5698,6 +5867,8 @@ def _experience_help_text() -> str:
             "/experience new <kind> <title> [| purpose: ...]",
             "/experience use <collection # or id>",
             "/experience record <event> [| result: ...] [| decision: ...] [| tag: ...]",
+            "/experience organize [limit <n>] [kind <kind>] [dry-run]",
+            "/experience organizer status|start|stop|restart",
             "/experience events [query]",
             "/experience show <event #, event id, collection #, or collection id>",
             "/experience link <from event #> <relation> <to event #> [reason]",
@@ -5737,6 +5908,13 @@ def _one_line(value: str, max_chars: int) -> str:
     if len(clean) <= max_chars:
         return clean
     return clean[: max_chars - 1].rstrip() + "..."
+
+
+def _trim_telegram_text(value: str, *, max_chars: int = MAX_TELEGRAM_MESSAGE - 80) -> str:
+    text = value.strip()
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "..."
 
 
 def _append_compact_list(lines: list[str], title: str, values: list[str], *, max_items: int) -> None:

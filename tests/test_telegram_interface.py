@@ -239,6 +239,28 @@ class TelegramInterfaceTests(unittest.TestCase):
             self.assertIn("IMU clone memory [current]", collections)
             self.assertIn("events: 2", collections)
 
+    def test_experience_phone_organize_and_daemon_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(Path(tmpdir) / ".agentdeck")
+            ProgressJournal(workspace).append(
+                kind="handoff",
+                summary="Add phone controls for experience organizer",
+                project_id="proj",
+                completed=["Added Telegram organize command"],
+                verified=["Telegram tests passed"],
+            )
+            handler = TelegramCommandHandler(workspace)
+
+            organized = asyncio.run(handler.handle_text("/experience organize limit 5", chat_id=42))[0]
+
+            self.assertIn("Experience organizer:", organized)
+            self.assertIn("events_created: 1", organized)
+            self.assertEqual(len(ExperienceStore(workspace).list_events(limit=10)), 1)
+
+            status = asyncio.run(handler.handle_text("/experience organizer status", chat_id=42))[0]
+            self.assertIn("experience organizer service: stopped", status)
+            self.assertIn("experience-organizer.log", status)
+
     def test_clone_phone_workflow_lists_shows_and_spawns_worker(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
