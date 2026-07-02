@@ -45,6 +45,7 @@ from agentdeck.storage.directories import DirectoryRecord, DirectoryRegistry
 from agentdeck.storage.focus import FOCUS_STATUSES, FocusRecord, FocusRegistry
 from agentdeck.storage.jobs import JobRecord, JobRegistry
 from agentdeck.storage.memory import MarkdownMemoryStore
+from agentdeck.storage.plans import PlanRecord, PlanRegistry, plan_progress
 from agentdeck.storage.progress import ProgressJournal, format_handoff, format_review
 from agentdeck.storage.provider_cleanup import ProviderDeleteResult, delete_provider_session
 from agentdeck.storage.provider_sessions import ProviderSessionCandidate, scan_codex_index_sessions, scan_provider_sessions
@@ -286,6 +287,45 @@ def build_parser() -> argparse.ArgumentParser:
     approval_reject = approval_sub.add_parser("reject", help="Mark an approval as rejected")
     approval_reject.add_argument("approval")
     approval_reject.add_argument("note", nargs="?")
+
+    plans = sub.add_parser("plans", help="Manage readable plan drafts and executable plan steps")
+    plans_sub = plans.add_subparsers(dest="plans_command", required=True)
+    plans_list = plans_sub.add_parser("list", help="List plans")
+    plans_list.add_argument("--project")
+    plans_list.add_argument("--focus")
+    plans_list.add_argument("--status")
+    plans_new = plans_sub.add_parser("new", help="Create a readable plan draft")
+    plans_new.add_argument("title")
+    plans_new.add_argument("--draft", default="")
+    plans_new.add_argument("--draft-file")
+    plans_new.add_argument("--project")
+    plans_new.add_argument("--focus")
+    plans_new.add_argument("--session")
+    plans_new.add_argument("--agent")
+    plans_new.add_argument("--cwd")
+    plans_show = plans_sub.add_parser("show", help="Show one plan as JSON")
+    plans_show.add_argument("plan")
+    plans_draft = plans_sub.add_parser("draft", help="Print the user-readable plan draft")
+    plans_draft.add_argument("plan")
+    plans_set_draft = plans_sub.add_parser("set-draft", help="Replace the user-readable plan draft")
+    plans_set_draft.add_argument("plan")
+    plans_set_draft.add_argument("--text", default="")
+    plans_set_draft.add_argument("--file")
+    plans_note = plans_sub.add_parser("note", help="Append a discussion note to a plan")
+    plans_note.add_argument("plan")
+    plans_note.add_argument("note")
+    plans_compile = plans_sub.add_parser("compile", help="Compile the readable draft into executable steps")
+    plans_compile.add_argument("plan")
+    plans_status = plans_sub.add_parser("status", help="Show plan step status")
+    plans_status.add_argument("plan")
+    plans_step = plans_sub.add_parser("step", help="Update one compiled plan step")
+    plans_step.add_argument("plan")
+    plans_step.add_argument("step")
+    plans_step.add_argument("--status", required=True)
+    plans_step.add_argument("--report", default="")
+    plans_step.add_argument("--result", default="")
+    plans_step.add_argument("--decision", default="")
+    plans_step.add_argument("--artifact", action="append", default=[])
 
     sessions = sub.add_parser("sessions", help="Inspect session registry")
     sess_sub = sessions.add_subparsers(dest="sessions_command", required=True)
@@ -931,6 +971,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command in {"sessions", "workers"}:
         return _handle_session_agent_command(workspace, args)
+
+    if args.command == "plans":
+        workspace.ensure()
+        return _handle_plans_command(workspace, args)
 
     if args.command == "clones":
         workspace.ensure()
@@ -2234,6 +2278,119 @@ def _handle_experience_command(workspace: Workspace, args: argparse.Namespace) -
     return 2
 
 
+def _handle_plans_command(workspace: Workspace, args: argparse.Namespace) -> int:
+    registry = PlanRegistry(workspace)
+    if args.plans_command == "list":
+        _print_plans(registry.list(project_id=args.project, focus_id=args.focus, status=args.status))
+        return 0
+    if args.plans_command == "new":
+        draft = _read_text_arg(args.draft, args.draft_file)
+        focus = FocusRegistry(workspace).resolve(args.focus) if args.focus else None
+        session = SessionRegistry(workspace).resolve(args.session) if args.session else None
+        project = ProjectRegistry(workspace).resolve(args.project) if args.project else None
+        try:
+            record = registry.create(
+                title=args.title,
+                draft=draft,
+                project_id=(focus.project_id if focus is not None else (project.project_id if project is not None else (args.project or ""))),
+                focus_id=focus.focus_id if focus is not None else (args.focus or ""),
+                session_id=(focus.session_id if focus is not None else (session.session_id if session is not None else (args.session or ""))),
+                agent_id=(focus.agent_id if focus is not None else (session.agent_id if session is not None else (args.agent or ""))),
+                directory=(focus.directory if focus is not None else (session.project_dir if session is not None else (args.cwd or ""))),
+                metadata={"created_by": "cli"},
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(f"plan: {record.title} ({record.plan_id})")
+        print("status: draft")
+        return 0
+    if args.plans_command == "show":
+        record = registry.resolve(args.plan)
+        if record is None:
+            print(f"plan not found: {args.plan}", file=sys.stderr)
+            return 2
+        print(json.dumps(record.to_dict(), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    if args.plans_command == "draft":
+        record = registry.resolve(args.plan)
+        if record is None:
+            print(f"plan not found: {args.plan}", file=sys.stderr)
+            return 2
+        print(record.draft)
+        return 0
+    if args.plans_command == "set-draft":
+        draft = _read_text_arg(args.text, args.file)
+        if not draft.strip():
+            print("draft text is empty; pass --text or --file", file=sys.stderr)
+            return 2
+        record = registry.set_draft(args.plan, draft, note="Draft updated from CLI.")
+        if record is None:
+            print(f"plan not found: {args.plan}", file=sys.stderr)
+            return 2
+        print(f"plan draft updated: {record.title} ({record.plan_id})")
+        return 0
+    if args.plans_command == "note":
+        record = registry.add_note(args.plan, args.note, kind="discussion")
+        if record is None:
+            print(f"plan not found: {args.plan}", file=sys.stderr)
+            return 2
+        print(f"plan note added: {record.title} ({record.plan_id})")
+        return 0
+    if args.plans_command == "compile":
+        try:
+            record = registry.compile(args.plan)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if record is None:
+            print(f"plan not found: {args.plan}", file=sys.stderr)
+            return 2
+        print(f"plan compiled: {record.title} ({record.plan_id})")
+        _print_plan_status(record)
+        return 0
+    if args.plans_command == "status":
+        record = registry.resolve(args.plan)
+        if record is None:
+            print(f"plan not found: {args.plan}", file=sys.stderr)
+            return 2
+        _print_plan_status(record)
+        return 0
+    if args.plans_command == "step":
+        try:
+            record = registry.update_step(
+                args.plan,
+                args.step,
+                status=args.status,
+                report=args.report,
+                result=args.result,
+                decision=args.decision,
+                artifacts=args.artifact,
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        if record is None:
+            print(f"plan or step not found: {args.plan} {args.step}", file=sys.stderr)
+            return 2
+        _print_plan_status(record)
+        return 0
+    return 2
+
+
+def _read_text_arg(text: str, path: str | None) -> str:
+    if path:
+        return Path(path).expanduser().read_text(encoding="utf-8")
+    return text or ""
+
+
+def _one_line(value: str, max_chars: int) -> str:
+    text = " ".join(str(value).strip().split())
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "..."
+
+
 def _parse_experience_artifacts(values: list[str]) -> list[dict[str, str]]:
     artifacts: list[dict[str, str]] = []
     for value in values or []:
@@ -2641,6 +2798,39 @@ def _print_focus(records: list[FocusRecord]) -> None:
                 ]
             )
         )
+
+
+def _print_plans(records: list[PlanRecord]) -> None:
+    if not records:
+        print("no plans")
+        return
+    print("title\tplan_id\tstatus\tsteps\tproject\tfocus\tsession")
+    for record in records:
+        done, total = plan_progress(record)
+        print(
+            "\t".join(
+                [
+                    record.title,
+                    record.plan_id,
+                    record.status,
+                    f"{done}/{total}",
+                    record.project_id or "-",
+                    record.focus_id or "-",
+                    record.session_id or "-",
+                ]
+            )
+        )
+
+
+def _print_plan_status(record: PlanRecord) -> None:
+    done, total = plan_progress(record)
+    print(f"plan: {record.title} ({record.plan_id})")
+    print(f"status: {record.status}")
+    print(f"steps: {done}/{total}")
+    for index, step in enumerate(record.steps, 1):
+        print(f"{index}. {step.step_id} [{step.status}] {step.title}")
+        if step.report:
+            print(f"   report: {_one_line(step.report, 180)}")
 
 
 def _setup_assistant(registry: AgentRegistry, args: argparse.Namespace) -> int:

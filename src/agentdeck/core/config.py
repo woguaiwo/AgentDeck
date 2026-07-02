@@ -130,6 +130,10 @@ class Workspace:
         return self.root / "experience"
 
     @property
+    def plans_dir(self) -> Path:
+        return self.root / "plans"
+
+    @property
     def tmp_dir(self) -> Path:
         return self.root / "tmp"
 
@@ -152,6 +156,7 @@ class Workspace:
             self.focus_dir,
             self.clones_dir,
             self.experience_dir,
+            self.plans_dir,
             self.tmp_dir,
             self.memory_dir / "user",
             self.memory_dir / "projects",
@@ -183,6 +188,7 @@ class Workspace:
             "focus": str(self.focus_dir),
             "clones": str(self.clones_dir),
             "experience": str(self.experience_dir),
+            "plans": str(self.plans_dir),
             "tmp": str(self.tmp_dir),
             "memory": str(self.memory_dir),
         }

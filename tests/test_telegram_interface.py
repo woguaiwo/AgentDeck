@@ -39,6 +39,7 @@ from agentdeck.storage.errors import ErrorIncidentStore
 from agentdeck.storage.experience import ExperienceStore
 from agentdeck.storage.focus import FocusRegistry
 from agentdeck.storage.jobs import JobRegistry
+from agentdeck.storage.plans import PlanRegistry
 from agentdeck.storage.progress import ProgressJournal
 from agentdeck.storage.projects import ProjectRegistry
 from agentdeck.storage.project_state import ProjectStateStore
@@ -3030,6 +3031,166 @@ class TelegramInterfaceTests(unittest.TestCase):
             self.assertEqual(finished.error, "cancelled by test")
             self.assertEqual(len(sent), 1)
             self.assertIn(f"Job cancelled: {job_id}", sent[0][1])
+
+    def test_plan_phone_workflow_discusses_compiles_and_runs_auto_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            workspace.ensure()
+            project_dir = tmp / "project"
+            project_dir.mkdir()
+            ProjectRegistry(workspace).upsert(project_id="proj", title="Project", project_dir=project_dir)
+            AgentRegistry(workspace).upsert(agent_id="owner", project_id="proj", adapter="echo", project_dir=project_dir)
+            session = SessionRegistry(workspace).upsert_start(
+                session_id="session-plan-worker",
+                agent_id="owner",
+                adapter="echo",
+                project_dir=project_dir,
+                project_id="proj",
+                prompt="Plan worker",
+                title="Plan worker",
+            )
+            focus = FocusRegistry(workspace).create(
+                title="Long experiment",
+                project_id="proj",
+                agent_id="owner",
+                session_id=session.session_id,
+                directory=project_dir,
+            )
+            seen: list[RunRequest] = []
+            sent: list[tuple[int, str]] = []
+            call_count = 0
+
+            async def runner(workspace_arg: Workspace, request: RunRequest) -> RunServiceResult:
+                nonlocal call_count
+                call_count += 1
+                seen.append(request)
+                marker = "step-001" if call_count == 1 else "step-002"
+                done_marker = "\nAGENTDECK_PLAN_DONE: " if call_count == 2 else ""
+                return RunServiceResult(
+                    session_id=session.session_id,
+                    final_text=(
+                        f"completed {marker}\n"
+                        f"result: result {call_count}\n"
+                        f"decision: decision {call_count}\n"
+                        f"artifact: /tmp/artifact-{call_count}\n"
+                        f"AGENTDECK_PLAN_STEP_DONE: {marker}"
+                        f"{done_marker}"
+                    ),
+                    events=[],
+                    agent_id="owner",
+                    adapter="echo",
+                    focus_id=focus.focus_id,
+                )
+
+            old_delay = telegram_module.AUTO_CONTINUE_DELAY_SECONDS
+            telegram_module.AUTO_CONTINUE_DELAY_SECONDS = 0.01
+            try:
+                queue = TelegramJobQueue(workspace, sender=lambda chat_id, text: sent.append((chat_id, text)), runner=runner)
+                handler = TelegramCommandHandler(workspace, job_queue=queue)
+                handler.chat_state.set_current_project(42, "proj")
+                handler.chat_state.set_current_focus(42, focus.focus_id)
+                handler.chat_state.set_current_session(42, session.session_id)
+
+                created = asyncio.run(
+                    handler.handle_text(
+                        "/plan new Dataset run | ## Prepare data\nCollect files\n## Verify result\nRun checks",
+                        chat_id=42,
+                    )
+                )[0]
+                self.assertIn("Plan draft created", created)
+
+                note = asyncio.run(handler.handle_text("/plan note 1 keep it phone-readable", chat_id=42))[0]
+                self.assertIn("Plan note added", note)
+
+                compiled = asyncio.run(handler.handle_text("/plan compile 1", chat_id=42))[0]
+                self.assertIn("Plan compiled", compiled)
+                self.assertIn("[ ] Prepare data", compiled)
+
+                started = asyncio.run(handler.handle_text("/auto plan 1", chat_id=42))[0]
+                self.assertIn("Auto plan enabled", started)
+                first_job_id = re.search(r"Job started: (job-\S+)", started).group(1)
+                queue.wait(first_job_id, timeout=2)
+                deadline = time.time() + 2
+                while time.time() < deadline:
+                    plans = PlanRegistry(workspace).list()
+                    if plans and plans[0].status == "done":
+                        break
+                    time.sleep(0.02)
+
+                record = PlanRegistry(workspace).list()[0]
+                self.assertEqual(record.status, "done")
+                self.assertEqual([step.status for step in record.steps], ["done", "done"])
+                self.assertEqual(call_count, 2)
+                self.assertEqual(seen[0].session, session.session_id)
+                self.assertIn("AgentDeck Plan", seen[0].prompt)
+                combined = "\n".join(text for _, text in sent)
+                self.assertIn("Auto plan completed", combined)
+                self.assertNotIn("AGENTDECK_PLAN_STEP_DONE", combined)
+                self.assertFalse(handler.chat_state.auto_state(42).get("enabled"))
+            finally:
+                telegram_module.AUTO_CONTINUE_DELAY_SECONDS = old_delay
+
+    def test_auto_plan_pauses_when_completion_marker_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            workspace = Workspace(tmp / ".agentdeck")
+            workspace.ensure()
+            project_dir = tmp / "project"
+            project_dir.mkdir()
+            session = SessionRegistry(workspace).upsert_start(
+                session_id="session-plan-worker",
+                agent_id="owner",
+                adapter="echo",
+                project_dir=project_dir,
+                prompt="Plan worker",
+                title="Plan worker",
+            )
+            plan = PlanRegistry(workspace).create(
+                title="Strict plan",
+                draft="## One step\nDo it",
+                session_id=session.session_id,
+                agent_id="owner",
+                directory=project_dir,
+            )
+            plan = PlanRegistry(workspace).compile(plan.plan_id)
+            assert plan is not None
+            sent: list[tuple[int, str]] = []
+
+            async def runner(workspace_arg: Workspace, request: RunRequest) -> RunServiceResult:
+                return RunServiceResult(
+                    session_id=session.session_id,
+                    final_text="I did some work but forgot the marker.",
+                    events=[],
+                    agent_id="owner",
+                    adapter="echo",
+                )
+
+            queue = TelegramJobQueue(workspace, sender=lambda chat_id, text: sent.append((chat_id, text)), runner=runner)
+            handler = TelegramCommandHandler(workspace, job_queue=queue)
+            handler.chat_state.set_recent_plans(42, [plan.plan_id])
+
+            started = asyncio.run(handler.handle_text("/auto plan 1", chat_id=42))[0]
+            job_id = re.search(r"Job started: (job-\S+)", started).group(1)
+            queue.wait(job_id, timeout=2)
+
+            updated = PlanRegistry(workspace).resolve(plan.plan_id)
+            assert updated is not None
+            self.assertEqual(updated.status, "blocked")
+            self.assertEqual(updated.steps[0].status, "blocked")
+            self.assertFalse(handler.chat_state.auto_state(42).get("enabled"))
+            self.assertIn("completion marker missing", "\n".join(text for _, text in sent))
+
+    def test_assistant_allows_plan_actions_but_blocks_auto_actions(self) -> None:
+        allowed, reason = telegram_module._assistant_action_allowed("/plan new Long work | ## Step 1")
+        self.assertTrue(allowed, reason)
+        allowed, reason = telegram_module._assistant_action_allowed("/plan compile 1")
+        self.assertTrue(allowed, reason)
+        allowed, reason = telegram_module._assistant_action_allowed("/plans")
+        self.assertTrue(allowed, reason)
+        allowed, reason = telegram_module._assistant_action_allowed("/auto plan 1")
+        self.assertFalse(allowed)
+        self.assertIn("whitelist", reason)
 
     def test_message_split_and_env_config(self) -> None:
         chunks = split_message("a" * 5000, limit=1000)

@@ -54,6 +54,7 @@ from agentdeck.storage.experience import COLLECTION_KINDS, EDGE_RELATIONS, Exper
 from agentdeck.storage.focus import FOCUS_STATUSES, FocusRecord, FocusRegistry
 from agentdeck.storage.jobs import JobRecord, JobRegistry
 from agentdeck.storage.memory import MemoryDocument, MarkdownMemoryStore
+from agentdeck.storage.plans import PlanRecord, PlanRegistry, PlanStep, plan_progress
 from agentdeck.storage.progress import ProgressJournal, format_review
 from agentdeck.storage.provider_sessions import ProviderSessionCandidate, scan_codex_index_sessions, scan_provider_sessions
 from agentdeck.storage.projects import ProjectRecord, ProjectRegistry
@@ -82,6 +83,9 @@ DEFAULT_AUTO_FOCUS_PROMPT = (
     "如果你判断当前 Focus 的范围和细节已经基本充分完成，请在回复最后单独一行输出 "
     f"{AUTO_FOCUS_DONE_MARKER}，并给出简短完成摘要；否则不要输出这个标记，继续说明下一步。"
 )
+AUTO_PLAN_STEP_DONE_MARKER = "AGENTDECK_PLAN_STEP_DONE"
+AUTO_PLAN_BLOCKED_MARKER = "AGENTDECK_PLAN_BLOCKED"
+AUTO_PLAN_DONE_MARKER = "AGENTDECK_PLAN_DONE"
 ACTIVE_JOB_STATUSES = {"queued", "running", "cancel_requested"}
 _RESTART_LOCK = threading.Lock()
 _RESTART_SCHEDULED = False
@@ -292,6 +296,7 @@ class TelegramChatStateStore:
         enabled: bool,
         task_id: str = "",
         focus_id: str = "",
+        plan_id: str = "",
         prompt: str = DEFAULT_AUTO_PROMPT,
         until: float = 0.0,
         turns_started: int = 0,
@@ -307,6 +312,7 @@ class TelegramChatStateStore:
                 "enabled": enabled,
                 "task_id": task_id,
                 "focus_id": focus_id,
+                "plan_id": plan_id,
                 "prompt": prompt,
                 "until": until,
                 "turns_started": turns_started,
@@ -328,7 +334,15 @@ class TelegramChatStateStore:
             data[key] = chat
             self._write(data)
 
-    def mark_auto_job(self, chat_id: int, *, job_id: str, task_id: str = "", focus_id: str = "") -> dict[str, Any]:
+    def mark_auto_job(
+        self,
+        chat_id: int,
+        *,
+        job_id: str,
+        task_id: str = "",
+        focus_id: str = "",
+        plan_id: str = "",
+    ) -> dict[str, Any]:
         with self._lock:
             data = self._read()
             key = self._chat_key(chat_id)
@@ -337,6 +351,7 @@ class TelegramChatStateStore:
             state["last_job_id"] = job_id
             state["task_id"] = task_id or str(state.get("task_id") or "")
             state["focus_id"] = focus_id or str(state.get("focus_id") or "")
+            state["plan_id"] = plan_id or str(state.get("plan_id") or "")
             state["turns_started"] = int(state.get("turns_started") or 0) + 1
             chat["auto"] = state
             data[key] = chat
@@ -434,6 +449,15 @@ class TelegramChatStateStore:
             data[key] = chat
             self._write(data)
 
+    def set_recent_plans(self, chat_id: int, plan_ids: list[str]) -> None:
+        with self._lock:
+            data = self._read()
+            key = self._chat_key(chat_id)
+            chat = dict(data.get(key) or {})
+            chat["recent_plan_ids"] = plan_ids
+            data[key] = chat
+            self._write(data)
+
     def set_recent_jobs(self, chat_id: int, job_ids: list[str]) -> None:
         with self._lock:
             data = self._read()
@@ -485,6 +509,14 @@ class TelegramChatStateStore:
             if not isinstance(focus_ids, list) or index < 1 or index > len(focus_ids):
                 return ""
             return str(focus_ids[index - 1])
+
+    def recent_plan_id(self, chat_id: int, index: int) -> str:
+        with self._lock:
+            data = self._read()
+            plan_ids = data.get(self._chat_key(chat_id), {}).get("recent_plan_ids") or []
+            if not isinstance(plan_ids, list) or index < 1 or index > len(plan_ids):
+                return ""
+            return str(plan_ids[index - 1])
 
     def recent_project_id(self, chat_id: int, index: int) -> str:
         with self._lock:
@@ -880,6 +912,7 @@ class TelegramJobQueue:
                 continue
             prompt = str(state.get("prompt") or DEFAULT_AUTO_PROMPT).strip() or DEFAULT_AUTO_PROMPT
             focus_id = str(state.get("focus_id") or "")
+            plan_id = str(state.get("plan_id") or "")
             task_id = str(state.get("task_id") or "")
             metadata: dict[str, Any] = {
                 "auto": True,
@@ -887,7 +920,29 @@ class TelegramJobQueue:
                 "approval_mode": _auto_approval_mode(state),
                 "auto_mode": _auto_mode(state),
             }
-            if focus_id:
+            if _auto_mode(state) == "plan":
+                plan = PlanRegistry(self.workspace).resolve(plan_id)
+                if plan is None:
+                    self.chat_state.disable_auto(chat_id)
+                    self._send(chat_id, f"Auto plan stopped during restart: plan not found: {plan_id}")
+                    continue
+                plan, step = PlanRegistry(self.workspace).start_next_step(plan.plan_id)
+                if plan is None or step is None:
+                    self.chat_state.disable_auto(chat_id)
+                    self._send(chat_id, _format_auto_plan_complete(plan))
+                    continue
+                prompt = _build_plan_step_prompt(plan, step)
+                metadata["plan_id"] = plan.plan_id
+                metadata["plan_step_id"] = step.step_id
+                if plan.focus_id:
+                    metadata["focus_id"] = plan.focus_id
+                    focus_id = plan.focus_id
+                if plan.agent_id:
+                    metadata["agent_id"] = plan.agent_id
+                session_id = _safe_session_id_for_resume(self.workspace, plan.session_id)
+                if session_id:
+                    metadata["session_id"] = session_id
+            elif focus_id:
                 metadata["focus_id"] = focus_id
                 focus = FocusRegistry(self.workspace).resolve(focus_id)
                 if focus is not None:
@@ -898,12 +953,12 @@ class TelegramJobQueue:
                         metadata["session_id"] = session_id
             elif not task_id:
                 task_id = self.chat_state.current_task(chat_id)
-            if not focus_id and not task_id:
+            if not plan_id and not focus_id and not task_id:
                 self.chat_state.disable_auto(chat_id)
                 self._send(chat_id, "Auto mode stopped during restart: no focus or task is selected.")
                 continue
             job = self.start(chat_id=chat_id, task_id="" if focus_id else task_id, prompt=prompt, metadata=metadata)
-            self.chat_state.mark_auto_job(chat_id, job_id=job.job_id, task_id=task_id, focus_id=focus_id)
+            self.chat_state.mark_auto_job(chat_id, job_id=job.job_id, task_id=task_id, focus_id=focus_id, plan_id=plan_id)
             recovered.append(job)
             self._send(
                 chat_id,
@@ -1193,6 +1248,9 @@ class TelegramJobQueue:
             self.chat_state.disable_auto(job.chat_id)
             self._send(job.chat_id, f"Auto mode stopped: {_one_line(job.error, 180)}")
             return
+        if _auto_mode(state) == "plan":
+            self._continue_auto_plan_if_needed(job, state)
+            return
         if _auto_mode(state) == "focus" and _auto_focus_completed(job.final_text):
             self.chat_state.disable_auto(job.chat_id)
             focus_id = str(state.get("focus_id") or (job.metadata or {}).get("focus_id") or "")
@@ -1253,6 +1311,142 @@ class TelegramJobQueue:
                 "\n".join(
                     [
                         f"Auto mode: next job started: {next_job.job_id}",
+                        "Use /auto status or /auto end.",
+                    ]
+                ),
+            )
+
+        timer = threading.Timer(AUTO_CONTINUE_DELAY_SECONDS, enqueue_next)
+        timer.daemon = True
+        timer.start()
+
+    def _continue_auto_plan_if_needed(self, job: JobRecord, state: dict[str, Any]) -> None:
+        plan_id = str(state.get("plan_id") or (job.metadata or {}).get("plan_id") or "")
+        if not plan_id:
+            self.chat_state.disable_auto(job.chat_id)
+            self._send(job.chat_id, "Auto plan stopped: no plan is selected.")
+            return
+        registry = PlanRegistry(self.workspace)
+        plan = registry.resolve(plan_id)
+        if plan is None:
+            self.chat_state.disable_auto(job.chat_id)
+            self._send(job.chat_id, f"Auto plan stopped: plan not found: {plan_id}")
+            return
+        step_id = str((job.metadata or {}).get("plan_step_id") or "")
+        update = _parse_plan_step_update(job.final_text, default_step_id=step_id)
+        if update.get("blocked"):
+            if step_id:
+                registry.update_step(
+                    plan.plan_id,
+                    step_id,
+                    status="blocked",
+                    report=str(update.get("report") or job.final_text),
+                    result=str(update.get("result") or ""),
+                    decision=str(update.get("decision") or ""),
+                    artifacts=list(update.get("artifacts") or []),
+                )
+            registry.set_status(plan.plan_id, "blocked", note="Auto plan stopped after agent reported a blocker.")
+            self.chat_state.disable_auto(job.chat_id)
+            self._send(
+                job.chat_id,
+                "\n".join(
+                    [
+                        "Auto plan paused: current step is blocked.",
+                        f"plan: {plan.title}",
+                        f"step: {step_id or '-'}",
+                        "Use /plan status 1 and decide how to continue.",
+                    ]
+                ),
+            )
+            return
+        if step_id and not update.get("done") and AUTO_PLAN_DONE_MARKER not in job.final_text:
+            registry.update_step(
+                plan.plan_id,
+                step_id,
+                status="blocked",
+                report="Auto plan paused because the agent response did not include a plan completion or blocker marker.\n\n"
+                + _strip_plan_markers(job.final_text),
+            )
+            registry.set_status(plan.plan_id, "blocked", note="Auto plan stopped because no completion marker was detected.")
+            self.chat_state.disable_auto(job.chat_id)
+            self._send(
+                job.chat_id,
+                "\n".join(
+                    [
+                        "Auto plan paused: completion marker missing.",
+                        f"plan: {plan.title}",
+                        f"step: {step_id}",
+                        "Use /plan status 1 to inspect, then decide whether to edit the plan or continue manually.",
+                    ]
+                ),
+            )
+            return
+        if step_id:
+            registry.update_step(
+                plan.plan_id,
+                step_id,
+                status="done",
+                report=str(update.get("report") or job.final_text),
+                result=str(update.get("result") or ""),
+                decision=str(update.get("decision") or ""),
+                artifacts=list(update.get("artifacts") or []),
+            )
+            plan = registry.resolve(plan.plan_id) or plan
+        if AUTO_PLAN_DONE_MARKER in job.final_text and plan.status != "done":
+            registry.set_status(plan.plan_id, "done", note="Agent emitted final plan completion marker.")
+            plan = registry.resolve(plan.plan_id) or plan
+        if plan.status == "done" or all(step.status in {"done", "skipped"} for step in plan.steps):
+            registry.set_status(plan.plan_id, "done", note="Auto plan completed all compiled steps.")
+            self.chat_state.disable_auto(job.chat_id)
+            self._send(job.chat_id, _format_auto_plan_complete(plan))
+            return
+        if _auto_expired(state):
+            self.chat_state.disable_auto(job.chat_id)
+            self._send(job.chat_id, "Auto plan ended: timer expired.")
+            return
+        plan, next_step = registry.start_next_step(plan.plan_id)
+        if plan is None or next_step is None:
+            self.chat_state.disable_auto(job.chat_id)
+            self._send(job.chat_id, _format_auto_plan_complete(plan) if plan is not None else "Auto plan ended.")
+            return
+
+        prompt = _build_plan_step_prompt(plan, next_step)
+        metadata: dict[str, Any] = {
+            "auto": True,
+            "auto_parent_job_id": job.job_id,
+            "approval_mode": _auto_approval_mode(state),
+            "auto_mode": "plan",
+            "plan_id": plan.plan_id,
+            "plan_step_id": next_step.step_id,
+        }
+        if plan.focus_id:
+            metadata["focus_id"] = plan.focus_id
+        if plan.agent_id:
+            metadata["agent_id"] = plan.agent_id
+        session_id = _safe_session_id_for_resume(self.workspace, job.session_id or plan.session_id)
+        if session_id:
+            metadata["session_id"] = session_id
+
+        def enqueue_next() -> None:
+            current = self.chat_state.auto_state(job.chat_id)
+            if not _auto_enabled_for_job(current, job) or _auto_expired(current):
+                if _auto_expired(current):
+                    self.chat_state.disable_auto(job.chat_id)
+                    self._send(job.chat_id, "Auto plan ended: timer expired.")
+                return
+            next_job = self.start(chat_id=job.chat_id, task_id="", prompt=prompt, metadata=metadata)
+            self.chat_state.mark_auto_job(
+                job.chat_id,
+                job_id=next_job.job_id,
+                focus_id=plan.focus_id,
+                plan_id=plan.plan_id,
+            )
+            self._send(
+                job.chat_id,
+                "\n".join(
+                    [
+                        f"Auto plan: next step started: {next_job.job_id}",
+                        f"step: {next_step.step_id} - {next_step.title}",
                         "Use /auto status or /auto end.",
                     ]
                 ),
@@ -1382,6 +1576,10 @@ class TelegramCommandHandler:
             return [self._clones(rest, chat_id=chat_id)]
         if command in {"/clone", "clone"}:
             return [self._clone(rest, chat_id=chat_id)]
+        if command in {"/plans", "plans"}:
+            return [self._plans(rest, chat_id=chat_id)]
+        if command in {"/plan", "plan"}:
+            return [self._plan(rest, chat_id=chat_id)]
         if command in {"/compact", "compact"}:
             return [self._compact(rest, chat_id=chat_id)]
         if command in {"/handoffs", "handoffs"}:
@@ -3820,6 +4018,202 @@ class TelegramCommandHandler:
             return SessionRegistry(self.workspace).resolve(focus.session_id)
         return None
 
+    def _plans(self, rest: str, *, chat_id: int | None) -> str:
+        project_id = ""
+        focus_id = ""
+        query = rest.strip()
+        if query:
+            focus = self._resolve_focus(query, chat_id=chat_id)
+            if focus is not None:
+                focus_id = focus.focus_id
+            else:
+                project = self._resolve_project(query)
+                if project is not None:
+                    project_id = project.project_id
+        elif chat_id is not None:
+            focus_id = self.chat_state.current_focus(chat_id)
+            if not focus_id:
+                project_id = self.chat_state.current_project(chat_id)
+        records = PlanRegistry(self.workspace).list(project_id=project_id or None, focus_id=focus_id or None)[:10]
+        if not records:
+            return "No plans. Use /plan new <title> to start a readable draft."
+        if chat_id is not None:
+            self.chat_state.set_recent_plans(chat_id, [record.plan_id for record in records])
+        lines = ["Plans:"]
+        for index, record in enumerate(records, 1):
+            done, total = plan_progress(record)
+            lines.append(f"{index}. {record.title}")
+            lines.append(f"   id: {_short_id(record.plan_id, keep=18)}  status: {record.status}  steps: {done}/{total}")
+            if record.focus_id:
+                lines.append(f"   focus: {record.focus_id}")
+        lines.append("")
+        lines.append("Use /plan <list #>, /plan draft <list #>, /plan compile <list #>, or /auto plan <list #>.")
+        return "\n".join(lines)
+
+    def _plan(self, rest: str, *, chat_id: int | None) -> str:
+        subcommand, subrest = _split_once(rest.strip())
+        lowered = subcommand.lower()
+        if lowered in {"", "list"}:
+            return self._plans(subrest, chat_id=chat_id)
+        if lowered in {"new", "create"}:
+            return self._plan_new(subrest, chat_id=chat_id)
+        if lowered in {"draft", "read"}:
+            return self._plan_draft(subrest, chat_id=chat_id)
+        if lowered in {"set", "write", "replace"}:
+            return self._plan_set(subrest, chat_id=chat_id)
+        if lowered in {"note", "comment", "discuss"}:
+            return self._plan_note(subrest, chat_id=chat_id)
+        if lowered in {"compile", "approve"}:
+            return self._plan_compile(subrest, chat_id=chat_id)
+        if lowered in {"use", "select"}:
+            return self._plan_use(subrest, chat_id=chat_id)
+        if lowered in {"status", "steps"}:
+            return self._plan_status(subrest, chat_id=chat_id)
+        record = self._resolve_plan(rest, chat_id=chat_id)
+        if record is None:
+            return "Plan not found. Use /plans or /plan new <title>."
+        return self._format_plan_detail(record)
+
+    def _plan_new(self, rest: str, *, chat_id: int | None) -> str:
+        title, draft = _parse_plan_new_text(rest)
+        if not title:
+            return "Usage: /plan new <title> or /plan new <title> | <draft text>"
+        focus = self._resolve_focus(self.chat_state.current_focus(chat_id)) if chat_id is not None else None
+        project = self._resolve_project(self.chat_state.current_project(chat_id)) if chat_id is not None else None
+        session = self._resolve_session(self.chat_state.current_session(chat_id)) if chat_id is not None else None
+        try:
+            record = PlanRegistry(self.workspace).create(
+                title=title,
+                draft=draft or f"# {title}\n\n## Step 1\nDescribe the first concrete action here.",
+                project_id=(focus.project_id if focus is not None else (project.project_id if project is not None else "")),
+                focus_id=focus.focus_id if focus is not None else "",
+                session_id=(focus.session_id if focus is not None else (session.session_id if session is not None else "")),
+                agent_id=(focus.agent_id if focus is not None else (session.agent_id if session is not None else "")),
+                directory=(focus.directory if focus is not None else (session.project_dir if session is not None else "")),
+                metadata={"created_by": "telegram"},
+            )
+        except ValueError as exc:
+            return str(exc)
+        if chat_id is not None:
+            self.chat_state.set_recent_plans(chat_id, [record.plan_id])
+        return "\n".join(
+            [
+                "Plan draft created.",
+                f"title: {record.title}",
+                f"id: {record.plan_id}",
+                "",
+                "Discuss or edit it with /plan set 1 <full draft>, then /plan compile 1.",
+            ]
+        )
+
+    def _plan_draft(self, rest: str, *, chat_id: int | None) -> str:
+        record = self._resolve_plan(rest.strip() or "1", chat_id=chat_id)
+        if record is None:
+            return "Plan not found. Use /plans first."
+        draft = record.draft or "(empty draft)"
+        return "\n".join([f"Draft: {record.title}", f"id: {record.plan_id}", "", draft])
+
+    def _plan_set(self, rest: str, *, chat_id: int | None) -> str:
+        ref, draft = _split_once(rest.strip())
+        if not ref or not draft:
+            return "Usage: /plan set <plan # or id> <full readable markdown draft>"
+        record = self._resolve_plan(ref, chat_id=chat_id)
+        if record is None:
+            return "Plan not found. Use /plans first."
+        updated = PlanRegistry(self.workspace).set_draft(record.plan_id, draft, note="Draft updated from Telegram discussion.")
+        assert updated is not None
+        if chat_id is not None:
+            self.chat_state.set_recent_plans(chat_id, [updated.plan_id])
+        return f"Plan draft updated: {updated.title}\nUse /plan draft 1 to review, then /plan compile 1."
+
+    def _plan_note(self, rest: str, *, chat_id: int | None) -> str:
+        ref, note = _split_once(rest.strip())
+        if not ref or not note:
+            return "Usage: /plan note <plan # or id> <question, constraint, or user edit note>"
+        record = self._resolve_plan(ref, chat_id=chat_id)
+        if record is None:
+            return "Plan not found. Use /plans first."
+        updated = PlanRegistry(self.workspace).add_note(record.plan_id, note, kind="discussion")
+        assert updated is not None
+        return f"Plan note added: {updated.title}\nnotes: {len(updated.notes)}"
+
+    def _plan_compile(self, rest: str, *, chat_id: int | None) -> str:
+        record = self._resolve_plan(rest.strip() or "1", chat_id=chat_id)
+        if record is None:
+            return "Plan not found. Use /plans first."
+        try:
+            compiled = PlanRegistry(self.workspace).compile(record.plan_id)
+        except ValueError as exc:
+            return str(exc)
+        assert compiled is not None
+        if chat_id is not None:
+            self.chat_state.set_recent_plans(chat_id, [compiled.plan_id])
+        return self._format_plan_status(compiled, prefix="Plan compiled.")
+
+    def _plan_use(self, rest: str, *, chat_id: int | None) -> str:
+        if chat_id is None:
+            return "This command requires a Telegram chat."
+        record = self._resolve_plan(rest.strip() or "1", chat_id=chat_id)
+        if record is None:
+            return "Plan not found. Use /plans first."
+        self.chat_state.set_recent_plans(chat_id, [record.plan_id])
+        if record.focus_id:
+            self.chat_state.set_current_focus(chat_id, record.focus_id)
+        if record.session_id:
+            self.chat_state.set_current_session(chat_id, record.session_id)
+        if record.agent_id:
+            self.chat_state.set_current_agent(chat_id, record.agent_id)
+        if record.project_id:
+            self.chat_state.set_current_project(chat_id, record.project_id)
+        return f"Plan selected: {record.title}\nUse /auto plan 1 to execute it step by step."
+
+    def _plan_status(self, rest: str, *, chat_id: int | None) -> str:
+        record = self._resolve_plan(rest.strip() or "1", chat_id=chat_id)
+        if record is None:
+            return "Plan not found. Use /plans first."
+        return self._format_plan_status(record)
+
+    def _resolve_plan(self, value: str, *, chat_id: int | None = None) -> PlanRecord | None:
+        clean = value.strip()
+        if not clean:
+            return None
+        if clean.isdigit() and chat_id is not None:
+            mapped = self.chat_state.recent_plan_id(chat_id, int(clean))
+            if mapped:
+                clean = mapped
+        return PlanRegistry(self.workspace).resolve(clean)
+
+    def _format_plan_detail(self, record: PlanRecord) -> str:
+        lines = [
+            record.title,
+            f"id: {record.plan_id}",
+            f"status: {record.status}",
+            f"project: {record.project_id or '-'}",
+            f"focus: {record.focus_id or '-'}",
+            f"session: {record.session_id or '-'}",
+        ]
+        if record.draft:
+            lines.extend(["", "draft preview:", _one_line(record.draft, 700)])
+        lines.extend(["", self._format_plan_status(record)])
+        return "\n".join(lines)
+
+    def _format_plan_status(self, record: PlanRecord, *, prefix: str = "") -> str:
+        lines = [prefix] if prefix else []
+        done, total = plan_progress(record)
+        lines.append(f"Plan: {record.title}")
+        lines.append(f"id: {record.plan_id}")
+        lines.append(f"status: {record.status}  steps: {done}/{total}")
+        for index, step in enumerate(record.steps[:12], 1):
+            marker = _plan_step_marker(step.status)
+            lines.append(f"{index}. {marker} {step.title}")
+            if step.report:
+                lines.append(f"   report: {_one_line(step.report, 180)}")
+        if len(record.steps) > 12:
+            lines.append(f"... {len(record.steps) - 12} more steps")
+        if not record.steps:
+            lines.append("No compiled steps yet. Use /plan draft and /plan compile.")
+        return "\n".join(line for line in lines if line)
+
     def _session(self, rest: str, *, chat_id: int | None) -> str:
         session_ref = rest.strip()
         if not session_ref:
@@ -4723,6 +5117,7 @@ class TelegramCommandHandler:
                 enabled=bool(state.get("enabled")),
                 task_id=str(state.get("task_id") or self.chat_state.current_task(chat_id)),
                 focus_id=str(state.get("focus_id") or self.chat_state.current_focus(chat_id)),
+                plan_id=str(state.get("plan_id") or ""),
                 prompt=prompt,
                 until=float(state.get("until") or 0.0),
                 turns_started=int(state.get("turns_started") or 0),
@@ -4733,11 +5128,105 @@ class TelegramCommandHandler:
             return f"Auto prompt updated:\n{prompt}"
         if action in {"focus", "by-focus", "byfocus", "task", "by-task", "bytask"}:
             return self._auto_start(tail, chat_id=chat_id, approval_mode=approval_mode, mode="focus")
+        if action in {"plan", "by-plan", "byplan"}:
+            return self._auto_plan_start(tail, chat_id=chat_id, approval_mode=approval_mode)
         if action == "start" or action == "on":
             return self._auto_start(tail, chat_id=chat_id, approval_mode=approval_mode, mode="loop")
         if _looks_like_float(action):
             return self._auto_start(clean, chat_id=chat_id, approval_mode=approval_mode, mode="loop")
-        return "Usage: /auto start [hours], /auto focus [hours], /auto <hours>, /auto -h start, /auto status, /auto prompt <message>, or /auto end"
+        return "Usage: /auto start [hours], /auto focus [hours], /auto plan [plan #] [hours], /auto <hours>, /auto status, /auto prompt <message>, or /auto end"
+
+    def _auto_plan_start(self, rest: str, *, chat_id: int, approval_mode: str) -> str:
+        ref, tail = _split_once(rest.strip())
+        if not ref:
+            ref = "1"
+        plan = self._resolve_plan(ref, chat_id=chat_id)
+        if plan is None and ref and _looks_like_float(ref):
+            plan = self._resolve_plan("1", chat_id=chat_id)
+            tail = rest.strip()
+        if plan is None:
+            return "Plan not found. Use /plans, /plan new <title>, or /plan compile <plan #> first."
+        if not plan.steps:
+            try:
+                plan = PlanRegistry(self.workspace).compile(plan.plan_id)
+            except ValueError as exc:
+                return f"Plan is not executable yet: {exc}"
+            assert plan is not None
+        duration_text, extra = _split_once(tail.strip())
+        until = 0.0
+        if duration_text:
+            if not _looks_like_float(duration_text):
+                extra = tail.strip()
+            else:
+                hours = float(duration_text)
+                if hours <= 0:
+                    return "Auto duration must be positive hours, or omit it for no timer."
+                until = time.time() + hours * 3600.0
+        if extra.strip():
+            PlanRegistry(self.workspace).add_note(plan.plan_id, extra.strip(), kind="auto-plan-instruction")
+        plan, step = PlanRegistry(self.workspace).start_next_step(plan.plan_id)
+        if plan is None:
+            return "Plan not found."
+        if step is None:
+            PlanRegistry(self.workspace).set_status(plan.plan_id, "done", note="Auto plan found no pending steps.")
+            return _format_auto_plan_complete(plan)
+        normalized_approval_mode = _normalize_auto_approval_mode(approval_mode)
+        self.chat_state.set_auto_state(
+            chat_id,
+            enabled=True,
+            task_id="",
+            focus_id=plan.focus_id,
+            plan_id=plan.plan_id,
+            prompt="",
+            until=until,
+            turns_started=0,
+            last_job_id="",
+            approval_mode=normalized_approval_mode,
+            mode="plan",
+        )
+        if plan.focus_id:
+            self.chat_state.set_current_focus(chat_id, plan.focus_id)
+        if plan.session_id:
+            self.chat_state.set_current_session(chat_id, plan.session_id)
+        if plan.agent_id:
+            self.chat_state.set_current_agent(chat_id, plan.agent_id)
+        if plan.project_id:
+            self.chat_state.set_current_project(chat_id, plan.project_id)
+        self.chat_state.set_recent_plans(chat_id, [plan.plan_id])
+        lines = [
+            "Auto plan enabled.",
+            f"plan: {plan.title}",
+            f"step: {step.step_id} - {step.title}",
+            f"timer: {_format_auto_until(until)}",
+            f"approval: {_format_auto_approval_mode(normalized_approval_mode)}",
+        ]
+        if self.job_queue is None:
+            lines.append("Jobs are not enabled for this interface.")
+            return "\n".join(lines)
+        active = self.job_queue.latest_for_chat(chat_id, statuses={"queued", "running", "cancel_requested"})
+        if active is not None:
+            lines.append(f"active job: {active.job_id}")
+            lines.append("Auto plan will continue after the active job finishes.")
+            return "\n".join(lines)
+        metadata: dict[str, Any] = {
+            "auto": True,
+            "approval_mode": normalized_approval_mode,
+            "auto_mode": "plan",
+            "plan_id": plan.plan_id,
+            "plan_step_id": step.step_id,
+        }
+        if plan.focus_id:
+            metadata["focus_id"] = plan.focus_id
+        if plan.agent_id:
+            metadata["agent_id"] = plan.agent_id
+        session_id = self._safe_session_id_for_resume(plan.session_id)
+        if session_id:
+            metadata["session_id"] = session_id
+        job = self.job_queue.start(chat_id=chat_id, task_id="", prompt=_build_plan_step_prompt(plan, step), metadata=metadata)
+        self.chat_state.mark_auto_job(chat_id, job_id=job.job_id, focus_id=plan.focus_id, plan_id=plan.plan_id)
+        lines.append(f"Job started: {job.job_id}")
+        lines.append("Use /auto status or /auto end.")
+        return "\n".join(lines)
 
     def _auto_start(self, rest: str, *, chat_id: int, approval_mode: str, mode: str) -> str:
         focus_id = self.chat_state.current_focus(chat_id)
@@ -4771,6 +5260,7 @@ class TelegramCommandHandler:
             enabled=True,
             task_id="",
             focus_id=focus.focus_id,
+            plan_id="",
             prompt=prompt,
             until=until,
             turns_started=0,
@@ -4820,6 +5310,7 @@ class TelegramCommandHandler:
             return "Auto mode: off\nUse /auto start after selecting a focus with /use focus or /focus new."
         focus = self._resolve_focus(str(state.get("focus_id") or ""))
         task = self._resolve_task(str(state.get("task_id") or ""))
+        plan = self._resolve_plan(str(state.get("plan_id") or ""), chat_id=chat_id)
         lines = [
             "Auto mode: on",
             f"focus: {focus.title if focus is not None else str(state.get('focus_id') or '-')}",
@@ -4828,6 +5319,12 @@ class TelegramCommandHandler:
             f"mode: {_auto_mode(state)}",
             f"turns started: {int(state.get('turns_started') or 0)}",
         ]
+        if plan is not None:
+            done, total = plan_progress(plan)
+            lines.append(f"plan: {plan.title} ({done}/{total})")
+            current_step = PlanRegistry(self.workspace).current_step(plan.plan_id)
+            if current_step is not None:
+                lines.append(f"step: {current_step.step_id} - {current_step.title}")
         if task is not None:
             lines.append(f"legacy task: {task.title}")
         if state.get("last_job_id"):
@@ -5491,6 +5988,8 @@ def _auto_approval_mode(state: dict[str, Any]) -> str:
 
 def _normalize_auto_mode(value: str) -> str:
     clean = (value or "").strip().lower().replace("_", "-")
+    if clean in {"plan", "by-plan", "byplan", "until-plan-done"}:
+        return "plan"
     if clean in {"focus", "by-focus", "byfocus", "until-focus-done", "task", "by-task", "bytask", "until-task-done"}:
         return "focus"
     return "loop"
@@ -5516,6 +6015,10 @@ def _safe_session_id_for_resume(workspace: Workspace, session_id: str) -> str:
 def _auto_enabled_for_job(state: dict[str, Any], job: JobRecord) -> bool:
     if not bool(state.get("enabled")):
         return False
+    plan_id = str(state.get("plan_id") or "")
+    job_plan_id = str((job.metadata or {}).get("plan_id") or "")
+    if plan_id:
+        return bool(job_plan_id) and plan_id == job_plan_id
     focus_id = str(state.get("focus_id") or "")
     job_focus_id = str((job.metadata or {}).get("focus_id") or "")
     if focus_id:
@@ -5605,11 +6108,137 @@ def _format_job_completion(job: JobRecord, approval_requested: bool) -> str:
 
 
 def _clean_job_final_text(text: str) -> str:
-    return _strip_assistant_actions(_strip_auto_task_marker(text))
+    return _strip_assistant_actions(_strip_plan_markers(_strip_auto_task_marker(text)))
 
 
 def _auto_focus_completed(text: str) -> bool:
     return AUTO_FOCUS_DONE_MARKER in text or AUTO_TASK_DONE_MARKER in text
+
+
+def _build_plan_step_prompt(plan: PlanRecord, step: PlanStep) -> str:
+    done, total = plan_progress(plan)
+    completed_reports = [
+        f"- {item.step_id} {item.title}: {_one_line(item.report or item.result, 260)}"
+        for item in plan.steps
+        if item.status in {"done", "skipped"} and (item.report or item.result)
+    ][-5:]
+    lines = [
+        "请按 AgentDeck Plan 模式推进当前计划的一个步骤。",
+        "",
+        f"Plan: {plan.title}",
+        f"Plan ID: {plan.plan_id}",
+        f"Progress: {done}/{total} completed",
+        "",
+        "用户可读计划 draft:",
+        plan.draft or "(empty)",
+        "",
+        "当前必须完成的 step:",
+        f"- id: {step.step_id}",
+        f"- title: {step.title}",
+    ]
+    if step.body:
+        lines.extend(["- details:", step.body])
+    if completed_reports:
+        lines.extend(["", "最近已完成 step 报告:", *completed_reports])
+    lines.extend(
+        [
+            "",
+            "执行要求:",
+            "- 只推进当前 step，不要跳到后续 step。",
+            "- 完成后记录关键行为、结果、证据路径、重要决策和下一步风险。",
+            "- 如果需要用户决策、权限、外部信息或出现不可自行解决的阻塞，停止并声明 blocked。",
+            "",
+            "回复格式要求:",
+            f"- step 完成时，最后单独一行输出: {AUTO_PLAN_STEP_DONE_MARKER}: {step.step_id}",
+            f"- plan 全部完成时，最后单独一行输出: {AUTO_PLAN_DONE_MARKER}: {plan.plan_id}",
+            f"- 遇到阻塞时，最后单独一行输出: {AUTO_PLAN_BLOCKED_MARKER}: {step.step_id}",
+            "- 可选字段用单独行表示: result: ... / decision: ... / artifact: path",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _parse_plan_step_update(text: str, *, default_step_id: str = "") -> dict[str, Any]:
+    update: dict[str, Any] = {
+        "step_id": default_step_id,
+        "done": AUTO_PLAN_STEP_DONE_MARKER in text or AUTO_PLAN_DONE_MARKER in text,
+        "blocked": AUTO_PLAN_BLOCKED_MARKER in text,
+        "report": _strip_plan_markers(text),
+        "result": "",
+        "decision": "",
+        "artifacts": [],
+    }
+    artifacts: list[str] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        marker = re.match(rf"^(?:{AUTO_PLAN_STEP_DONE_MARKER}|{AUTO_PLAN_BLOCKED_MARKER})\s*:?\s*(\S+)?", stripped)
+        if marker and marker.group(1):
+            update["step_id"] = marker.group(1)
+            continue
+        if stripped.startswith(f"{AUTO_PLAN_DONE_MARKER}:"):
+            continue
+        key, value = _split_once(stripped)
+        lowered = key.rstrip(":").lower()
+        if lowered == "result":
+            update["result"] = value
+        elif lowered == "decision":
+            update["decision"] = value
+        elif lowered in {"artifact", "artifacts"} and value:
+            artifacts.append(value)
+    update["artifacts"] = artifacts
+    return update
+
+
+def _parse_plan_new_text(text: str) -> tuple[str, str]:
+    clean = text.strip()
+    if "|" not in clean:
+        return clean, ""
+    title, draft = clean.split("|", 1)
+    return " ".join(title.strip().split()), draft.strip()
+
+
+def _strip_plan_markers(text: str) -> str:
+    lines = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(AUTO_PLAN_STEP_DONE_MARKER):
+            continue
+        if stripped.startswith(AUTO_PLAN_BLOCKED_MARKER):
+            continue
+        if stripped.startswith(AUTO_PLAN_DONE_MARKER):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _format_auto_plan_complete(plan: PlanRecord | None) -> str:
+    if plan is None:
+        return "Auto plan completed."
+    done, total = plan_progress(plan)
+    lines = [
+        "Auto plan completed.",
+        f"plan: {plan.title}",
+        f"status: {plan.status}",
+        f"steps: {done}/{total}",
+    ]
+    reports = [step for step in plan.steps if step.report]
+    if reports:
+        lines.append("latest reports:")
+        for step in reports[-5:]:
+            lines.append(f"- {step.step_id} {step.title}: {_one_line(step.report, 220)}")
+    lines.append("Use /plan status 1 or /plan draft 1 to review.")
+    return "\n".join(lines)
+
+
+def _plan_step_marker(status: str) -> str:
+    return {
+        "pending": "[ ]",
+        "running": "[>]",
+        "done": "[x]",
+        "blocked": "[!]",
+        "failed": "[!]",
+        "skipped": "[-]",
+    }.get(status, "[ ]")
 
 
 def _strip_auto_task_marker(text: str) -> str:
@@ -5663,6 +6292,7 @@ def _assistant_action_allowed(action: str) -> tuple[bool, str]:
         "/directories",
         "/agents",
         "/tasks",
+        "/plans",
         "/workers",
         "/sessions",
         "/current",
@@ -5690,6 +6320,28 @@ def _assistant_action_allowed(action: str) -> tuple[bool, str]:
         return True, ""
     if command == "/task":
         return (True, "") if rest.strip() else (False, "/task requires a task reference or new task title")
+    if command == "/plan":
+        safe_plan_commands = {
+            "",
+            "list",
+            "new",
+            "create",
+            "draft",
+            "read",
+            "set",
+            "write",
+            "replace",
+            "note",
+            "comment",
+            "discuss",
+            "compile",
+            "approve",
+            "use",
+            "select",
+            "status",
+            "steps",
+        }
+        return (True, "") if lowered_sub in safe_plan_commands else (False, "/plan subcommand is not in the assistant safe command whitelist")
     if command == "/newtask":
         return (True, "") if rest.strip() else (False, "/newtask requires a title")
     if command == "/session":
@@ -6049,6 +6701,14 @@ def _help_text() -> str:
             "/clone show <clone # or id>",
             "/clone spawn <clone # or id> [agent <id>] [title <name>]",
             "/clone current [strategy rules|ai] [agent <id>] [title <name>]",
+            "/plans [project or focus]",
+            "/plan new <title> | <readable draft>",
+            "/plan draft <plan #>",
+            "/plan set <plan #> <full readable draft>",
+            "/plan note <plan #> <question or constraint>",
+            "/plan compile <plan #>",
+            "/plan status <plan #>",
+            "/plan use <plan #>",
             "/compact [--pin] [title]",
             "/handoffs [focus or legacy task]",
             "/review <manager review summary>",
@@ -6063,6 +6723,7 @@ def _help_text() -> str:
             "/resume <session_id or list #> <message>",
             "/auto start [hours]",
             "/auto focus [hours]",
+            "/auto plan [plan #] [hours]",
             "/auto -h start [hours]",
             "/auto <hours>",
             "/auto status",

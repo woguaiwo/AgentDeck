@@ -359,6 +359,14 @@ Supported commands:
 /clone show <clone # or id>
 /clone spawn <clone # or id> [agent <id>] [title <name>]
 /clone current [strategy rules|ai] [agent <id>] [title <name>]
+/plans [project or focus]
+/plan new <title> | <readable draft>
+/plan draft <plan #>
+/plan set <plan #> <full readable draft>
+/plan note <plan #> <question or constraint>
+/plan compile <plan #>
+/plan status <plan #>
+/plan use <plan #>
 /compact [--pin] [title]
 /handoffs [focus or legacy task]
 /review <manager review summary>
@@ -373,6 +381,7 @@ Supported commands:
 /resume <session_id or list #> <message>
 /auto start [hours]
 /auto focus [hours]
+/auto plan [plan #] [hours]
 /auto -h start [hours]
 /auto --human start [hours]
 /auto <hours>
@@ -521,6 +530,14 @@ Use `/auto focus [hours]` when the loop should stop once the agent judges the
 current focus to be sufficiently complete. AgentDeck injects a completion marker
 into that auto prompt; if the backend returns the marker, AgentDeck strips it
 from the user-visible reply and stops auto mode.
+
+Plan mode is for longer work where the user wants to discuss and edit the plan
+before execution. Start with `/plan new <title> | <readable draft>`, revise it
+with `/plan note`, `/plan draft`, and `/plan set`, then run `/plan compile`.
+The readable draft remains visible to the user; the compiled steps are the
+machine-executable checklist. `/auto plan [plan #] [hours]` then pushes the
+current session-agent through one compiled step at a time, records each step
+report on the plan, stops on blockers, and ends when every step is done.
 
 Auto mode defaults to automatic approval: auto-created jobs run with
 `approval_mode=bypass`, so they do not stop on backend approval prompts. Use
